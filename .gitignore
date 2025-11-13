@@ -192,3 +192,5 @@ calibration_*.npy
 *.heic
 *.ico
 *.raw
+/examples/YOLOv8-ONNXRuntime-Rust/models
+/examples/YOLOv8-ONNXRuntime-Rust/docs

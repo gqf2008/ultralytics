@@ -173,7 +173,8 @@ impl OrtBackend {
 
         // build session again with the new provider
         let session = SessionBuilder::new()?
-            // .with_optimization_level(ort::GraphOptimizationLevel::Level3)?
+            .with_intra_threads(4)? // Enable intra-op parallelism (4 threads)
+            .with_inter_threads(2)? // Enable inter-op parallelism (2 threads)
             .with_execution_providers([provider])?
             .commit_from_file(args.f)?;
 

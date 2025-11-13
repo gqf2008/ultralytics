@@ -1,17 +1,96 @@
 #![allow(clippy::type_complexity)]
 // Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 
-use ab_glyph::FontArc;
 use anyhow::Result;
+use clap::Parser;
 use image::{DynamicImage, GenericImageView, ImageBuffer};
 use ndarray::{s, Array, Axis, IxDyn};
-use rand::{thread_rng, Rng};
-use std::path::PathBuf;
 
 use crate::{
-    gen_time_string, load_font, non_max_suppression, Args, Batch, Bbox, Embedding, OrtBackend,
-    OrtConfig, OrtEP, Point2, YOLOResult, YOLOTask, SKELETON,
+    non_max_suppression, Batch, Bbox, Embedding, OrtBackend, OrtConfig, OrtEP, Point2, YOLOResult,
+    YOLOTask, SKELETON,
 };
+
+/// YOLOv8 模型配置参数 (用于命令行和手动配置)
+#[derive(Parser, Clone)]
+#[command(author, version, about, long_about = None)]
+pub struct Args {
+    /// ONNX model path
+    #[arg(long, required = true)]
+    pub model: String,
+
+    /// input path
+    #[arg(long, required = true)]
+    pub source: String,
+
+    /// device id
+    #[arg(long, default_value_t = 0)]
+    pub device_id: i32,
+
+    /// using TensorRT EP
+    #[arg(long)]
+    pub trt: bool,
+
+    /// using CUDA EP
+    #[arg(long)]
+    pub cuda: bool,
+
+    /// input batch size
+    #[arg(long, default_value_t = 1)]
+    pub batch: u32,
+
+    /// trt input min_batch size
+    #[arg(long, default_value_t = 1)]
+    pub batch_min: u32,
+
+    /// trt input max_batch size
+    #[arg(long, default_value_t = 32)]
+    pub batch_max: u32,
+
+    /// using TensorRT --fp16
+    #[arg(long)]
+    pub fp16: bool,
+
+    /// specify YOLO task
+    #[arg(long, value_enum)]
+    pub task: Option<YOLOTask>,
+
+    /// num_classes
+    #[arg(long)]
+    pub nc: Option<u32>,
+
+    /// num_keypoints
+    #[arg(long)]
+    pub nk: Option<u32>,
+
+    /// num_masks
+    #[arg(long)]
+    pub nm: Option<u32>,
+
+    /// input image width
+    #[arg(long)]
+    pub width: Option<u32>,
+
+    /// input image height
+    #[arg(long)]
+    pub height: Option<u32>,
+
+    /// confidence threshold
+    #[arg(long, required = false, default_value_t = 0.3)]
+    pub conf: f32,
+
+    /// iou threshold in NMS
+    #[arg(long, required = false, default_value_t = 0.45)]
+    pub iou: f32,
+
+    /// confidence threshold of keypoint
+    #[arg(long, required = false, default_value_t = 0.55)]
+    pub kconf: f32,
+
+    /// check time consumed in each stage
+    #[arg(long)]
+    pub profile: bool,
+}
 
 pub struct YOLOv8 {
     // YOLOv8 model for all yolo-tasks
@@ -29,7 +108,6 @@ pub struct YOLOv8 {
     names: Vec<String>,
     color_palette: Vec<(u8, u8, u8)>,
     profile: bool,
-    plot: bool,
 }
 
 impl YOLOv8 {
@@ -90,17 +168,26 @@ impl YOLOv8 {
         // class names
         let names = engine.names().unwrap_or(vec!["Unknown".to_string()]);
 
-        // color palette
-        let mut rng = thread_rng();
+        // color palette - use bright, highly visible colors
+        let bright_colors = vec![
+            (255, 0, 0),     // 红色
+            (0, 255, 0),     // 绿色
+            (0, 0, 255),     // 蓝色
+            (255, 255, 0),   // 黄色
+            (255, 0, 255),   // 品红
+            (0, 255, 255),   // 青色
+            (255, 128, 0),   // 橙色
+            (255, 0, 128),   // 粉红
+            (128, 255, 0),   // 黄绿
+            (0, 128, 255),   // 天蓝
+            (255, 255, 255), // 白色
+            (128, 0, 255),   // 紫色
+        ];
+
         let color_palette: Vec<_> = names
             .iter()
-            .map(|_| {
-                (
-                    rng.gen_range(0..=255),
-                    rng.gen_range(0..=255),
-                    rng.gen_range(0..=255),
-                )
-            })
+            .enumerate()
+            .map(|(i, _)| bright_colors[i % bright_colors.len()])
             .collect();
 
         Ok(Self {
@@ -111,7 +198,6 @@ impl YOLOv8 {
             iou: config.iou,
             color_palette,
             profile: config.profile,
-            plot: config.plot,
             nc,
             nk,
             nm,
@@ -191,10 +277,7 @@ impl YOLOv8 {
             println!("[Model Postprocess]: {:?}", t_post.elapsed());
         }
 
-        // plot and save
-        if self.plot {
-            self.plot_and_save(&ys, xs, Some(&SKELETON));
-        }
+        // Note: plot_and_save removed - RTSP rendering handled by ggez
         Ok(ys)
     }
 
@@ -412,140 +495,6 @@ impl YOLOv8 {
         }
     }
 
-    pub fn plot_and_save(
-        &self,
-        ys: &[YOLOResult],
-        xs0: &[DynamicImage],
-        skeletons: Option<&[(usize, usize)]>,
-    ) {
-        // check font then load
-        let font: FontArc = load_font();
-        for (_idb, (img0, y)) in xs0.iter().zip(ys.iter()).enumerate() {
-            let mut img = img0.to_rgb8();
-
-            // draw for classifier
-            if let Some(probs) = y.probs() {
-                for (i, k) in probs.topk(5).iter().enumerate() {
-                    let legend = format!("{} {:.2}%", self.names[k.0], k.1);
-                    let scale = 32;
-                    let legend_size = img.width().max(img.height()) / scale;
-                    let x = img.width() / 20;
-                    let y = img.height() / 20 + i as u32 * legend_size;
-
-                    imageproc::drawing::draw_text_mut(
-                        &mut img,
-                        image::Rgb([0, 255, 0]),
-                        x as i32,
-                        y as i32,
-                        legend_size as f32,
-                        &font,
-                        &legend,
-                    );
-                }
-            }
-
-            // draw bboxes & keypoints
-            if let Some(bboxes) = y.bboxes() {
-                for (_idx, bbox) in bboxes.iter().enumerate() {
-                    // rect
-                    imageproc::drawing::draw_hollow_rect_mut(
-                        &mut img,
-                        imageproc::rect::Rect::at(bbox.xmin() as i32, bbox.ymin() as i32)
-                            .of_size(bbox.width() as u32, bbox.height() as u32),
-                        image::Rgb(self.color_palette[bbox.id()].into()),
-                    );
-
-                    // text
-                    let legend = format!("{} {:.2}%", self.names[bbox.id()], bbox.confidence());
-                    let scale = 40;
-                    let legend_size = img.width().max(img.height()) / scale;
-                    imageproc::drawing::draw_text_mut(
-                        &mut img,
-                        image::Rgb(self.color_palette[bbox.id()].into()),
-                        bbox.xmin() as i32,
-                        (bbox.ymin() - legend_size as f32) as i32,
-                        legend_size as f32,
-                        &font,
-                        &legend,
-                    );
-                }
-            }
-
-            // draw kpts
-            if let Some(keypoints) = y.keypoints() {
-                for kpts in keypoints.iter() {
-                    for kpt in kpts.iter() {
-                        // filter
-                        if kpt.confidence() < self.kconf {
-                            continue;
-                        }
-
-                        // draw point
-                        imageproc::drawing::draw_filled_circle_mut(
-                            &mut img,
-                            (kpt.x() as i32, kpt.y() as i32),
-                            2,
-                            image::Rgb([0, 255, 0]),
-                        );
-                    }
-
-                    // draw skeleton if has
-                    if let Some(skeletons) = skeletons {
-                        for &(idx1, idx2) in skeletons.iter() {
-                            let kpt1 = &kpts[idx1];
-                            let kpt2 = &kpts[idx2];
-                            if kpt1.confidence() < self.kconf || kpt2.confidence() < self.kconf {
-                                continue;
-                            }
-                            imageproc::drawing::draw_line_segment_mut(
-                                &mut img,
-                                (kpt1.x(), kpt1.y()),
-                                (kpt2.x(), kpt2.y()),
-                                image::Rgb([233, 14, 57]),
-                            );
-                        }
-                    }
-                }
-            }
-
-            // draw mask
-            if let Some(masks) = y.masks() {
-                for (mask, _bbox) in masks.iter().zip(y.bboxes().unwrap().iter()) {
-                    let mask_nd: ImageBuffer<image::Luma<_>, Vec<u8>> =
-                        match ImageBuffer::from_vec(img.width(), img.height(), mask.to_vec()) {
-                            Some(image) => image,
-                            None => panic!("can not crate image from ndarray"),
-                        };
-
-                    for _x in 0..img.width() {
-                        for _y in 0..img.height() {
-                            let mask_p = imageproc::drawing::Canvas::get_pixel(&mask_nd, _x, _y);
-                            if mask_p.0[0] > 0 {
-                                let mut img_p = imageproc::drawing::Canvas::get_pixel(&img, _x, _y);
-                                // img_p.0[2] = self.color_palette[bbox.id()].2 / 2;
-                                // img_p.0[1] = self.color_palette[bbox.id()].1 / 2;
-                                // img_p.0[0] = self.color_palette[bbox.id()].0 / 2;
-                                img_p.0[2] /= 2;
-                                img_p.0[1] = 255 - (255 - img_p.0[2]) / 2;
-                                img_p.0[0] /= 2;
-                                imageproc::drawing::Canvas::draw_pixel(&mut img, _x, _y, img_p)
-                            }
-                        }
-                    }
-                }
-            }
-
-            // mkdir and save
-            let mut runs = PathBuf::from("runs");
-            if !runs.exists() {
-                std::fs::create_dir_all(&runs).unwrap();
-            }
-            runs.push(gen_time_string("-"));
-            let saveout = format!("{}.jpg", runs.to_str().unwrap());
-            let _ = img.save(saveout);
-        }
-    }
-
     pub fn summary(&self) {
         println!(
             "\nSummary:\n\
@@ -596,6 +545,10 @@ impl YOLOv8 {
 
     pub fn engine(&self) -> &OrtBackend {
         &self.engine
+    }
+
+    pub fn engine_mut(&mut self) -> &mut OrtBackend {
+        &mut self.engine
     }
 
     pub fn conf(&self) -> f32 {

@@ -1,0 +1,23 @@
+# Cargo 构建配置
+
+[env]
+# vcpkg 根目录 (用于 FFmpeg 等 C/C++ 依赖)
+VCPKG_ROOT = "D:\\workspace\\vcpkg"
+
+# FFmpeg 路径 (如果 vcpkg 已安装 ffmpeg)
+# FFMPEG_DIR = "D:\\workspace\\vcpkg\\installed\\x64-windows"
+
+[build]
+# 使用所有 CPU 核心加速编译
+jobs = 8
+
+# 链接器参数: 添加 DirectShow 和 Media Foundation 库 (FFmpeg dshow/mf 需要)
+[target.x86_64-pc-windows-msvc]
+rustflags = [
+    "-C",
+    "link-arg=/DEFAULTLIB:strmiids.lib",
+    "-C",
+    "link-arg=/DEFAULTLIB:mfuuid.lib",
+    "-C",
+    "link-arg=/DEFAULTLIB:mfplat.lib",
+]
