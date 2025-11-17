@@ -195,7 +195,7 @@ impl Renderer {
             lines.push(format!("人数: 0"));
         }
 
-        lines.push(format!("🖼️  渲染FPS: {:.1}", self.render_fps));
+        lines.push(format!("渲染FPS: {:.1}", self.render_fps));
 
         // 计算面板高度
         let panel_height = lines.len() as f32 * line_height + 20.0;
