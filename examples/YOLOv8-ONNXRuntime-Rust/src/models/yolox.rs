@@ -11,7 +11,8 @@ use image::DynamicImage;
 use ndarray::{Array, Axis, IxDyn};
 
 use crate::{
-    non_max_suppression, Batch, Bbox, DetectionResult, OrtBackend, OrtConfig, OrtEP, YOLOTask,
+    non_max_suppression, Batch, Bbox, DetectionResult, OrtBackend, OrtConfig, OrtEP, Point2,
+    YOLOTask,
 };
 
 /// YOLOX 模型结构
@@ -194,20 +195,27 @@ impl YOLOX {
         let r = (w1 / w0).min(h1 / h0);
         (r, (w0 * r).round(), (h0 * r).round())
     }
+
+    /// 获取类别名称列表
+    pub fn names(&self) -> &Vec<String> {
+        &self.names
+    }
+
+    /// 获取调色板
+    pub fn color_palette(&self) -> &Vec<(u8, u8, u8)> {
+        &self.color_palette
+    }
 }
 
 impl crate::models::Model for YOLOX {
     fn preprocess(&mut self, xs: &[DynamicImage]) -> Result<Vec<Array<f32, IxDyn>>> {
         let mut ys =
-            Array::ones((xs.len(), 3, self.height() as usize, self.width() as usize)).into_dyn();
+            Array::ones((xs.len(), 3, self.height as usize, self.width as usize)).into_dyn();
         ys.fill(114.0 / 255.0); // YOLOX uses 114 as padding value
 
         for (idx, x) in xs.iter().enumerate() {
-            let (w0, h0) = x.dimensions();
-            let w0 = w0 as f32;
-            let h0 = h0 as f32;
-            let (_, w_new, h_new) =
-                self.scale_wh(w0, h0, self.width() as f32, self.height() as f32);
+            let (w0, h0) = (x.width() as f32, x.height() as f32);
+            let (_, w_new, h_new) = self.scale_wh(w0, h0, self.width as f32, self.height as f32);
 
             let img = x.resize_exact(
                 w_new as u32,
@@ -215,17 +223,17 @@ impl crate::models::Model for YOLOX {
                 image::imageops::FilterType::Triangle,
             );
 
-            for (x, y, rgb) in img.pixels() {
+            for (x, y, rgb) in img.to_rgb8().enumerate_pixels() {
                 let x = x as usize;
                 let y = y as usize;
-                let [r, g, b, _] = rgb.0;
+                let [r, g, b] = rgb.0;
                 ys[[idx, 0, y, x]] = (r as f32) / 255.0;
                 ys[[idx, 1, y, x]] = (g as f32) / 255.0;
                 ys[[idx, 2, y, x]] = (b as f32) / 255.0;
             }
         }
 
-        Ok(ys)
+        Ok(vec![ys])
     }
 
     fn run(&mut self, xs: Vec<Array<f32, IxDyn>>, profile: bool) -> Result<Vec<Array<f32, IxDyn>>> {
@@ -316,8 +324,8 @@ impl crate::models::Model for YOLOX {
                     Bbox::new(
                         x1,
                         y1,
-                        x2 - x1,  // width
-                        y2 - y1,  // height
+                        x2 - x1, // width
+                        y2 - y1, // height
                         item[5] as usize,
                         item[4],
                     ),
