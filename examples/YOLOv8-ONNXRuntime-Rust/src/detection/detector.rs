@@ -9,6 +9,7 @@ use fast_image_resize as fr;
 use image::{DynamicImage, ImageBuffer, RgbImage, Rgba};
 
 use super::types::DecodedFrame;
+use super::{ByteTracker, PersonTracker};
 use crate::detection::types;
 use crate::models::{FastestV2, Model, ModelType, NanoDet, YOLOv8};
 use crate::{xbus, Args, YOLOTask};
@@ -26,24 +27,57 @@ pub struct DetectionResult {
     pub resized_size: u32,              // Resize后的图像尺寸
 }
 
+/// 跟踪器类型
+enum TrackerType {
+    DeepSort(PersonTracker),
+    ByteTrack(ByteTracker),
+    None,
+}
+
 pub struct Detector {
     detect_model_path: String,
     inf_size: u32,
+    tracker: TrackerType,
 
     // 统计
     count: u64,
     last: Instant,
     current_fps: f64,
+
+    // 跟踪统计
+    tracker_count: u64,
+    tracker_last: Instant,
+    tracker_current_fps: f64,
 }
 
 impl Detector {
-    pub fn new(detect_model: String, inf_size: u32) -> Self {
+    pub fn new(detect_model: String, inf_size: u32, tracker_name: String) -> Self {
+        // 根据跟踪器名称初始化
+        let tracker = match tracker_name.to_lowercase().as_str() {
+            "deepsort" => {
+                println!("🎯 跟踪器: DeepSort (级联匹配 + 外观特征)");
+                TrackerType::DeepSort(PersonTracker::new())
+            }
+            "bytetrack" => {
+                println!("🎯 跟踪器: ByteTrack (高低分分开处理)");
+                TrackerType::ByteTrack(ByteTracker::new())
+            }
+            _ => {
+                println!("🎯 跟踪器: 禁用");
+                TrackerType::None
+            }
+        };
+
         Self {
             detect_model_path: detect_model,
             inf_size,
+            tracker,
             count: 0,
             last: Instant::now(),
             current_fps: 0.0,
+            tracker_count: 0,
+            tracker_last: Instant::now(),
+            tracker_current_fps: 0.0,
         }
     }
 
@@ -308,8 +342,56 @@ impl Detector {
         // 7. 姿态估计 (当前未实现)
         let keypoints = Vec::new();
 
-        // 8. 追踪器更新 (当前已禁用用于性能测试)
-        let tracker_ms = 0.0;
+        // 8. 跟踪器更新
+        let tracker_start = Instant::now();
+        let tracked_bboxes = match &mut self.tracker {
+            TrackerType::DeepSort(tracker) => {
+                let tracked = tracker.update(&bboxes, &keypoints, None);
+                // 将跟踪结果转换为BBox格式(保持原有结构)
+                tracked
+                    .iter()
+                    .map(|t| types::BBox {
+                        x1: t.bbox.x1,
+                        y1: t.bbox.y1,
+                        x2: t.bbox.x2,
+                        y2: t.bbox.y2,
+                        confidence: t.bbox.confidence,
+                        class_id: t.id, // 使用跟踪ID替换class_id
+                    })
+                    .collect()
+            }
+            TrackerType::ByteTrack(tracker) => {
+                let tracked = tracker.update(&bboxes);
+                tracked
+                    .iter()
+                    .map(|t| types::BBox {
+                        x1: t.bbox.x1,
+                        y1: t.bbox.y1,
+                        x2: t.bbox.x2,
+                        y2: t.bbox.y2,
+                        confidence: t.bbox.confidence,
+                        class_id: t.id,
+                    })
+                    .collect()
+            }
+            TrackerType::None => bboxes.clone(), // 不使用跟踪器,直接返回检测结果
+        };
+        let tracker_ms = tracker_start.elapsed().as_secs_f64() * 1000.0;
+
+        // 更新跟踪器统计
+        if !matches!(self.tracker, TrackerType::None) {
+            self.tracker_count += 1;
+            let now_tracker = Instant::now();
+            if now_tracker.duration_since(self.tracker_last).as_secs() >= 1 {
+                self.tracker_current_fps = self.tracker_count as f64
+                    / now_tracker.duration_since(self.tracker_last).as_secs_f64();
+                self.tracker_count = 0;
+                self.tracker_last = now_tracker;
+            }
+        }
+
+        // 使用跟踪后的结果替换原始检测框
+        let bboxes = tracked_bboxes;
 
         // 9. 更新统计
         self.count += 1;
@@ -325,14 +407,26 @@ impl Detector {
 
         // 性能监控日志 (每60帧打印一次简洁信息)
         if self.count % 60 == 0 {
-            eprintln!(
-                "🎯 检测: {}人 | {:.1}ms/帧 | {:.1}fps (Resize:{:.1}ms | 推理:{:.1}ms)",
-                bboxes.len(),
-                total_ms,
-                self.current_fps,
-                resize_ms,
-                inference_ms
-            );
+            if matches!(self.tracker, TrackerType::None) {
+                eprintln!(
+                    "🎯 检测: {}人 | {:.1}ms/帧 | {:.1}fps (Resize:{:.1}ms | 推理:{:.1}ms)",
+                    bboxes.len(),
+                    total_ms,
+                    self.current_fps,
+                    resize_ms,
+                    inference_ms
+                );
+            } else {
+                eprintln!(
+                    "🎯 检测+跟踪: {}人 | {:.1}ms/帧 | {:.1}fps (Resize:{:.1}ms | 推理:{:.1}ms | 跟踪:{:.1}ms)",
+                    bboxes.len(),
+                    total_ms,
+                    self.current_fps,
+                    resize_ms,
+                    inference_ms,
+                    tracker_ms
+                );
+            }
         }
 
         // 10. 发送检测结果到XBus
@@ -341,7 +435,7 @@ impl Detector {
             keypoints,
             inference_fps: self.current_fps,
             inference_ms: total_ms,
-            tracker_fps: 0.0,
+            tracker_fps: self.tracker_current_fps,
             tracker_ms,
             resized_image: Some(resized_rgba),
             resized_size: inf_size,

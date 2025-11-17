@@ -35,6 +35,10 @@ struct Args {
     /// 检测模型 (n/s/m/l/x/fastest/fastest-xl/n-int8/m-int8/v5n/v5s/v5m/nanodet/nanodet-m/nanodet-plus)
     #[arg(short, long, default_value = "fastestv2")]
     model: String,
+
+    /// 跟踪算法 (deepsort/bytetrack/none)
+    #[arg(short = 't', long, default_value = "none")]
+    tracker: String,
 }
 
 fn main() -> GameResult {
@@ -83,6 +87,7 @@ fn main() -> GameResult {
 
     println!("🚀 数字卫兵系统启动");
     println!("📦 检测模型: {}", detect_model);
+    println!("🎯 跟踪算法: {}", args.tracker);
     println!("📹 RTSP地址: {}", args.rtsp_url);
     println!();
 
@@ -95,9 +100,10 @@ fn main() -> GameResult {
 
     // ========== 启动检测线程 ==========
     let detect_model_clone = detect_model.clone();
+    let tracker = args.tracker.clone();
 
     std::thread::spawn(move || {
-        let mut det = detection::Detector::new(detect_model_clone, INF_SIZE);
+        let mut det = detection::Detector::new(detect_model_clone, INF_SIZE, tracker);
         det.run();
     });
 
