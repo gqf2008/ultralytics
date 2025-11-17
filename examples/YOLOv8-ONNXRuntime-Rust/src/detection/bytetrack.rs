@@ -1,137 +1,14 @@
-/// ByteTrack 算法实现
-/// ByteTrack: Simple and effective multi-object tracking
-///
-/// 核心思想:
-/// 1. 高低分检测框分开处理
-/// 2. 高分框优先匹配 (IOU)
-/// 3. 低分框救援丢失的轨迹
-/// 4. 纯运动模型,无需外观特征
+//! ByteTrack 算法实现
+//! ByteTrack: Simple and effective multi-object tracking
+//!
+//! 核心思想:
+//! 1. 高低分检测框分开处理
+//! 2. 高分框优先匹配 (IOU)
+//! 3. 低分框救援丢失的轨迹
+//! 4. 纯运动模型,无需外观特征
+
+use super::tracker::{compute_iou, KalmanBoxFilter, TrackPoint};
 use super::types::BBox;
-
-/// 跟踪点 (用于绘制轨迹)
-#[derive(Clone, Debug)]
-pub struct TrackPoint {
-    pub x: f32,
-    pub y: f32,
-}
-
-/// 简化卡尔曼滤波器 (用于单个边界框)
-#[derive(Clone)]
-struct KalmanBoxFilter {
-    // 状态估计: [cx, cy, w, h, vx, vy, vw, vh]
-    state: [f32; 8],
-    // 估计误差协方差 (简化为对角阵)
-    p: [f32; 8],
-    // 过程噪声
-    q: f32,
-    // 观测噪声
-    r: f32,
-}
-
-impl KalmanBoxFilter {
-    fn new(bbox: &BBox) -> Self {
-        let cx = (bbox.x1 + bbox.x2) / 2.0;
-        let cy = (bbox.y1 + bbox.y2) / 2.0;
-        let w = bbox.x2 - bbox.x1;
-        let h = bbox.y2 - bbox.y1;
-
-        Self {
-            state: [cx, cy, w, h, 0.0, 0.0, 0.0, 0.0],
-            p: [10.0; 8], // ByteTrack 用更小的初始不确定性
-            q: 0.1,       // 较小的过程噪声 (运动更确定)
-            r: 1.0,       // 适中的观测噪声
-        }
-    }
-
-    fn predict(&mut self) {
-        // 状态转移: 匀速运动模型
-        self.state[0] += self.state[4];
-        self.state[1] += self.state[5];
-        self.state[2] += self.state[6];
-        self.state[3] += self.state[7];
-
-        // 协方差预测
-        for i in 0..8 {
-            self.p[i] += self.q;
-        }
-    }
-
-    fn update(&mut self, bbox: &BBox) {
-        let cx = (bbox.x1 + bbox.x2) / 2.0;
-        let cy = (bbox.y1 + bbox.y2) / 2.0;
-        let w = bbox.x2 - bbox.x1;
-        let h = bbox.y2 - bbox.y1;
-
-        // 卡尔曼增益
-        let k = [
-            self.p[0] / (self.p[0] + self.r),
-            self.p[1] / (self.p[1] + self.r),
-            self.p[2] / (self.p[2] + self.r),
-            self.p[3] / (self.p[3] + self.r),
-            self.p[4] / (self.p[4] + self.r * 5.0), // 速度增益降低
-            self.p[5] / (self.p[5] + self.r * 5.0),
-            self.p[6] / (self.p[6] + self.r * 5.0),
-            self.p[7] / (self.p[7] + self.r * 5.0),
-        ];
-
-        // 观测残差
-        let y = [
-            cx - self.state[0],
-            cy - self.state[1],
-            w - self.state[2],
-            h - self.state[3],
-        ];
-
-        // 状态更新
-        self.state[0] += k[0] * y[0];
-        self.state[1] += k[1] * y[1];
-        self.state[2] += k[2] * y[2];
-        self.state[3] += k[3] * y[3];
-
-        // 速度更新
-        self.state[4] += k[4] * y[0];
-        self.state[5] += k[5] * y[1];
-        self.state[6] += k[6] * y[2];
-        self.state[7] += k[7] * y[3];
-
-        // 协方差更新
-        for i in 0..8 {
-            self.p[i] *= 1.0 - k[i];
-        }
-    }
-
-    fn get_bbox(&self) -> BBox {
-        let cx = self.state[0];
-        let cy = self.state[1];
-        let w = self.state[2].max(1.0);
-        let h = self.state[3].max(1.0);
-
-        BBox {
-            x1: cx - w / 2.0,
-            y1: cy - h / 2.0,
-            x2: cx + w / 2.0,
-            y2: cy + h / 2.0,
-            confidence: 1.0,
-            class_id: 0,
-        }
-    }
-
-    fn get_predicted_bbox(&self) -> BBox {
-        let cx = self.state[0] + self.state[4];
-        let cy = self.state[1] + self.state[5];
-        let w = (self.state[2] + self.state[6]).max(1.0);
-        let h = (self.state[3] + self.state[7]).max(1.0);
-
-        BBox {
-            x1: cx - w / 2.0,
-            y1: cy - h / 2.0,
-            x2: cx + w / 2.0,
-            y2: cy + h / 2.0,
-            confidence: 1.0,
-            class_id: 0,
-        }
-    }
-}
 
 /// ByteTrack 跟踪对象
 #[derive(Clone)]
@@ -163,8 +40,9 @@ pub struct ByteTrackedPerson {
 
 impl ByteTrackedPerson {
     fn new(id: u32, bbox: BBox, color: (u8, u8, u8)) -> Self {
-        let kalman = KalmanBoxFilter::new(&bbox);
-        let smoothed_bbox = kalman.get_bbox();
+        // ByteTrack使用较小的过程噪声(q=0.1)和观测噪声(r=1.0)
+        let kalman = KalmanBoxFilter::new(&bbox, 0.1, 1.0);
+        let smoothed_bbox = kalman.get_state_bbox();
 
         let center = TrackPoint {
             x: (smoothed_bbox.x1 + smoothed_bbox.x2) / 2.0,
@@ -185,12 +63,12 @@ impl ByteTrackedPerson {
 
     fn predict(&mut self) {
         self.kalman.predict();
-        self.bbox = self.kalman.get_bbox();
+        self.bbox = self.kalman.get_state_bbox();
     }
 
     fn update(&mut self, bbox: BBox) {
         self.kalman.update(&bbox);
-        self.bbox = self.kalman.get_bbox();
+        self.bbox = self.kalman.get_state_bbox();
         self.frames_lost = 0;
         self.total_frames += 1;
         self.score = bbox.confidence;
@@ -362,7 +240,7 @@ impl ByteTracker {
         for (local_det_idx, (det_idx, detection)) in detections.iter().enumerate() {
             for (local_track_idx, &track_idx) in track_indices.iter().enumerate() {
                 let track = &self.tracked_persons[track_idx];
-                let iou = Self::compute_iou(detection, &track.get_predicted_bbox());
+                let iou = compute_iou(detection, &track.get_predicted_bbox());
 
                 if iou >= iou_threshold {
                     let cost = 1.0 - iou;
@@ -387,25 +265,6 @@ impl ByteTracker {
         }
 
         assignments
-    }
-
-    /// 计算 IOU
-    fn compute_iou(bbox1: &BBox, bbox2: &BBox) -> f32 {
-        let x1 = bbox1.x1.max(bbox2.x1);
-        let y1 = bbox1.y1.max(bbox2.y1);
-        let x2 = bbox1.x2.min(bbox2.x2);
-        let y2 = bbox1.y2.min(bbox2.y2);
-
-        if x2 < x1 || y2 < y1 {
-            return 0.0;
-        }
-
-        let intersection = (x2 - x1) * (y2 - y1);
-        let area1 = (bbox1.x2 - bbox1.x1) * (bbox1.y2 - bbox1.y1);
-        let area2 = (bbox2.x2 - bbox2.x1) * (bbox2.y2 - bbox2.y1);
-        let union = area1 + area2 - intersection;
-
-        intersection / union
     }
 
     /// 获取跟踪统计信息

@@ -5,14 +5,16 @@
 //! - Tracker:  目标追踪
 
 pub mod bytetrack;
+pub mod deepsort;
 pub mod detector;
 pub mod tracker;
 pub mod types;
 
 // Re-exports
 pub use bytetrack::{ByteTrackedPerson, ByteTracker};
+pub use deepsort::{PersonTracker, TrackedPerson};
 pub use detector::Detector;
-pub use tracker::{PersonTracker, TrackPoint, TrackedPerson};
+pub use tracker::{compute_iou, id_to_color, KalmanBoxFilter, TrackPoint, TrackedObject, Tracker};
 pub use types::{
     BBox, DecodedFrame, InferredFrame, PoseKeypoints, ResizedFrame, TrackerType, INF_SIZE,
 };
