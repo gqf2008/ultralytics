@@ -11,7 +11,7 @@ use image::{DynamicImage, ImageBuffer, RgbImage, Rgba};
 use super::types::DecodedFrame;
 use super::{ByteTracker, PersonTracker};
 use crate::detection::types;
-use crate::models::{FastestV2, Model, ModelType, NanoDet, YOLOv8};
+use crate::models::{FastestV2, Model, ModelType, NanoDet, YOLOv8, YOLOX};
 use crate::{xbus, Args, YOLOTask};
 
 /// 检测结果 (检测模块 → 渲染模块)
@@ -38,6 +38,7 @@ pub struct Detector {
     detect_model_path: String,
     inf_size: u32,
     tracker: TrackerType,
+    pose_enabled: bool,
 
     // 统计
     count: u64,
@@ -49,9 +50,13 @@ pub struct Detector {
     tracker_last: Instant,
     tracker_current_fps: f64,
 }
-
 impl Detector {
-    pub fn new(detect_model: String, inf_size: u32, tracker_name: String) -> Self {
+    pub fn new(
+        detect_model: String,
+        inf_size: u32,
+        tracker_name: String,
+        pose_enabled: bool,
+    ) -> Self {
         // 根据跟踪器名称初始化
         let tracker = match tracker_name.to_lowercase().as_str() {
             "deepsort" => {
@@ -72,6 +77,7 @@ impl Detector {
             detect_model_path: detect_model,
             inf_size,
             tracker,
+            pose_enabled,
             count: 0,
             last: Instant::now(),
             current_fps: 0.0,
@@ -115,6 +121,15 @@ impl Detector {
             ModelType::YOLOv8 | ModelType::YOLOv5 => match YOLOv8::new(detect_args) {
                 Ok(m) => {
                     println!("✅ YOLOv8 检测模型加载成功");
+                    // 检查姿态估计能力
+                    if self.pose_enabled {
+                        if m.supports_task(YOLOTask::Pose) {
+                            println!("✅ 姿态估计: 已启用 (模型支持)");
+                        } else {
+                            println!("⚠️ 姿态估计: 已请求但模型不支持,将禁用");
+                            self.pose_enabled = false;
+                        }
+                    }
                     Arc::new(Mutex::new(Box::new(m)))
                 }
                 Err(e) => {
@@ -139,6 +154,16 @@ impl Detector {
                 }
                 Err(e) => {
                     eprintln!("❌ NanoDet 模型加载失败: {}", e);
+                    return;
+                }
+            },
+            ModelType::YOLOX => match YOLOX::new(detect_args) {
+                Ok(m) => {
+                    println!("✅ YOLOX 检测模型加载成功");
+                    Arc::new(Mutex::new(Box::new(m)))
+                }
+                Err(e) => {
+                    eprintln!("❌ YOLOX 模型加载失败: {}", e);
                     return;
                 }
             },
@@ -339,8 +364,20 @@ impl Detector {
             );
         }
 
-        // 7. 姿态估计 (当前未实现)
-        let keypoints = Vec::new();
+        // 7. 姿态估计
+        let mut keypoints = Vec::new();
+        if self.pose_enabled {
+            for result in &detect_results {
+                if let Some(kpts) = result.keypoints() {
+                    for kpt in kpts {
+                        // 转换关键点数据: Vec<Point2> -> Vec<(f32, f32, f32)>
+                        let points: Vec<(f32, f32, f32)> =
+                            kpt.iter().map(|p| (p.x(), p.y(), p.confidence())).collect();
+                        keypoints.push(types::PoseKeypoints { points });
+                    }
+                }
+            }
+        }
 
         // 8. 跟踪器更新
         let tracker_start = Instant::now();

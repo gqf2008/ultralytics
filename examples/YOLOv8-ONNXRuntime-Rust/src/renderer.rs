@@ -56,20 +56,20 @@ enum RenderFrame {
 
 impl Renderer {
     pub fn new(detect_model: String, pose_model: String, tracker: String) -> GameResult<Self> {
-        println!("🎨 渲染器启动");
+        println!("渲染器启动");
         let (tx, rx) = crossbeam_channel::bounded(120);
         // 订阅DecodedFrame
         let tx1 = tx.clone();
         let frame_sub = xbus::subscribe::<DecodedFrame, _>(move |frame| {
             if let Err(err) = tx1.try_send(RenderFrame::Video(frame.clone())) {
-                eprintln!("⚠️ 渲染器通道发送DecodedFrame失败: {}", err);
+                eprintln!("渲染器通道发送DecodedFrame失败: {}", err);
             }
         });
 
         // 订阅Det ectionResult
         let result_sub = xbus::subscribe::<DetectionResult, _>(move |result| {
             if let Err(err) = tx.try_send(RenderFrame::Detection(result.clone())) {
-                eprintln!("⚠️ 渲染器通道发送DetectionResult失败: {}", err);
+                eprintln!("渲染器通道发送DetectionResult失败: {}", err);
             }
         });
 
@@ -163,36 +163,36 @@ impl Renderer {
 
         // 准备统计信息文本
         let mut lines = vec![
-            format!("🚀 数字卫兵 Digital Sentinel"),
+            format!("数字卫兵 Digital Sentinel"),
             format!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━"),
         ];
 
         // 检测模型
-        lines.push(format!("🎯 检测: {}", self.detect_model_name));
+        lines.push(format!("检测: {}", self.detect_model_name));
 
         // 姿态模型
         if !self.pose_model_name.is_empty() {
-            lines.push(format!("🦴 姿态: {}", self.pose_model_name));
+            lines.push(format!("姿态: {}", self.pose_model_name));
         }
 
         // 追踪器
-        lines.push(format!("📍 追踪: {}", self.tracker_name));
+        lines.push(format!("追踪: {}", self.tracker_name));
 
         lines.push(format!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━"));
 
         // 性能统计
         if let Some(detection) = &self.last_detection {
-            lines.push(format!("⚡ 检测FPS: {:.1}", detection.inference_fps));
-            lines.push(format!("⏱️  检测耗时: {:.1}ms", detection.inference_ms));
-            lines.push(format!("🔄 追踪FPS: {:.1}", detection.tracker_fps));
-            lines.push(format!("⏲️  追踪耗时: {:.2}ms", detection.tracker_ms));
-            lines.push(format!("👤 人数: {}", detection.bboxes.len()));
+            lines.push(format!("检测FPS: {:.1}", detection.inference_fps));
+            lines.push(format!("检测耗时: {:.1}ms", detection.inference_ms));
+            lines.push(format!("追踪FPS: {:.1}", detection.tracker_fps));
+            lines.push(format!("追踪耗时: {:.2}ms", detection.tracker_ms));
+            lines.push(format!("人数: {}", detection.bboxes.len()));
         } else {
-            lines.push(format!("⚡ 检测FPS: --"));
-            lines.push(format!("⏱️  检测耗时: --"));
-            lines.push(format!("🔄 追踪FPS: --"));
-            lines.push(format!("⏲️  追踪耗时: --"));
-            lines.push(format!("👤 人数: 0"));
+            lines.push(format!("检测FPS: --"));
+            lines.push(format!("检测耗时: --"));
+            lines.push(format!("追踪FPS: --"));
+            lines.push(format!("追踪耗时: --"));
+            lines.push(format!("人数: 0"));
         }
 
         lines.push(format!("🖼️  渲染FPS: {:.1}", self.render_fps));

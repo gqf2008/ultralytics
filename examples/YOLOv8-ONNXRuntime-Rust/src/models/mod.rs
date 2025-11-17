@@ -45,6 +45,8 @@ pub enum ModelType {
     YOLOv8,
     /// YOLOv5 模型
     YOLOv5,
+    /// YOLOX 无锚点模型
+    YOLOX,
     /// YOLO-FastestV2 超轻量级模型
     FastestV2,
     /// NanoDet 系列模型
@@ -54,7 +56,9 @@ pub enum ModelType {
 impl ModelType {
     /// 从模型路径推断模型类型
     pub fn from_path(path: &str) -> Self {
-        if path.contains("fastestv2") {
+        if path.contains("yolox") {
+            ModelType::YOLOX
+        } else if path.contains("fastestv2") {
             ModelType::FastestV2
         } else if path.contains("nanodet") {
             ModelType::NanoDet
@@ -68,6 +72,7 @@ impl ModelType {
     /// 获取模型推荐的置信度阈值
     pub fn default_conf_threshold(&self) -> f32 {
         match self {
+            ModelType::YOLOX => 0.25,
             ModelType::FastestV2 => 0.10,
             ModelType::NanoDet => 0.35,
             ModelType::YOLOv5 => 0.25,
@@ -168,8 +173,10 @@ pub trait Model {
 pub mod fastestv2;
 pub mod nanodet;
 pub mod yolov8; // YOLOv8 完整模型 + 实现 Model trait
+pub mod yolox; // YOLOX 无锚点模型
 
 // Re-exports
 pub use fastestv2::{FastestV2, FastestV2Config, FastestV2Postprocessor};
 pub use nanodet::{NanoDet, NanoDetConfig, NanoDetPostprocessor};
 pub use yolov8::{YOLOv8, YOLOv8Config, YOLOv8Postprocessor};
+pub use yolox::YOLOX;

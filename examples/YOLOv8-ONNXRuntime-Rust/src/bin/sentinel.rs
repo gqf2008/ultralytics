@@ -32,13 +32,17 @@ struct Args {
     )]
     rtsp_url: String,
 
-    /// 检测模型 (n/s/m/l/x/fastest/fastest-xl/n-int8/m-int8/v5n/v5s/v5m/nanodet/nanodet-m/nanodet-plus)
-    #[arg(short, long, default_value = "fastestv2")]
+    /// 检测模型 (n/s/m/l/x/fastest/fastest-xl/n-int8/m-int8/v5n/v5s/v5m/nanodet/nanodet-m/nanodet-plus/yolox_s/yolox_m/yolox_l)
+    #[arg(short, long, default_value = "n")]
     model: String,
 
     /// 跟踪算法 (deepsort/bytetrack/none)
     #[arg(short = 't', long, default_value = "none")]
     tracker: String,
+
+    /// 启用姿态估计 (需要pose模型支持)
+    #[arg(short = 'p', long, default_value_t = false)]
+    pose: bool,
 }
 
 fn main() -> GameResult {
@@ -51,7 +55,10 @@ fn main() -> GameResult {
         "yolo-fastest-1.1"
     };
 
-    let detect_model = if args.model == "fastest" || args.model.starts_with("fastest") {
+    let detect_model = if args.model.starts_with("yolox") {
+        // YOLOX 模型 (例如: yolox_s -> yolox_s.onnx, yolox_m -> yolox_m.onnx)
+        format!("models/{}.onnx", args.model)
+    } else if args.model == "fastest" || args.model.starts_with("fastest") {
         format!("models/{}.onnx", fastest_variant)
     } else if args.model.starts_with("nanodet") {
         // NanoDet 模型 (例如: nanodet-m -> nanodet-m.onnx, nanodet-plus -> nanodet-plus-m_320.onnx)
@@ -88,6 +95,7 @@ fn main() -> GameResult {
     println!("🚀 数字卫兵系统启动");
     println!("📦 检测模型: {}", detect_model);
     println!("🎯 跟踪算法: {}", args.tracker);
+    println!("🧍 姿态估计: {}", if args.pose { "启用" } else { "禁用" });
     println!("📹 RTSP地址: {}", args.rtsp_url);
     println!();
 
@@ -101,9 +109,10 @@ fn main() -> GameResult {
     // ========== 启动检测线程 ==========
     let detect_model_clone = detect_model.clone();
     let tracker = args.tracker.clone();
+    let pose_enabled = args.pose;
 
     std::thread::spawn(move || {
-        let mut det = detection::Detector::new(detect_model_clone, INF_SIZE, tracker);
+        let mut det = detection::Detector::new(detect_model_clone, INF_SIZE, tracker, pose_enabled);
         det.run();
     });
 
