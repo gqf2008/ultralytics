@@ -27,7 +27,7 @@ struct Args {
     )]
     rtsp_url: String,
 
-    /// 检测模型 (n/s/m/l/x/fastest/fastest-xl/n-int8/m-int8/v5n/v5s/v5m)
+    /// 检测模型 (n/s/m/l/x/fastest/fastest-xl/n-int8/m-int8/v5n/v5s/v5m/nanodet/nanodet-m/nanodet-plus)
     #[arg(short, long, default_value = "fastestv2")]
     model: String,
 
@@ -52,6 +52,21 @@ fn main() -> GameResult {
 
     let detect_model = if args.model == "fastest" || args.model.starts_with("fastest") {
         format!("models/{}.onnx", fastest_variant)
+    } else if args.model.starts_with("nanodet") {
+        // NanoDet 模型 (例如: nanodet-m -> nanodet-m.onnx, nanodet-plus -> nanodet-plus-m_320.onnx)
+        if args.model == "nanodet" || args.model == "nanodet-m" {
+            "models/nanodet-m.onnx".to_string()
+        } else if args.model == "nanodet-plus" {
+            "models/nanodet-plus-m_320.onnx".to_string()
+        } else if args.model == "nanodet-plus-416" {
+            "models/nanodet-plus-m_416.onnx".to_string()
+        } else if args.model == "nanodet-plus-1.5x" {
+            "models/nanodet-plus-m-1.5x_320.onnx".to_string()
+        } else if args.model == "nanodet-plus-1.5x-416" {
+            "models/nanodet-plus-m-1.5x_416.onnx".to_string()
+        } else {
+            format!("models/{}.onnx", args.model)
+        }
     } else if args.model.starts_with("v5") {
         // YOLOv5 模型 (例如: v5n -> yolov5n.onnx)
         let variant = args.model.trim_start_matches("v5");
@@ -61,13 +76,19 @@ fn main() -> GameResult {
         let base = args.model.trim_end_matches("-int8");
         format!("models/yolov8{}_int8.onnx", base)
     } else {
-        format!("models/yolov8{}.onnx", args.model)
+        // YOLOv8 标准模型 (例如: yolov8n -> yolov8n.onnx, 或直接 n -> yolov8n.onnx)
+        if args.model.starts_with("yolov8") {
+            format!("models/{}.onnx", args.model)
+        } else {
+            format!("models/yolov8{}.onnx", args.model)
+        }
     };
 
     let pose_model = if args.pose
         && !args.model.starts_with("fastest")
         && !args.model.ends_with("-int8")
         && !args.model.starts_with("v5")
+        && !args.model.starts_with("nanodet")
     {
         format!("models/yolov8{}-pose.onnx", args.model)
     } else {
@@ -123,7 +144,16 @@ fn main() -> GameResult {
     ctx.gfx.add_font("MicrosoftYaHei", font);
     println!("✅ 中文字体加载成功: 微软雅黑");
 
-    let renderer = Renderer::new()?;
+    // 提取干净的模型名称 (去掉路径和扩展名)
+    let detect_model_name = detect_model.replace("models/", "").replace(".onnx", "");
+    let pose_model_name = if pose_model.is_empty() {
+        String::new()
+    } else {
+        pose_model.replace("models/", "").replace(".onnx", "")
+    };
+    let tracker_name = args.tracker.clone();
+
+    let renderer = Renderer::new(detect_model_name, pose_model_name, tracker_name)?;
 
     println!("✅ 系统就绪,开始监控...\n");
 

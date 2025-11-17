@@ -5,8 +5,9 @@ use crate::rtsp::DecodedFrame;
 use crate::xbus::{self, Subscription};
 use crate::SKELETON;
 use crossbeam_channel::Receiver;
-use ggez::event::EventHandler;
+use ggez::event::{EventHandler, MouseButton};
 use ggez::graphics::{Canvas, Color, DrawMode, DrawParam, Image, Mesh, Rect, Text, TextFragment};
+use ggez::input::keyboard::KeyCode;
 use ggez::mint::Point2;
 use ggez::{Context, GameResult};
 use std::time::Instant;
@@ -20,6 +21,16 @@ pub struct Renderer {
     render_count: u64,
     render_last: Instant,
     render_fps: f64,
+    // Resize预览窗口拖动相关
+    preview_pos: (f32, f32),         // 预览窗口位置 (默认右下角)
+    preview_dragging: bool,          // 是否正在拖动
+    preview_drag_offset: (f32, f32), // 拖动时鼠标相对预览窗口的偏移
+    preview_visible: bool,           // 是否显示预览窗口 (Space键切换)
+    // 系统配置信息
+    detect_model_name: String, // 检测模型名称
+    pose_model_name: String,   // 姿态模型名称
+    tracker_name: String,      // 追踪器名称
+    decode_fps: f64,           // 解码FPS
 }
 
 /// 系统控制
@@ -36,7 +47,7 @@ enum RenderFrame {
 }
 
 impl Renderer {
-    pub fn new() -> GameResult<Self> {
+    pub fn new(detect_model: String, pose_model: String, tracker: String) -> GameResult<Self> {
         println!("🎨 渲染器启动");
         let (tx, rx) = crossbeam_channel::bounded(120);
         // 订阅DecodedFrame
@@ -63,6 +74,14 @@ impl Renderer {
             render_count: 0,
             render_last: Instant::now(),
             render_fps: 0.0,
+            preview_pos: (0.0, 0.0), // 初始化为(0,0),在draw时设置为右下角
+            preview_dragging: false,
+            preview_drag_offset: (0.0, 0.0),
+            preview_visible: true, // 默认显示预览窗口
+            detect_model_name: detect_model,
+            pose_model_name: pose_model,
+            tracker_name: tracker,
+            decode_fps: 0.0,
         })
     }
 
@@ -117,16 +136,100 @@ impl Renderer {
         let b_range = b_max - b_min;
         let total_range = r_range.max(g_range).max(b_range);
 
-        // 如果RGB对比度都很低(<10),认为是灰屏/单调帧
-        if total_range < 10 {
-            eprintln!(
-                "⚠️ 渲染器跳过低对比度帧 (RGB范围: {}/{}/{})",
-                r_range, g_range, b_range
-            );
+        // 降低阈值避免窗口无响应 (从10降到3)
+        if total_range < 3 {
+            // 不再打印警告,避免刷屏
             return false;
         }
 
         true
+    }
+
+    /// 绘制系统统计信息面板 (左上角)
+    fn draw_stats_panel(&self, ctx: &mut Context, canvas: &mut Canvas) -> GameResult {
+        let margin = 10.0;
+        let panel_width = 280.0;
+        let line_height = 22.0;
+        let font_size = 16.0;
+
+        // 准备统计信息文本
+        let mut lines = vec![
+            format!("🚀 数字卫兵 Digital Sentinel"),
+            format!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━"),
+        ];
+
+        // 检测模型
+        lines.push(format!("🎯 检测: {}", self.detect_model_name));
+
+        // 姿态模型
+        if !self.pose_model_name.is_empty() {
+            lines.push(format!("🦴 姿态: {}", self.pose_model_name));
+        }
+
+        // 追踪器
+        lines.push(format!("📍 追踪: {}", self.tracker_name));
+
+        lines.push(format!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━"));
+
+        // 性能统计
+        if let Some(detection) = &self.last_detection {
+            lines.push(format!("⚡ 检测FPS: {:.1}", detection.inference_fps));
+            lines.push(format!("⏱️  检测耗时: {:.1}ms", detection.inference_ms));
+            lines.push(format!("🔄 追踪FPS: {:.1}", detection.tracker_fps));
+            lines.push(format!("⏲️  追踪耗时: {:.2}ms", detection.tracker_ms));
+            lines.push(format!("👤 人数: {}", detection.bboxes.len()));
+        } else {
+            lines.push(format!("⚡ 检测FPS: --"));
+            lines.push(format!("⏱️  检测耗时: --"));
+            lines.push(format!("🔄 追踪FPS: --"));
+            lines.push(format!("⏲️  追踪耗时: --"));
+            lines.push(format!("👤 人数: 0"));
+        }
+
+        lines.push(format!("🖼️  渲染FPS: {:.1}", self.render_fps));
+
+        // 计算面板高度
+        let panel_height = lines.len() as f32 * line_height + 20.0;
+
+        // 绘制半透明背景
+        let bg_rect = Rect::new(margin, margin, panel_width, panel_height);
+        let bg_mesh = Mesh::new_rectangle(
+            ctx,
+            DrawMode::fill(),
+            bg_rect,
+            Color::from_rgba(0, 0, 0, 180), // 半透明黑色
+        )?;
+        canvas.draw(&bg_mesh, DrawParam::default());
+
+        // 绘制边框
+        let border_mesh = Mesh::new_rectangle(
+            ctx,
+            DrawMode::stroke(2.0),
+            bg_rect,
+            Color::from_rgb(0, 200, 255), // 青蓝色边框
+        )?;
+        canvas.draw(&border_mesh, DrawParam::default());
+
+        // 绘制文本
+        for (i, line) in lines.iter().enumerate() {
+            let y_pos = margin + 10.0 + i as f32 * line_height;
+            let text = Text::new(
+                TextFragment::new(line.clone())
+                    .font("MicrosoftYaHei")
+                    .scale(font_size),
+            );
+            canvas.draw(
+                &text,
+                DrawParam::default()
+                    .dest(Point2 {
+                        x: margin + 10.0,
+                        y: y_pos,
+                    })
+                    .color(Color::from_rgb(255, 255, 255)),
+            );
+        }
+
+        Ok(())
     }
 }
 
@@ -135,21 +238,18 @@ impl EventHandler for Renderer {
         if let Some(frame) = self.render_frame_buffer.try_iter().last() {
             match frame {
                 RenderFrame::Video(decoded_frame) => {
-                    // ✅ 在渲染前做二次质量检查,防止灰屏
-                    if !Self::is_valid_frame(&decoded_frame) {
-                        // 跳过低质量帧,保留上一帧
-                        return Ok(());
+                    // 只更新有效帧,低质量帧保留上一帧 (不要return,保持事件循环)
+                    if Self::is_valid_frame(&decoded_frame) {
+                        let image = Image::from_pixels(
+                            ctx,
+                            &decoded_frame.rgba_data,
+                            ggez::graphics::ImageFormat::Rgba8UnormSrgb,
+                            decoded_frame.width,
+                            decoded_frame.height,
+                        );
+                        self.last_frame.replace(image);
                     }
-
-                    // 渲染视频帧
-                    let image = Image::from_pixels(
-                        ctx,
-                        &decoded_frame.rgba_data,
-                        ggez::graphics::ImageFormat::Rgba8UnormSrgb,
-                        decoded_frame.width,
-                        decoded_frame.height,
-                    );
-                    self.last_frame.replace(image);
+                    // 即使跳过帧也继续,不要return,保持窗口响应
                 }
                 RenderFrame::Detection(detection_result) => {
                     self.last_detection.replace(detection_result);
@@ -189,7 +289,8 @@ impl EventHandler for Renderer {
 
                     // 置信度标签
                     let label = format!("Person {:.2}", bbox.confidence);
-                    let text = Text::new(TextFragment::new(label).scale(18.0));
+                    let text =
+                        Text::new(TextFragment::new(label).font("MicrosoftYaHei").scale(18.0));
                     canvas.draw(
                         &text,
                         DrawParam::default()
@@ -251,6 +352,73 @@ impl EventHandler for Renderer {
                         }
                     }
                 }
+
+                // 在右下角显示resize后的图像 (可拖动, Space键切换显示)
+                if self.preview_visible {
+                    if let Some(ref resized_data) = detection_result.resized_image {
+                        let (window_width, window_height) = ctx.gfx.drawable_size();
+
+                        let resized_img = Image::from_pixels(
+                            ctx,
+                            resized_data,
+                            ggez::graphics::ImageFormat::Rgba8UnormSrgb,
+                            detection_result.resized_size,
+                            detection_result.resized_size,
+                        );
+
+                        // 计算预览窗口位置 (首次默认右下角,之后使用拖动位置)
+                        let margin = 10.0;
+                        let preview_size = 200.0; // 预览窗口大小
+                        let preview_scale = preview_size / detection_result.resized_size as f32;
+
+                        // 如果还未初始化位置,设为右下角
+                        if self.preview_pos == (0.0, 0.0) {
+                            self.preview_pos = (
+                                window_width - preview_size - margin,
+                                window_height - preview_size - margin,
+                            );
+                        }
+
+                        let x = self.preview_pos.0;
+                        let y = self.preview_pos.1;
+
+                        // 绘制边框
+                        let border_rect =
+                            Rect::new(x - 2.0, y - 2.0, preview_size + 4.0, preview_size + 4.0);
+                        let border_mesh = Mesh::new_rectangle(
+                            ctx,
+                            DrawMode::stroke(2.0),
+                            border_rect,
+                            Color::from_rgb(0, 255, 255), // 青色边框
+                        )?;
+                        canvas.draw(&border_mesh, DrawParam::default());
+
+                        // 绘制resize后的图像
+                        canvas.draw(
+                            &resized_img,
+                            DrawParam::default()
+                                .dest(Point2 { x, y })
+                                .scale([preview_scale, preview_scale]),
+                        );
+
+                        // 添加标签
+                        let label_text = format!(
+                            "推理输入 {}x{}",
+                            detection_result.resized_size, detection_result.resized_size
+                        );
+                        let label = Text::new(
+                            TextFragment::new(label_text)
+                                .font("MicrosoftYaHei")
+                                .scale(18.0),
+                        );
+                        canvas.draw(
+                            &label,
+                            DrawParam::default()
+                                .dest(Point2 { x, y: y - 25.0 })
+                                .color(Color::from_rgb(0, 255, 255)),
+                        );
+                    }
+                }
             }
         }
 
@@ -263,7 +431,91 @@ impl EventHandler for Renderer {
             self.render_count = 0;
             self.render_last = now;
         }
+
+        // 绘制左上角系统统计信息面板
+        self.draw_stats_panel(ctx, &mut canvas)?;
+
         canvas.finish(ctx)?;
+        Ok(())
+    }
+
+    fn mouse_button_down_event(
+        &mut self,
+        _ctx: &mut Context,
+        button: MouseButton,
+        x: f32,
+        y: f32,
+    ) -> GameResult {
+        if button == MouseButton::Left {
+            // 检查是否点击在resize预览区域
+            let preview_size = 200.0;
+            let px = self.preview_pos.0;
+            let py = self.preview_pos.1;
+
+            if x >= px && x <= px + preview_size && y >= py && y <= py + preview_size {
+                self.preview_dragging = true;
+                self.preview_drag_offset = (x - px, y - py);
+            }
+        }
+        Ok(())
+    }
+
+    fn mouse_button_up_event(
+        &mut self,
+        _ctx: &mut Context,
+        button: MouseButton,
+        _x: f32,
+        _y: f32,
+    ) -> GameResult {
+        if button == MouseButton::Left {
+            self.preview_dragging = false;
+        }
+        Ok(())
+    }
+
+    fn mouse_motion_event(
+        &mut self,
+        ctx: &mut Context,
+        x: f32,
+        y: f32,
+        _dx: f32,
+        _dy: f32,
+    ) -> GameResult {
+        if self.preview_dragging {
+            let preview_size = 200.0;
+            let (window_width, window_height) = ctx.gfx.drawable_size();
+
+            // 计算新位置 (考虑拖动偏移)
+            let mut new_x = x - self.preview_drag_offset.0;
+            let mut new_y = y - self.preview_drag_offset.1;
+
+            // 限制在窗口范围内
+            new_x = new_x.max(0.0).min(window_width - preview_size);
+            new_y = new_y.max(0.0).min(window_height - preview_size);
+
+            self.preview_pos = (new_x, new_y);
+        }
+        Ok(())
+    }
+
+    fn key_down_event(
+        &mut self,
+        _ctx: &mut Context,
+        input: ggez::input::keyboard::KeyInput,
+        _repeated: bool,
+    ) -> GameResult {
+        // Space键切换预览窗口显示/隐藏
+        if input.keycode == Some(KeyCode::Space) {
+            self.preview_visible = !self.preview_visible;
+            println!(
+                "🔲 Resize预览窗口: {}",
+                if self.preview_visible {
+                    "显示"
+                } else {
+                    "隐藏"
+                }
+            );
+        }
         Ok(())
     }
 }

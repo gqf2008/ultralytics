@@ -1,12 +1,14 @@
 /// 检测器 (Detector)
 /// 职责: 订阅DecodedFrame → YOLO检测 → 追踪 → 发送DetectionResult消息
 use crate::fastestv2::{FastestV2Config, FastestV2Postprocessor};
+use crate::nanodet::{NanoDetConfig, NanoDetPostprocessor};
 use crate::rtsp::DecodedFrame;
 use crate::rtsp::{tracker::PersonTracker, types, TrackerType};
 use crate::xbus;
 use crate::{Args as YoloArgs, YOLOTask, YOLOv8};
 use crossbeam_channel::{self, Receiver, Sender};
-use image::{imageops, DynamicImage, ImageBuffer, RgbImage, Rgba};
+use fast_image_resize as fr;
+use image::{DynamicImage, ImageBuffer, RgbImage, Rgba};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -17,6 +19,10 @@ pub struct DetectionResult {
     pub keypoints: Vec<types::PoseKeypoints>,
     pub inference_fps: f64,
     pub inference_ms: f64,
+    pub tracker_fps: f64,               // 追踪器FPS
+    pub tracker_ms: f64,                // 追踪器耗时
+    pub resized_image: Option<Vec<u8>>, // Resize后的RGB图像数据 (用于右下角显示)
+    pub resized_size: u32,              // Resize后的图像尺寸
 }
 
 pub struct Detector {
@@ -30,11 +36,13 @@ pub struct Detector {
     last: Instant,
     current_fps: f64,
 
-    // 姿态估计优化: 跳帧策略
-    pose_skip_counter: u32,
-    pose_skip_interval: u32, // 每N帧做一次姿态估计
+    // 追踪器性能统计
+    tracker_count: u64,
+    tracker_last: Instant,
+    tracker_fps: f64,
 
-    // 追踪器
+    // 追踪器 (已禁用用于性能测试)
+    #[allow(dead_code)]
     tracker: Option<PersonTracker>,
 }
 
@@ -53,9 +61,10 @@ impl Detector {
             count: 0,
             last: Instant::now(),
             current_fps: 0.0,
-            pose_skip_counter: 0,
-            pose_skip_interval: 5, // 每5帧做一次姿态估计,提升性能
-            tracker: None,         // 延迟初始化,在run中创建
+            tracker_count: 0,
+            tracker_last: Instant::now(),
+            tracker_fps: 0.0,
+            tracker: None, // 已禁用用于性能测试
         }
     }
 
@@ -63,14 +72,21 @@ impl Detector {
         println!("🔍 检测模块启动");
 
         let is_fastestv2 = self.detect_model_path.contains("fastestv2");
+        let is_nanodet = self.detect_model_path.contains("nanodet");
 
         // 加载检测模型
         let detect_args = YoloArgs {
             model: self.detect_model_path.clone(),
             width: Some(self.inf_size),
             height: Some(self.inf_size),
-            conf: if is_fastestv2 { 0.10 } else { 0.15 },
-            iou: 0.45,
+            conf: if is_fastestv2 {
+                0.10
+            } else if is_nanodet {
+                0.35 // NanoDet推荐0.35
+            } else {
+                0.15
+            },
+            iou: if is_nanodet { 0.6 } else { 0.45 },
             source: String::new(),
             device_id: 0,
             trt: false,
@@ -112,6 +128,24 @@ impl Detector {
                 ],
             };
             Some(FastestV2Postprocessor::new(
+                config,
+                self.inf_size as usize,
+                self.inf_size as usize,
+            ))
+        } else {
+            None
+        };
+
+        // NanoDet专用后处理
+        let nanodet_postprocessor = if is_nanodet {
+            let config = NanoDetConfig {
+                num_classes: 80,
+                strides: vec![8, 16, 32], // NanoDet-Plus三层特征
+                conf_threshold: 0.35,     // NanoDet推荐0.35
+                iou_threshold: 0.6,
+                reg_max: 7, // DFL参数
+            };
+            Some(NanoDetPostprocessor::new(
                 config,
                 self.inf_size as usize,
                 self.inf_size as usize,
@@ -191,6 +225,7 @@ impl Detector {
                         &detect_model,
                         &pose_model,
                         &fastestv2_postprocessor,
+                        &nanodet_postprocessor,
                         inf_size,
                     );
                 }
@@ -209,11 +244,12 @@ impl Detector {
         &mut self,
         frame: DecodedFrame,
         detect_model: &Arc<Mutex<YOLOv8>>,
-        pose_model: &Option<Arc<Mutex<YOLOv8>>>,
+        _pose_model: &Option<Arc<Mutex<YOLOv8>>>,
         fastestv2_postprocessor: &Option<FastestV2Postprocessor>,
+        nanodet_postprocessor: &Option<NanoDetPostprocessor>,
         inf_size: u32,
     ) {
-        let start = Instant::now();
+        let start_total = Instant::now();
 
         // 1. RGBA → RgbaImage
         let rgba_img = match ImageBuffer::<Rgba<u8>, _>::from_raw(
@@ -227,19 +263,53 @@ impl Detector {
                 return;
             }
         };
-        // 2. Resize: 动态分辨率 → 320x320
-        let resized_rgba = imageops::resize(
-            &rgba_img,
-            inf_size,
-            inf_size,
-            imageops::FilterType::Triangle,
-        );
 
-        // 3. RGBA → RGB
-        let rgb_data: Vec<u8> = resized_rgba
-            .pixels()
-            .flat_map(|p| vec![p.0[0], p.0[1], p.0[2]])
-            .collect();
+        // 2. Resize: 动态分辨率 → 320x320 (使用 fast_image_resize 高性能库 + Nearest 插值)
+        let t2 = Instant::now();
+
+        // 创建源图像 (RGBA)
+        let src_buffer = rgba_img.as_raw().clone();
+        let src_image = fr::images::Image::from_vec_u8(
+            frame.width,
+            frame.height,
+            src_buffer,
+            fr::PixelType::U8x4,
+        )
+        .unwrap();
+
+        // 创建目标图像 (RGBA)
+        let mut dst_image = fr::images::Image::new(inf_size, inf_size, fr::PixelType::U8x4);
+
+        // 执行超快速缩放 (Nearest 算法,比 Bilinear 快 5-10 倍,牺牲少量质量换取极致速度)
+        let mut resizer = fr::Resizer::new();
+        resizer
+            .resize(
+                &src_image,
+                &mut dst_image,
+                &fr::ResizeOptions::new().resize_alg(fr::ResizeAlg::Nearest), // 最快插值算法
+            )
+            .unwrap();
+
+        let resize_ms = t2.elapsed().as_secs_f64() * 1000.0;
+
+        // 3. RGBA → RGB (优化版: 预分配 + 直接循环)
+        let dst_pixels = dst_image.buffer();
+        let mut rgb_data = Vec::with_capacity((inf_size * inf_size * 3) as usize);
+        for chunk in dst_pixels.chunks_exact(4) {
+            rgb_data.push(chunk[0]); // R
+            rgb_data.push(chunk[1]); // G
+            rgb_data.push(chunk[2]); // B
+                                     // 跳过 Alpha 通道
+        }
+
+        // 保存一份用于右下角显示 (转换为RGBA格式,ggez需要)
+        let mut resized_rgba = Vec::with_capacity((inf_size * inf_size * 4) as usize);
+        for chunk in dst_pixels.chunks_exact(4) {
+            resized_rgba.push(chunk[0]); // R
+            resized_rgba.push(chunk[1]); // G
+            resized_rgba.push(chunk[2]); // B
+            resized_rgba.push(255); // A (不透明)
+        }
 
         // 4. RGB → DynamicImage
         let rgb_img = match RgbImage::from_raw(inf_size, inf_size, rgb_data) {
@@ -251,18 +321,49 @@ impl Detector {
         };
         let img = DynamicImage::ImageRgb8(rgb_img);
 
-        // 5. YOLO检测
-        let detect_results = if let Some(ref pp) = fastestv2_postprocessor {
-            // FastestV2专用后处理
-            let mut model = detect_model.lock().unwrap();
-            let xs = model.preprocess(&vec![img.clone()]).unwrap_or_default();
-            let ys = model.engine_mut().run(xs, false).unwrap_or_default();
-            drop(model);
-            pp.postprocess(ys, &vec![img.clone()]).unwrap_or_default()
-        } else {
-            let mut model = detect_model.lock().unwrap();
-            model.run(&vec![img.clone()]).unwrap_or_default()
-        };
+        // 5. YOLO检测 (只保留inference_ms用于日志)
+        let t5_preprocess = Instant::now();
+        let (detect_results, _preprocess_ms, inference_ms, _postprocess_ms) =
+            if let Some(ref pp) = fastestv2_postprocessor {
+                // FastestV2专用后处理
+                let mut model = detect_model.lock().unwrap();
+                let xs = model.preprocess(&vec![img.clone()]).unwrap_or_default();
+                let preprocess_time = t5_preprocess.elapsed().as_secs_f64() * 1000.0;
+
+                let t5_inference = Instant::now();
+                let ys = model.engine_mut().run(xs, false).unwrap_or_default();
+                let inference_time = t5_inference.elapsed().as_secs_f64() * 1000.0;
+                drop(model);
+
+                let t5_postprocess = Instant::now();
+                let results = pp.postprocess(ys, &vec![img.clone()]).unwrap_or_default();
+                let postprocess_time = t5_postprocess.elapsed().as_secs_f64() * 1000.0;
+
+                (results, preprocess_time, inference_time, postprocess_time)
+            } else if let Some(ref pp) = nanodet_postprocessor {
+                // NanoDet专用后处理
+                let mut model = detect_model.lock().unwrap();
+                let xs = model.preprocess(&vec![img.clone()]).unwrap_or_default();
+                let preprocess_time = t5_preprocess.elapsed().as_secs_f64() * 1000.0;
+
+                let t5_inference = Instant::now();
+                let ys = model.engine_mut().run(xs, false).unwrap_or_default();
+                let inference_time = t5_inference.elapsed().as_secs_f64() * 1000.0;
+                drop(model);
+
+                let t5_postprocess = Instant::now();
+                let results = pp.postprocess(ys, &vec![img.clone()]).unwrap_or_default();
+                let postprocess_time = t5_postprocess.elapsed().as_secs_f64() * 1000.0;
+
+                (results, preprocess_time, inference_time, postprocess_time)
+            } else {
+                let mut model = detect_model.lock().unwrap();
+                let t5_run = Instant::now();
+                let results = model.run(&vec![img.clone()]).unwrap_or_default();
+                let run_time = t5_run.elapsed().as_secs_f64() * 1000.0;
+                drop(model);
+                (results, 0.0, run_time, 0.0)
+            };
 
         // 6. 提取检测框并缩放到原始分辨率
         let scale_x = frame.width as f32 / inf_size as f32;
@@ -328,132 +429,56 @@ impl Detector {
             );
         }
 
-        // 7. 姿态估计 (可选,性能优先 - 跳帧策略)
-        let mut keypoints = Vec::new();
-        if let Some(pose_model) = pose_model {
-            // 跳帧优化: 每N帧才做一次姿态估计
-            self.pose_skip_counter += 1;
-            let should_run_pose = self.pose_skip_counter >= self.pose_skip_interval;
-            if should_run_pose {
-                self.pose_skip_counter = 0;
-            }
+        // 7. 姿态估计 (可选,性能优先 - 跳帧策略) - 已禁用用于性能测试
+        let keypoints = Vec::new();
+        // if let Some(pose_model) = pose_model { ... } // 已禁用
 
-            // 限制姿态估计数量,避免性能下降 (只对第1个人做姿态估计)
-            let max_pose_detections = 1;
-            let bboxes_for_pose: Vec<_> = bboxes.iter().take(max_pose_detections).collect();
-
-            if should_run_pose && !bboxes_for_pose.is_empty() {
-                if let Ok(mut model) = pose_model.lock() {
-                    // 对每个人体边界框运行姿态估计 (bbox已缩放到原始分辨率)
-                    for bbox in bboxes_for_pose {
-                        // 裁剪边界框区域 (带padding)
-                        let padding = 20.0;
-                        let x1 = (bbox.x1 - padding).max(0.0) as u32;
-                        let y1 = (bbox.y1 - padding).max(0.0) as u32;
-                        let x2 = (bbox.x2 + padding).min(frame.width as f32) as u32;
-                        let y2 = (bbox.y2 + padding).min(frame.height as f32) as u32;
-
-                        let crop_w = x2.saturating_sub(x1);
-                        let crop_h = y2.saturating_sub(y1);
-
-                        // 验证裁剪区域有效性
-                        if crop_w < 10 || crop_h < 10 {
-                            continue;
-                        }
-
-                        // 创建裁剪区域的子图像
-                        let cropped_img =
-                            imageops::crop_imm(&rgba_img, x1, y1, crop_w, crop_h).to_image();
-                        let dynamic_img = DynamicImage::ImageRgba8(cropped_img);
-
-                        // 运行姿态估计
-                        if let Ok(pose_results) = model.run(&vec![dynamic_img]) {
-                            for result in &pose_results {
-                                if let Some(kpts_batch) = result.keypoints() {
-                                    for kpts_person in kpts_batch {
-                                        let mut points = Vec::new();
-                                        for kp in kpts_person.iter() {
-                                            // 转换坐标到原图
-                                            points.push((
-                                                kp.x() + x1 as f32,
-                                                kp.y() + y1 as f32,
-                                                kp.confidence(),
-                                            ));
-                                        }
-                                        if !points.is_empty() {
-                                            keypoints.push(types::PoseKeypoints { points });
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // 8. 追踪器更新 (使用检测结果和姿态关键点)
-        if let Some(ref mut tracker) = self.tracker {
-            // 准备RGBA帧数据用于特征提取
-            let frame_rgba = Some((rgba_img.as_raw().as_slice(), frame.width, frame.height));
-
-            // 更新追踪器,获取带ID的追踪对象
-            let tracked_persons = tracker.update(&bboxes, &keypoints, frame_rgba);
-
-            // 用追踪结果替换原始检测框 (现在bbox有稳定ID了)
-            let original_keypoints = keypoints.clone(); // 保留原始关键点
-            bboxes.clear();
-            keypoints.clear();
-
-            for (idx, person) in tracked_persons.iter().enumerate() {
-                // 显示所有轨迹 (包括未确认的,调试用)
-                // TODO: 恢复为 if person.confirmed 只显示稳定轨迹
-                if true || person.confirmed {
-                    bboxes.push(types::BBox {
-                        x1: person.bbox.x1,
-                        y1: person.bbox.y1,
-                        x2: person.bbox.x2,
-                        y2: person.bbox.y2,
-                        confidence: person.bbox.confidence,
-                        class_id: person.id, // 使用追踪ID
-                    });
-
-                    // 如果有对应的姿态关键点,也添加进去
-                    if idx < original_keypoints.len() {
-                        keypoints.push(original_keypoints[idx].clone());
-                    }
-                }
-            }
-        }
+        // 8. 追踪器更新 (使用检测结果和姿态关键点) - 已禁用用于性能测试
+        let tracker_start = Instant::now();
+        // if let Some(ref mut tracker) = self.tracker { ... } // 已禁用
+        let tracker_ms = tracker_start.elapsed().as_secs_f64() * 1000.0;
 
         // 9. 更新统计
         self.count += 1;
+        self.tracker_count += 1;
         let now = Instant::now();
         if now.duration_since(self.last).as_secs() >= 1 {
             self.current_fps = self.count as f64 / now.duration_since(self.last).as_secs_f64();
             self.count = 0;
             self.last = now;
         }
+        if now.duration_since(self.tracker_last).as_secs() >= 1 {
+            self.tracker_fps =
+                self.tracker_count as f64 / now.duration_since(self.tracker_last).as_secs_f64();
+            self.tracker_count = 0;
+            self.tracker_last = now;
+        }
 
-        let inference_ms = start.elapsed().as_secs_f64() * 1000.0;
+        // 计算总耗时 (移除未使用的tracker_ms变量)
+        let total_ms = start_total.elapsed().as_secs_f64() * 1000.0;
 
-        // 调试日志 (每秒打印一次)
-        if self.count % 30 == 0 {
+        // 性能监控日志 (每60帧打印一次简洁信息)
+        if self.count % 60 == 0 {
             eprintln!(
-                "🎯 检测: {}人 | {}关键点组 | {:.1}ms | {:.1}fps",
+                "🎯 检测: {}人 | {:.1}ms/帧 | {:.1}fps (Resize:{:.1}ms | 推理:{:.1}ms)",
                 bboxes.len(),
-                keypoints.len(),
-                inference_ms,
-                self.current_fps
+                total_ms,
+                self.current_fps,
+                resize_ms,
+                inference_ms
             );
         }
 
-        // 9. 发送检测结果到XBus
+        // 10. 发送检测结果到XBus
         xbus::post(DetectionResult {
             bboxes,
             keypoints,
             inference_fps: self.current_fps,
-            inference_ms,
+            inference_ms: total_ms,
+            tracker_fps: self.tracker_fps,
+            tracker_ms,
+            resized_image: Some(resized_rgba),
+            resized_size: inf_size,
         });
     }
 }

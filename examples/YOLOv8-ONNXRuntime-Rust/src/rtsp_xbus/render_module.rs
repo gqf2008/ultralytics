@@ -161,6 +161,71 @@ impl EventHandler for RenderModule {
                     &decoder_display,
                     DrawParam::default().dest([10.0, 40.0]).color(Color::WHITE),
                 );
+                
+                // 在右下角显示resize后的图像
+                if let Some(ref resized_data) = result.resized_image {
+                    // 调试日志
+                    if self.render_count == 1 {
+                        eprintln!("🖼️ Resize图像数据: size={}x{}, data_len={}, 窗口={}x{}", 
+                            result.resized_size, result.resized_size, resized_data.len(), 
+                            window_width, window_height);
+                    }
+                    
+                    let resized_img = Image::from_pixels(
+                        ctx,
+                        resized_data,
+                        graphics::ImageFormat::Rgba8UnormSrgb,
+                        result.resized_size,
+                        result.resized_size,
+                    );
+                    
+                    // 计算右下角位置 (留出边距)
+                    let margin = 10.0;
+                    let preview_size = 200.0; // 预览窗口大小
+                    let scale = preview_size / result.resized_size as f32;
+                    let x = window_width - preview_size - margin;
+                    let y = window_height - preview_size - margin;
+                    
+                    if self.render_count == 1 {
+                        eprintln!("🎨 绘制位置: x={:.1}, y={:.1}, scale={:.3}", x, y, scale);
+                    }
+                    
+                    // 绘制边框
+                    let border_rect = graphics::Rect::new(
+                        x - 2.0,
+                        y - 2.0,
+                        preview_size + 4.0,
+                        preview_size + 4.0,
+                    );
+                    let border_mesh = graphics::Mesh::new_rectangle(
+                        ctx,
+                        graphics::DrawMode::stroke(2.0),
+                        border_rect,
+                        Color::from_rgb(0, 255, 255), // 青色边框
+                    )?;
+                    canvas.draw(&border_mesh, DrawParam::default());
+                    
+                    // 绘制resize后的图像
+                    canvas.draw(
+                        &resized_img,
+                        DrawParam::default()
+                            .dest([x, y])
+                            .scale([scale, scale]),
+                    );
+                    
+                    // 添加标签
+                    let label_text = format!("推理输入 {}x{}", result.resized_size, result.resized_size);
+                    let label_fragment = TextFragment::new(label_text)
+                        .font("MicrosoftYaHei")
+                        .scale(18.0);
+                    let label_display = Text::new(label_fragment);
+                    canvas.draw(
+                        &label_display,
+                        DrawParam::default()
+                            .dest([x, y - 25.0])
+                            .color(Color::from_rgb(0, 255, 255)),
+                    );
+                }
             }
         } else {
             // 无数据时显示等待提示

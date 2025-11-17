@@ -3,6 +3,7 @@
 pub mod acquisition; // 视频采集系统
 pub mod detection; // 智能检测系统
 pub mod fastestv2;
+pub mod nanodet;
 
 pub mod model;
 pub mod ort_backend;
@@ -13,6 +14,7 @@ pub mod yolo_result;
 
 pub use crate::fastestv2::{FastestV2Config, FastestV2Postprocessor};
 pub use crate::model::{Args, YOLOv8};
+pub use crate::nanodet::{NanoDetConfig, NanoDetPostprocessor};
 pub use crate::ort_backend::{Batch, OrtBackend, OrtConfig, OrtEP, YOLOTask};
 pub use crate::yolo_result::{Bbox, Embedding, Point2, YOLOResult};
 
