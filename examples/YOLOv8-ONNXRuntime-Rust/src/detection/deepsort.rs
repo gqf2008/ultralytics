@@ -62,8 +62,8 @@ impl TrackedPerson {
         keypoints: Option<&PoseKeypoints>,
         reid_features: Option<Vec<f32>>,
     ) -> Self {
-        // DeepSort使用较大的观测噪声(r=50.0)和中等过程噪声(q=0.5)
-        let kalman = KalmanBoxFilter::new(&bbox, 0.5, 50.0);
+        // DeepSort标准参数: 小过程噪声(q=0.1)和中等观测噪声(r=10.0)
+        let kalman = KalmanBoxFilter::new(&bbox, 0.1, 10.0);
         let smoothed_bbox = kalman.get_state_bbox();
 
         let center = TrackPoint {
@@ -399,12 +399,12 @@ impl PersonTracker {
         Self {
             tracked_persons: Vec::new(),
             next_id: 1,
-            max_lost_frames: 300, // 大幅增加: 300帧 ≈ 10秒@30fps (长时遮挡鲁棒)
-            iou_threshold: 0.15,  // 降低IOU阈值 (允许更大位置偏差)
-            mahalanobis_threshold: 20.0, // 大幅放宽运动门控 (允许快速移动/突变)
-            appearance_threshold: 0.3, // 降低外观阈值 (姿态变化大时也能匹配)
-            max_cascade_depth: 100, // 增加级联深度 (长时丢失也能恢复)
-            min_confirmation_hits: 2, // 降低确认要求 (更快确认新ID)
+            max_lost_frames: 30,  // 减少: 30帧 ≈ 1秒@30fps (防止误匹配)
+            iou_threshold: 0.3,   // 提高IOU阈值 (更严格的位置匹配)
+            mahalanobis_threshold: 9.4, // 标准DeepSort值 (运动一致性检查)
+            appearance_threshold: 0.2, // 提高外观阈值 (更严格的相似度要求)
+            max_cascade_depth: 30, // 标准级联深度
+            min_confirmation_hits: 3, // 标准确认要求 (3帧确认,防止抖动)
             color_palette,
             reid_model: Self::load_reid_model(),
         }
