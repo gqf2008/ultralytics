@@ -147,6 +147,7 @@ impl KalmanBoxFilter {
     }
 
     /// 获取速度向量 (vx, vy)
+    #[allow(dead_code)]
     fn get_velocity(&self) -> (f32, f32) {
         (self.state[4], self.state[5])
     }
@@ -367,11 +368,13 @@ impl TrackedPerson {
     }
 
     /// 获取当前速度向量
+    #[allow(dead_code)]
     fn get_velocity(&self) -> (f32, f32) {
         self.kalman.get_velocity()
     }
 
     /// 检查速度方向一致性
+    #[allow(dead_code)]
     fn check_velocity_consistency(&self, detection: &BBox, angle_threshold: f32) -> bool {
         let (vx, vy) = self.get_velocity();
 
@@ -457,6 +460,7 @@ impl TrackedPerson {
     }
 
     /// 计算马氏距离 (考虑卡尔曼不确定性)
+    #[allow(dead_code)]
     fn compute_mahalanobis_distance(&self, detection: &BBox) -> f32 {
         let predicted = self.get_predicted_bbox();
 
@@ -489,12 +493,15 @@ pub struct PersonTracker {
     max_lost_frames: u32,
 
     /// IOU 匹配阈值
+    #[allow(dead_code)]
     iou_threshold: f32,
 
     /// 马氏距离阈值 (DeepSort运动门控)
+    #[allow(dead_code)]
     mahalanobis_threshold: f32,
 
     /// 外观相似度阈值 (余弦距离)
+    #[allow(dead_code)]
     appearance_threshold: f32,
 
     /// 级联匹配最大深度 (age)
@@ -823,7 +830,7 @@ impl PersonTracker {
                 let iou = Self::compute_iou(detection, &track.get_predicted_bbox());
 
                 // 计算外观相似度
-                let (appearance_sim, feature_type) = if let (Some(reid), Some((rgba, w, h))) =
+                let (appearance_sim, _feature_type) = if let (Some(reid), Some((rgba, w, h))) =
                     (&mut self.reid_model, frame_rgba)
                 {
                     // 使用深度ReID模型
@@ -889,6 +896,7 @@ impl PersonTracker {
     }
 
     /// 计算代价矩阵 (1 - IOU,越小越好)
+    #[allow(dead_code)]
     fn compute_cost_matrix(&self, detections: &[BBox]) -> Vec<Vec<f32>> {
         let mut matrix = Vec::new();
 
@@ -907,6 +915,7 @@ impl PersonTracker {
     }
 
     /// 计算代价矩阵 (仅针对指定轨迹,用于低分救援)
+    #[allow(dead_code)]
     fn compute_cost_matrix_for_tracks(
         &self,
         detections: &[BBox],

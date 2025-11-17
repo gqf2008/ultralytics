@@ -1,16 +1,17 @@
-/// 检测器 (Detector)
-/// 职责: 订阅DecodedFrame → YOLO检测 → 追踪 → 发送DetectionResult消息
-use crate::fastestv2::{FastestV2Config, FastestV2Postprocessor};
-use crate::nanodet::{NanoDetConfig, NanoDetPostprocessor};
-use crate::rtsp::DecodedFrame;
-use crate::rtsp::{tracker::PersonTracker, types, TrackerType};
-use crate::xbus;
-use crate::{Args as YoloArgs, YOLOTask, YOLOv8};
-use crossbeam_channel::{self, Receiver, Sender};
-use fast_image_resize as fr;
-use image::{DynamicImage, ImageBuffer, RgbImage, Rgba};
+//! 检测器 (Detector)
+//! 职责: 订阅DecodedFrame → YOLO检测 → 发送DetectionResult消息
+
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+
+use crossbeam_channel::{Receiver, Sender};
+use fast_image_resize as fr;
+use image::{DynamicImage, ImageBuffer, RgbImage, Rgba};
+
+use super::types::DecodedFrame;
+use crate::detection::types;
+use crate::models::{FastestV2, Model, ModelType, NanoDet, YOLOv8};
+use crate::{xbus, Args, YOLOTask};
 
 /// 检测结果 (检测模块 → 渲染模块)
 #[derive(Clone, Debug)]
@@ -27,66 +28,38 @@ pub struct DetectionResult {
 
 pub struct Detector {
     detect_model_path: String,
-    pose_model_path: String,
-    tracker_type: TrackerType,
     inf_size: u32,
 
     // 统计
     count: u64,
     last: Instant,
     current_fps: f64,
-
-    // 追踪器性能统计
-    tracker_count: u64,
-    tracker_last: Instant,
-    tracker_fps: f64,
-
-    // 追踪器 (已禁用用于性能测试)
-    #[allow(dead_code)]
-    tracker: Option<PersonTracker>,
 }
 
 impl Detector {
-    pub fn new(
-        detect_model: String,
-        pose_model: String,
-        tracker_type: TrackerType,
-        inf_size: u32,
-    ) -> Self {
+    pub fn new(detect_model: String, inf_size: u32) -> Self {
         Self {
             detect_model_path: detect_model,
-            pose_model_path: pose_model,
-            tracker_type,
             inf_size,
             count: 0,
             last: Instant::now(),
             current_fps: 0.0,
-            tracker_count: 0,
-            tracker_last: Instant::now(),
-            tracker_fps: 0.0,
-            tracker: None, // 已禁用用于性能测试
         }
     }
 
     pub fn run(&mut self) {
         println!("🔍 检测模块启动");
 
-        let is_fastestv2 = self.detect_model_path.contains("fastestv2");
-        let is_nanodet = self.detect_model_path.contains("nanodet");
+        // 识别模型类型
+        let model_type = ModelType::from_path(&self.detect_model_path);
 
         // 加载检测模型
-        let detect_args = YoloArgs {
+        let detect_args = Args {
             model: self.detect_model_path.clone(),
             width: Some(self.inf_size),
             height: Some(self.inf_size),
-            conf: if is_fastestv2 {
-                0.10
-            } else if is_nanodet {
-                0.35 // NanoDet推荐0.35
-            } else {
-                0.15
-            },
-            iou: if is_nanodet { 0.6 } else { 0.45 },
+            conf: model_type.default_conf_threshold(),
+            iou: model_type.default_iou_threshold(),
             source: String::new(),
             device_id: 0,
             trt: false,
@@ -103,93 +76,38 @@ impl Detector {
             profile: false,
         };
 
-        let detect_model = match YOLOv8::new(detect_args) {
-            Ok(m) => {
-                println!("✅ 检测模型加载成功");
-                Arc::new(Mutex::new(m))
-            }
-            Err(e) => {
-                eprintln!("❌ 检测模型加载失败: {}", e);
-                return;
-            }
-        };
-
-        // FastestV2专用后处理
-        let fastestv2_postprocessor = if is_fastestv2 {
-            let config = FastestV2Config {
-                conf_threshold: 0.05, // FastestV2输出置信度较低,使用0.05阈值
-                iou_threshold: 0.45,
-                num_classes: 80,          // COCO 类别数
-                num_anchors: 3,           // 每个尺度3个anchor
-                strides: vec![8, 16, 32], // YOLOv8默认stride
-                anchors: vec![
-                    12.64, 19.39, 37.88, 51.48, 55.71, 138.31, 79.57, 257.11, 140.63, 149.70,
-                    279.92, 258.87,
-                ],
-            };
-            Some(FastestV2Postprocessor::new(
-                config,
-                self.inf_size as usize,
-                self.inf_size as usize,
-            ))
-        } else {
-            None
-        };
-
-        // NanoDet专用后处理
-        let nanodet_postprocessor = if is_nanodet {
-            let config = NanoDetConfig {
-                num_classes: 80,
-                strides: vec![8, 16, 32], // NanoDet-Plus三层特征
-                conf_threshold: 0.35,     // NanoDet推荐0.35
-                iou_threshold: 0.6,
-                reg_max: 7, // DFL参数
-            };
-            Some(NanoDetPostprocessor::new(
-                config,
-                self.inf_size as usize,
-                self.inf_size as usize,
-            ))
-        } else {
-            None
-        };
-
-        // 加载姿态模型 (可选)
-        let pose_model = if !self.pose_model_path.is_empty() {
-            let pose_args = YoloArgs {
-                model: self.pose_model_path.clone(),
-                width: Some(self.inf_size),
-                height: Some(self.inf_size),
-                conf: 0.5,
-                iou: 0.45,
-                kconf: 0.55,
-                source: String::new(),
-                device_id: 0,
-                trt: false,
-                cuda: false,
-                batch: 1,
-                batch_min: 1,
-                batch_max: 1,
-                fp16: false,
-                task: Some(YOLOTask::Pose),
-                nc: None,
-                nk: Some(17),
-                nm: None,
-                profile: false,
-            };
-
-            match YOLOv8::new(pose_args) {
+        // 根据模型类型创建对应的模型实例
+        let detect_model: Arc<Mutex<Box<dyn Model>>> = match model_type {
+            ModelType::YOLOv8 | ModelType::YOLOv5 => match YOLOv8::new(detect_args) {
                 Ok(m) => {
-                    println!("✅ 姿态模型加载成功");
-                    Some(Arc::new(Mutex::new(m)))
+                    println!("✅ YOLOv8 检测模型加载成功");
+                    Arc::new(Mutex::new(Box::new(m)))
                 }
                 Err(e) => {
-                    println!("⚠️  姿态模型加载失败: {}", e);
-                    None
+                    eprintln!("❌ YOLOv8 模型加载失败: {}", e);
+                    return;
                 }
-            }
-        } else {
-            None
+            },
+            ModelType::FastestV2 => match FastestV2::new(detect_args) {
+                Ok(m) => {
+                    println!("✅ YOLO-FastestV2 检测模型加载成功");
+                    Arc::new(Mutex::new(Box::new(m)))
+                }
+                Err(e) => {
+                    eprintln!("❌ FastestV2 模型加载失败: {}", e);
+                    return;
+                }
+            },
+            ModelType::NanoDet => match NanoDet::new(detect_args) {
+                Ok(m) => {
+                    println!("✅ NanoDet 检测模型加载成功");
+                    Arc::new(Mutex::new(Box::new(m)))
+                }
+                Err(e) => {
+                    eprintln!("❌ NanoDet 模型加载失败: {}", e);
+                    return;
+                }
+            },
         };
 
         // 订阅解码帧 - 仅将任务放入队列
@@ -206,28 +124,11 @@ impl Detector {
 
         println!("✅ 检测模块已订阅DecodedFrame,等待数据...");
 
-        // 初始化追踪器
-        self.tracker = Some(PersonTracker::new());
-        println!(
-            "✅ 追踪器初始化成功 ({})",
-            match self.tracker_type {
-                TrackerType::DeepSort => "DeepSort",
-                TrackerType::ByteTrack => "ByteTrack",
-            }
-        );
-
-        // 工作线程:异步处理检测任务
+        // 工作线程: 异步处理检测任务
         loop {
             match rx.recv() {
                 Ok(frame) => {
-                    self.process_frame(
-                        frame,
-                        &detect_model,
-                        &pose_model,
-                        &fastestv2_postprocessor,
-                        &nanodet_postprocessor,
-                        inf_size,
-                    );
+                    self.process_frame(frame, &detect_model, inf_size);
                 }
                 Err(e) => {
                     eprintln!("❌ 目标检测队列接收失败: {}", e);
@@ -243,10 +144,7 @@ impl Detector {
     fn process_frame(
         &mut self,
         frame: DecodedFrame,
-        detect_model: &Arc<Mutex<YOLOv8>>,
-        _pose_model: &Option<Arc<Mutex<YOLOv8>>>,
-        fastestv2_postprocessor: &Option<FastestV2Postprocessor>,
-        nanodet_postprocessor: &Option<NanoDetPostprocessor>,
+        detect_model: &Arc<Mutex<Box<dyn Model>>>,
         inf_size: u32,
     ) {
         let start_total = Instant::now();
@@ -321,49 +219,27 @@ impl Detector {
         };
         let img = DynamicImage::ImageRgb8(rgb_img);
 
-        // 5. YOLO检测 (只保留inference_ms用于日志)
+        // 5. YOLO检测 (统一处理所有模型类型)
         let t5_preprocess = Instant::now();
-        let (detect_results, _preprocess_ms, inference_ms, _postprocess_ms) =
-            if let Some(ref pp) = fastestv2_postprocessor {
-                // FastestV2专用后处理
-                let mut model = detect_model.lock().unwrap();
-                let xs = model.preprocess(&vec![img.clone()]).unwrap_or_default();
-                let preprocess_time = t5_preprocess.elapsed().as_secs_f64() * 1000.0;
 
-                let t5_inference = Instant::now();
-                let ys = model.engine_mut().run(xs, false).unwrap_or_default();
-                let inference_time = t5_inference.elapsed().as_secs_f64() * 1000.0;
-                drop(model);
+        // 方式1: 细粒度控制 - 分步调用以便计时
+        // 方式2: 简化版 - model.forward(&images) (内部自动调用三步)
+        let images = vec![img]; // 只创建一次Vec,避免重复clone
+        let mut model = detect_model.lock().unwrap();
+        let xs = model.preprocess(&images).unwrap_or_default();
+        let preprocess_time = t5_preprocess.elapsed().as_secs_f64() * 1000.0;
 
-                let t5_postprocess = Instant::now();
-                let results = pp.postprocess(ys, &vec![img.clone()]).unwrap_or_default();
-                let postprocess_time = t5_postprocess.elapsed().as_secs_f64() * 1000.0;
+        let t5_inference = Instant::now();
+        let ys = model.run(xs, false).unwrap_or_default();
+        let inference_time = t5_inference.elapsed().as_secs_f64() * 1000.0;
 
-                (results, preprocess_time, inference_time, postprocess_time)
-            } else if let Some(ref pp) = nanodet_postprocessor {
-                // NanoDet专用后处理
-                let mut model = detect_model.lock().unwrap();
-                let xs = model.preprocess(&vec![img.clone()]).unwrap_or_default();
-                let preprocess_time = t5_preprocess.elapsed().as_secs_f64() * 1000.0;
+        let t5_postprocess = Instant::now();
+        let detect_results = model.postprocess(ys, &images).unwrap_or_default();
+        let postprocess_time = t5_postprocess.elapsed().as_secs_f64() * 1000.0;
+        drop(model);
 
-                let t5_inference = Instant::now();
-                let ys = model.engine_mut().run(xs, false).unwrap_or_default();
-                let inference_time = t5_inference.elapsed().as_secs_f64() * 1000.0;
-                drop(model);
-
-                let t5_postprocess = Instant::now();
-                let results = pp.postprocess(ys, &vec![img.clone()]).unwrap_or_default();
-                let postprocess_time = t5_postprocess.elapsed().as_secs_f64() * 1000.0;
-
-                (results, preprocess_time, inference_time, postprocess_time)
-            } else {
-                let mut model = detect_model.lock().unwrap();
-                let t5_run = Instant::now();
-                let results = model.run(&vec![img.clone()]).unwrap_or_default();
-                let run_time = t5_run.elapsed().as_secs_f64() * 1000.0;
-                drop(model);
-                (results, 0.0, run_time, 0.0)
-            };
+        let (_preprocess_ms, inference_ms, _postprocess_ms) =
+            (preprocess_time, inference_time, postprocess_time);
 
         // 6. 提取检测框并缩放到原始分辨率
         let scale_x = frame.width as f32 / inf_size as f32;
@@ -429,29 +305,19 @@ impl Detector {
             );
         }
 
-        // 7. 姿态估计 (可选,性能优先 - 跳帧策略) - 已禁用用于性能测试
+        // 7. 姿态估计 (当前未实现)
         let keypoints = Vec::new();
-        // if let Some(pose_model) = pose_model { ... } // 已禁用
 
-        // 8. 追踪器更新 (使用检测结果和姿态关键点) - 已禁用用于性能测试
-        let tracker_start = Instant::now();
-        // if let Some(ref mut tracker) = self.tracker { ... } // 已禁用
-        let tracker_ms = tracker_start.elapsed().as_secs_f64() * 1000.0;
+        // 8. 追踪器更新 (当前已禁用用于性能测试)
+        let tracker_ms = 0.0;
 
         // 9. 更新统计
         self.count += 1;
-        self.tracker_count += 1;
         let now = Instant::now();
         if now.duration_since(self.last).as_secs() >= 1 {
             self.current_fps = self.count as f64 / now.duration_since(self.last).as_secs_f64();
             self.count = 0;
             self.last = now;
-        }
-        if now.duration_since(self.tracker_last).as_secs() >= 1 {
-            self.tracker_fps =
-                self.tracker_count as f64 / now.duration_since(self.tracker_last).as_secs_f64();
-            self.tracker_count = 0;
-            self.tracker_last = now;
         }
 
         // 计算总耗时 (移除未使用的tracker_ms变量)
@@ -475,7 +341,7 @@ impl Detector {
             keypoints,
             inference_fps: self.current_fps,
             inference_ms: total_ms,
-            tracker_fps: self.tracker_fps,
+            tracker_fps: 0.0,
             tracker_ms,
             resized_image: Some(resized_rgba),
             resized_size: inf_size,

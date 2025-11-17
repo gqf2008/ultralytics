@@ -1,6 +1,22 @@
 /// RTSP检测系统数据结构定义
 /// Data structures for RTSP detection system
 
+// ========== 公共常量 ==========
+
+/// YOLOv8推理输入尺寸
+pub const INF_SIZE: u32 = 320;
+
+// ========== 枚举类型 ==========
+
+/// 追踪器类型
+#[derive(Debug, Clone, Copy)]
+pub enum TrackerType {
+    DeepSort,
+    ByteTrack,
+}
+
+// ========== 数据结构 ==========
+
 /// 检测框 (Detection bounding box)
 #[derive(Clone, Debug)]
 pub struct BBox {

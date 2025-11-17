@@ -2,8 +2,7 @@ use crate::xbus;
 
 /// FFmpeg解码过滤器模块
 /// FFmpeg decode filter module
-use super::types::DecodedFrame;
-use crossbeam_channel::Sender;
+use crate::detection::types::DecodedFrame;
 use ez_ffmpeg::filter::frame_filter::FrameFilter;
 use ez_ffmpeg::filter::frame_filter_context::FrameFilterContext;
 use ez_ffmpeg::{AVMediaType, Frame};

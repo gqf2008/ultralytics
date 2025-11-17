@@ -8,6 +8,25 @@ use ez_ffmpeg::{AVMediaType, FfmpegContext};
 #[cfg(windows)]
 use wmi::{COMLibrary, WMIConnection};
 
+/// 解码器包装器
+pub struct Decoder {
+    rtsp_url: String,
+}
+
+impl Decoder {
+    pub fn new(rtsp_url: String) -> Self {
+        Self { rtsp_url }
+    }
+
+    pub fn run(&mut self) {
+        println!("🎬 解码器启动");
+        let filter = DecodeFilter::new();
+        let rtsp_url = self.rtsp_url.clone();
+        adaptive_decode(&rtsp_url, filter);
+        println!("❌ 解码器退出");
+    }
+}
+
 /// 解码器类型
 pub enum DecoderType {
     NvidiaCuda, // NVIDIA GPU硬件解码
@@ -93,8 +112,10 @@ fn check_gpu_vendor(vendor: &str) -> bool {
     use serde::Deserialize;
 
     #[derive(Deserialize)]
+    #[allow(non_camel_case_types)]
     struct Win32_VideoController {
-        Name: String,
+        #[serde(rename = "Name")]
+        name: String,
     }
 
     match COMLibrary::new() {
@@ -104,7 +125,7 @@ fn check_gpu_vendor(vendor: &str) -> bool {
                     .raw_query::<Win32_VideoController>("SELECT Name FROM Win32_VideoController")
                 {
                     for gpu in gpus {
-                        if gpu.Name.to_lowercase().contains(vendor) {
+                        if gpu.name.to_lowercase().contains(vendor) {
                             return true;
                         }
                     }

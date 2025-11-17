@@ -1,12 +1,18 @@
+// Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+//
 // NanoDet 后处理模块
 // 基于官方实现: https://github.com/RangiLyu/nanodet
 // NanoDet是FCOS-style anchor-free单阶段目标检测器
+//
+// 注意: NanoDet 当前仅实现后处理器，通过 detection::PostprocessorFactory 统一管理
+//       完整的模型加载、预处理由 detector.rs 中的 OrtBackend 处理
+//       如需完整 Model trait 实现，可参考 yolov8.rs
 
 use anyhow::Result;
-use image::DynamicImage;
+use image::{DynamicImage, GenericImageView};
 use ndarray::{s, Array, IxDyn};
 
-use crate::{non_max_suppression, Bbox, Point2, YOLOResult};
+use crate::{non_max_suppression, Bbox, DetectionResult, Point2};
 
 /// NanoDet 配置
 pub struct NanoDetConfig {
@@ -20,17 +26,17 @@ pub struct NanoDetConfig {
 impl Default for NanoDetConfig {
     fn default() -> Self {
         Self {
-            num_classes: 80, // COCO
+            num_classes: 80,          // COCO
             strides: vec![8, 16, 32], // NanoDet-Plus三个特征层
-            conf_threshold: 0.35, // NanoDet推荐0.35-0.4
-            iou_threshold: 0.6,   // NanoDet推荐0.5-0.6
-            reg_max: 7,           // DFL参数
+            conf_threshold: 0.35,     // NanoDet推荐0.35-0.4
+            iou_threshold: 0.6,       // NanoDet推荐0.5-0.6
+            reg_max: 7,               // DFL参数
         }
     }
 }
 
 /// NanoDet 后处理器
-/// 
+///
 /// NanoDet输出格式 (anchor-free):
 /// - cls_pred_stride8: [batch, num_classes, h, w] - 分类分数
 /// - dis_pred_stride8: [batch, 32, h, w] - 边界框分布 (4边×8个bin)
@@ -51,7 +57,7 @@ impl NanoDetPostprocessor {
     }
 
     /// Distribution Focal Loss (DFL) 解码
-    /// 
+    ///
     /// 将分布预测转换为实际距离值
     /// dis: [reg_max+1] - 单边的分布概率
     fn dfl_decode(&self, dis: &[f32]) -> f32 {
@@ -70,7 +76,7 @@ impl NanoDetPostprocessor {
     }
 
     /// 解码单个特征图
-    /// 
+    ///
     /// # 参数
     /// - cls_pred: [1, num_classes, h, w] - 分类预测
     /// - dis_pred: [1, 4*(reg_max+1), h, w] - 距离预测分布
@@ -96,7 +102,7 @@ impl NanoDetPostprocessor {
             for w in 0..width {
                 // 提取分类分数 [num_classes]
                 let cls_scores = cls_pred.slice(s![0, .., h, w]);
-                
+
                 // Sigmoid激活
                 let cls_scores: Vec<f32> = cls_scores
                     .iter()
@@ -127,12 +133,9 @@ impl NanoDetPostprocessor {
                 for i in 0..4 {
                     let start = i * reg_max_plus_1;
                     let end = start + reg_max_plus_1;
-                    let dis_slice: Vec<f32> = dis_preds
-                        .slice(s![start..end])
-                        .iter()
-                        .cloned()
-                        .collect();
-                    
+                    let dis_slice: Vec<f32> =
+                        dis_preds.slice(s![start..end]).iter().cloned().collect();
+
                     // Softmax + DFL解码
                     let dis_softmax = Self::softmax(&dis_slice);
                     let distance = self.dfl_decode(&dis_softmax);
@@ -162,7 +165,7 @@ impl NanoDetPostprocessor {
     }
 
     /// 后处理主函数
-    /// 
+    ///
     /// # 参数
     /// - `outputs`: 模型输出 [cls_8, dis_8, cls_16, dis_16, cls_32, dis_32]
     ///   NanoDet-Plus-m 输出6个tensor,每个stride对应(cls_pred, dis_pred)
@@ -171,7 +174,7 @@ impl NanoDetPostprocessor {
         &self,
         outputs: Vec<Array<f32, IxDyn>>,
         original_images: &[DynamicImage],
-    ) -> Result<Vec<YOLOResult>> {
+    ) -> Result<Vec<DetectionResult>> {
         let mut results = Vec::new();
 
         // 对每张图片处理
@@ -187,7 +190,7 @@ impl NanoDetPostprocessor {
 
             // NanoDet输出: [cls_8, dis_8, cls_16, dis_16, cls_32, dis_32]
             let num_strides = self.config.strides.len();
-            
+
             for i in 0..num_strides {
                 let cls_idx = i * 2;
                 let dis_idx = i * 2 + 1;
@@ -200,13 +203,8 @@ impl NanoDetPostprocessor {
                 let dis_pred = &outputs[dis_idx];
                 let stride = self.config.strides[i];
 
-                let mut dets = self.decode_feature_map(
-                    cls_pred,
-                    dis_pred,
-                    stride,
-                    scale_w,
-                    scale_h,
-                );
+                let mut dets =
+                    self.decode_feature_map(cls_pred, dis_pred, stride, scale_w, scale_h);
                 all_detections.append(&mut dets);
             }
 
@@ -219,7 +217,7 @@ impl NanoDetPostprocessor {
                 .map(|(bbox, _, _)| bbox)
                 .collect();
 
-            let result = YOLOResult::new(
+            let result = DetectionResult::new(
                 None,
                 if !bboxes.is_empty() {
                     Some(bboxes)
@@ -261,10 +259,144 @@ mod tests {
     fn test_dfl_decode() {
         let config = NanoDetConfig::default();
         let processor = NanoDetPostprocessor::new(config, 320, 320);
-        
+
         // 均匀分布应该返回中间值
         let dis = vec![0.125; 8];
         let distance = processor.dfl_decode(&dis);
         assert!((distance - 3.5).abs() < 0.1);
+    }
+}
+
+// ========================================
+// 完整 NanoDet 模型实现 (实现 Model trait)
+// ========================================
+
+use crate::{Batch, OrtBackend, OrtConfig, OrtEP};
+
+/// NanoDet 完整模型
+pub struct NanoDet {
+    engine: OrtBackend,
+    postprocessor: NanoDetPostprocessor,
+    width: u32,
+    height: u32,
+}
+
+impl NanoDet {
+    /// 从配置创建 NanoDet 模型
+    pub fn new(config: crate::Args) -> Result<Self> {
+        // execution provider
+        let ep = if config.trt {
+            OrtEP::Trt(config.device_id)
+        } else if config.cuda {
+            OrtEP::CUDA(config.device_id)
+        } else {
+            OrtEP::CPU
+        };
+
+        // batch
+        let batch = Batch {
+            opt: config.batch,
+            min: config.batch_min,
+            max: config.batch_max,
+        };
+
+        // build ort engine
+        let ort_args = OrtConfig {
+            ep,
+            batch,
+            f: config.model,
+            task: Some(crate::YOLOTask::Detect), // NanoDet only supports detection
+            trt_fp16: config.fp16,
+            image_size: (config.height, config.width),
+        };
+        let engine = OrtBackend::build(ort_args)?;
+
+        let width = engine.width();
+        let height = engine.height();
+
+        // NanoDet 后处理器配置
+        let postprocessor_config = NanoDetConfig {
+            num_classes: config.nc.unwrap_or(80) as usize,
+            strides: vec![8, 16, 32],
+            conf_threshold: config.conf,
+            iou_threshold: config.iou,
+            reg_max: 7,
+        };
+
+        let postprocessor =
+            NanoDetPostprocessor::new(postprocessor_config, width as usize, height as usize);
+
+        Ok(Self {
+            engine,
+            postprocessor,
+            width,
+            height,
+        })
+    }
+}
+
+// 实现 Model trait
+impl super::Model for NanoDet {
+    fn preprocess(&mut self, images: &[DynamicImage]) -> Result<Vec<Array<f32, IxDyn>>> {
+        // NanoDet 预处理: letterbox + normalize
+        let mut ys =
+            Array::ones((images.len(), 3, self.height as usize, self.width as usize)).into_dyn();
+        ys.fill(0.0); // NanoDet 使用黑色填充
+
+        for (idx, img) in images.iter().enumerate() {
+            let (w0, h0) = img.dimensions();
+            let w0 = w0 as f32;
+            let h0 = h0 as f32;
+            let r = (self.width as f32 / w0).min(self.height as f32 / h0);
+            let w_new = (w0 * r).round() as u32;
+            let h_new = (h0 * r).round() as u32;
+
+            let resized = img.resize_exact(w_new, h_new, image::imageops::FilterType::Triangle);
+
+            // NanoDet 归一化: mean=[103.53, 116.28, 123.675], std=[57.375, 57.12, 58.395]
+            // 简化版: 使用标准 ImageNet 归一化
+            for (x, y, rgb) in resized.pixels() {
+                let x = x as usize;
+                let y = y as usize;
+                let [r, g, b, _] = rgb.0;
+                ys[[idx, 0, y, x]] = (r as f32) / 255.0;
+                ys[[idx, 1, y, x]] = (g as f32) / 255.0;
+                ys[[idx, 2, y, x]] = (b as f32) / 255.0;
+            }
+        }
+
+        Ok(vec![ys])
+    }
+
+    fn run(&mut self, xs: Vec<Array<f32, IxDyn>>, profile: bool) -> Result<Vec<Array<f32, IxDyn>>> {
+        self.engine.run(xs[0].clone(), profile)
+    }
+
+    fn postprocess(
+        &self,
+        xs: Vec<Array<f32, IxDyn>>,
+        xs0: &[DynamicImage],
+    ) -> Result<Vec<DetectionResult>> {
+        self.postprocessor.postprocess(xs, xs0)
+    }
+
+    fn engine_mut(&mut self) -> &mut OrtBackend {
+        &mut self.engine
+    }
+
+    fn summary(&self) {
+        println!("\n[NanoDet 模型信息]");
+        println!("  任务类型: Detection (Anchor-Free)");
+        println!("  输入尺寸: {}x{}", self.width, self.height);
+        println!("  类别数量: {}", self.postprocessor.config.num_classes);
+        println!("  特征层strides: {:?}", self.postprocessor.config.strides);
+        println!("  DFL reg_max: {}", self.postprocessor.config.reg_max);
+        println!("  置信度阈值: {}", self.postprocessor.config.conf_threshold);
+        println!("  IOU阈值: {}", self.postprocessor.config.iou_threshold);
+    }
+
+    fn supports_task(&self, task: crate::YOLOTask) -> bool {
+        // NanoDet 仅支持目标检测
+        matches!(task, crate::YOLOTask::Detect)
     }
 }

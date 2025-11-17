@@ -1,5 +1,5 @@
 use crate::detection::detector::DetectionResult;
-use crate::rtsp::DecodedFrame;
+use crate::detection::types::DecodedFrame;
 /// 渲染器 (Renderer)
 /// 数字卫兵主程序的渲染模块
 use crate::xbus::{self, Subscription};
@@ -11,6 +11,11 @@ use ggez::input::keyboard::KeyCode;
 use ggez::mint::Point2;
 use ggez::{Context, GameResult};
 use std::time::Instant;
+
+// ========== 公共常量 ==========
+
+pub const WINDOW_WIDTH: f32 = 1280.0;
+pub const WINDOW_HEIGHT: f32 = 720.0;
 
 pub struct Renderer {
     _frame_sub: Subscription,
@@ -30,7 +35,10 @@ pub struct Renderer {
     detect_model_name: String, // 检测模型名称
     pose_model_name: String,   // 姿态模型名称
     tracker_name: String,      // 追踪器名称
-    decode_fps: f64,           // 解码FPS
+    #[allow(dead_code)]
+    detect_fps: f64, // 检测FPS (保留用于未来统计)
+    #[allow(dead_code)]
+    decode_fps: f64, // 解码FPS (保留用于未来统计)
 }
 
 /// 系统控制
@@ -81,6 +89,7 @@ impl Renderer {
             detect_model_name: detect_model,
             pose_model_name: pose_model,
             tracker_name: tracker,
+            detect_fps: 0.0,
             decode_fps: 0.0,
         })
     }

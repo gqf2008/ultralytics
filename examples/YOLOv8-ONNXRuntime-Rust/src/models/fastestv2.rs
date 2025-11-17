@@ -1,11 +1,17 @@
+// Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+//
 // YOLO-FastestV2 后处理模块
 // 基于官方NCNN实现: https://github.com/dog-qiuqiu/Yolo-FastestV2
+//
+// 注意: FastestV2 当前仅实现后处理器，通过 detection::PostprocessorFactory 统一管理
+//       完整的模型加载、预处理由 detector.rs 中的 OrtBackend 处理
+//       如需完整 Model trait 实现，可参考 yolov8.rs
 
 use anyhow::Result;
-use image::DynamicImage;
+use image::{DynamicImage, GenericImageView};
 use ndarray::{s, Array, IxDyn};
 
-use crate::{non_max_suppression, Bbox, Point2, YOLOResult};
+use crate::{non_max_suppression, Bbox, DetectionResult, Point2};
 
 /// YOLO-FastestV2 配置
 pub struct FastestV2Config {
@@ -155,7 +161,7 @@ impl FastestV2Postprocessor {
         &self,
         outputs: Vec<Array<f32, IxDyn>>,
         original_images: &[DynamicImage],
-    ) -> Result<Vec<YOLOResult>> {
+    ) -> Result<Vec<DetectionResult>> {
         let mut results = Vec::new();
 
         // 对每张图片处理
@@ -194,7 +200,7 @@ impl FastestV2Postprocessor {
                 .map(|(bbox, _, _)| bbox)
                 .collect();
 
-            let result = YOLOResult::new(
+            let result = DetectionResult::new(
                 None,
                 if !bboxes.is_empty() {
                     Some(bboxes)
@@ -222,5 +228,140 @@ mod tests {
         assert_eq!(config.num_classes, 80);
         assert_eq!(config.num_anchors, 3);
         assert_eq!(config.anchors.len(), 12); // 6 anchors * 2 (w,h)
+    }
+}
+
+// ========================================
+// 完整 FastestV2 模型实现 (实现 Model trait)
+// ========================================
+
+use crate::{Batch, OrtBackend, OrtConfig, OrtEP};
+
+/// YOLO-FastestV2 完整模型
+pub struct FastestV2 {
+    engine: OrtBackend,
+    postprocessor: FastestV2Postprocessor,
+    width: u32,
+    height: u32,
+}
+
+impl FastestV2 {
+    /// 从配置创建 FastestV2 模型
+    pub fn new(config: crate::Args) -> Result<Self> {
+        // execution provider
+        let ep = if config.trt {
+            OrtEP::Trt(config.device_id)
+        } else if config.cuda {
+            OrtEP::CUDA(config.device_id)
+        } else {
+            OrtEP::CPU
+        };
+
+        // batch
+        let batch = Batch {
+            opt: config.batch,
+            min: config.batch_min,
+            max: config.batch_max,
+        };
+
+        // build ort engine
+        let ort_args = OrtConfig {
+            ep,
+            batch,
+            f: config.model,
+            task: Some(crate::YOLOTask::Detect), // FastestV2 only supports detection
+            trt_fp16: config.fp16,
+            image_size: (config.height, config.width),
+        };
+        let engine = OrtBackend::build(ort_args)?;
+
+        let width = engine.width();
+        let height = engine.height();
+
+        // FastestV2 后处理器配置
+        let postprocessor_config = FastestV2Config {
+            num_classes: config.nc.unwrap_or(80) as usize,
+            num_anchors: 3,
+            strides: vec![16, 32],
+            anchors: vec![
+                12.64, 19.39, 37.88, 51.48, 55.71, 138.31, 126.91, 78.23, 131.57, 214.55, 279.92,
+                258.87,
+            ],
+            conf_threshold: config.conf,
+            iou_threshold: config.iou,
+        };
+
+        let postprocessor =
+            FastestV2Postprocessor::new(postprocessor_config, width as usize, height as usize);
+
+        Ok(Self {
+            engine,
+            postprocessor,
+            width,
+            height,
+        })
+    }
+}
+
+// 实现 Model trait
+impl super::Model for FastestV2 {
+    fn preprocess(&mut self, images: &[DynamicImage]) -> Result<Vec<Array<f32, IxDyn>>> {
+        // 复用 YOLOv8 的预处理逻辑 (letterbox + normalize)
+        let mut ys =
+            Array::ones((images.len(), 3, self.height as usize, self.width as usize)).into_dyn();
+        ys.fill(144.0 / 255.0);
+
+        for (idx, img) in images.iter().enumerate() {
+            let (w0, h0) = img.dimensions();
+            let w0 = w0 as f32;
+            let h0 = h0 as f32;
+            let r = (self.width as f32 / w0).min(self.height as f32 / h0);
+            let w_new = (w0 * r).round() as u32;
+            let h_new = (h0 * r).round() as u32;
+
+            let resized = img.resize_exact(w_new, h_new, image::imageops::FilterType::Triangle);
+
+            for (x, y, rgb) in resized.pixels() {
+                let x = x as usize;
+                let y = y as usize;
+                let [r, g, b, _] = rgb.0;
+                ys[[idx, 0, y, x]] = (r as f32) / 255.0;
+                ys[[idx, 1, y, x]] = (g as f32) / 255.0;
+                ys[[idx, 2, y, x]] = (b as f32) / 255.0;
+            }
+        }
+
+        Ok(vec![ys])
+    }
+
+    fn run(&mut self, xs: Vec<Array<f32, IxDyn>>, profile: bool) -> Result<Vec<Array<f32, IxDyn>>> {
+        self.engine.run(xs[0].clone(), profile)
+    }
+
+    fn postprocess(
+        &self,
+        xs: Vec<Array<f32, IxDyn>>,
+        xs0: &[DynamicImage],
+    ) -> Result<Vec<DetectionResult>> {
+        self.postprocessor.postprocess(xs, xs0)
+    }
+
+    fn engine_mut(&mut self) -> &mut OrtBackend {
+        &mut self.engine
+    }
+
+    fn summary(&self) {
+        println!("\n[YOLO-FastestV2 模型信息]");
+        println!("  任务类型: Detection");
+        println!("  输入尺寸: {}x{}", self.width, self.height);
+        println!("  类别数量: {}", self.postprocessor.config.num_classes);
+        println!("  Anchor数: {}", self.postprocessor.config.num_anchors);
+        println!("  置信度阈值: {}", self.postprocessor.config.conf_threshold);
+        println!("  IOU阈值: {}", self.postprocessor.config.iou_threshold);
+    }
+
+    fn supports_task(&self, task: crate::YOLOTask) -> bool {
+        // FastestV2 仅支持目标检测
+        matches!(task, crate::YOLOTask::Detect)
     }
 }

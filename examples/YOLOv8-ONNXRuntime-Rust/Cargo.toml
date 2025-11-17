@@ -41,6 +41,9 @@ ggez = "0.9"
 # 线程间通信
 crossbeam-channel = "0.5.15"
 crossbeam-skiplist = "0.1.3"
+
+# 高性能内存分配器 (替代系统默认分配器)
+mimalloc = { version = "0.1", default-features = false }
 # Windows系统信息查询
 [target.'cfg(windows)'.dependencies]
 wmi = "0.13"
@@ -52,5 +55,5 @@ name = "yolov8"            # 图片检测: cargo run --bin yolov8
 path = "src/bin/yolov8.rs"
 
 [[bin]]
-name = "yolov8-rtsp"     # RTSP检测: cargo run --bin yolov8-rtsp --release
-path = "src/bin/rtsp.rs"
+name = "sentinel"            # 数字卫兵 RTSP 实时监控: cargo run --bin sentinel --release
+path = "src/bin/sentinel.rs"
