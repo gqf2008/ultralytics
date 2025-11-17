@@ -18,7 +18,7 @@ pub struct PoseKeypoints {
     pub points: Vec<(f32, f32, f32)>, // (x, y, confidence)
 }
 
-/// 已解码帧 (解码线程 → 渲染线程 + 检测线程)
+/// 已解码帧 (解码线程 → 渲染线程)
 #[derive(Clone)]
 pub struct DecodedFrame {
     pub rgba_data: Vec<u8>, // 直接RGBA,无需二次转换
@@ -28,15 +28,15 @@ pub struct DecodedFrame {
     pub decoder_name: String, // 使用的解码器名称
 }
 
-/// 渲染数据 (检测线程 → 渲染线程, 或 解码线程 → 渲染线程)
+/// 缩放后的帧 (渲染线程 → 推理线程)
 #[derive(Clone)]
-pub struct RenderData {
-    pub rgba_data: Vec<u8>,     // 原始视频帧
-    pub width: u32,
-    pub height: u32,
-    pub decode_fps: f64,
-    pub decoder_name: String,
-    // 检测结果(可选,来自检测线程)
+pub struct ResizedFrame {
+    pub rgb_data: Vec<u8>, // 320x320 RGB data from GPU resize
+}
+
+/// 推理结果 (推理线程 → 渲染线程)
+#[derive(Clone)]
+pub struct InferredFrame {
     pub bboxes: Vec<BBox>,
     pub keypoints: Vec<PoseKeypoints>,
     pub inference_fps: f64,

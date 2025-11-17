@@ -1,16 +1,16 @@
 /// YOLOv8推理线程模块
 /// YOLOv8 inference thread module
-use super::types::{BBox, DecodedFrame, PoseKeypoints, RenderData};
+use super::types::{BBox, InferredFrame, PoseKeypoints, ResizedFrame};
 use crate::fastestv2::{FastestV2Config, FastestV2Postprocessor}; // 导入FastestV2后处理
 use crate::{Args as YoloArgs, YOLOv8};
 use crossbeam_channel::{Receiver, Sender};
-use image::{imageops, DynamicImage, ImageBuffer, RgbImage, Rgba};
+use image::{DynamicImage, RgbImage};
 use std::time::Instant;
 
-/// 推理线程: 接收原始帧 → Resize+检测+姿态 → 返回渲染数据
+/// 推理线程: 接收320x320图像 → YOLO检测+姿态 → 返回结果
 pub fn inference_thread(
-    rx_decoded: Receiver<DecodedFrame>,
-    tx_render: Sender<RenderData>,
+    rx_resized: Receiver<ResizedFrame>,
+    tx_result: Sender<InferredFrame>,
     detect_model: String,
     pose_model: String,
     inf_size: u32,
@@ -115,48 +115,21 @@ pub fn inference_thread(
 
     println!("🔍 推理线程等待数据...");
 
-    while let Ok(decoded_frame) = rx_decoded.recv() {
+    while let Ok(resized_frame) = rx_resized.recv() {
         receive_count += 1;
         if receive_count == 1 {
             println!("✅ 推理线程收到第一帧数据!");
             println!(
-                "   原始尺寸: {}x{}, RGBA数据: {} 字节",
-                decoded_frame.width, decoded_frame.height,
-                decoded_frame.rgba_data.len()
+                "   数据大小: {} 字节 (期望: {} 字节)",
+                resized_frame.rgb_data.len(),
+                inf_size * inf_size * 3
             );
         }
 
         count += 1;
 
-        // 1. RGBA → RgbaImage
-        let rgba_img = match ImageBuffer::<Rgba<u8>, _>::from_raw(
-            decoded_frame.width,
-            decoded_frame.height,
-            decoded_frame.rgba_data.clone(),
-        ) {
-            Some(img) => img,
-            None => {
-                eprintln!("❌ RGBA图像转换失败!");
-                continue;
-            }
-        };
-
-        // 2. CPU Resize: 动态分辨率 → 320x320 (Triangle快速算法)
-        let resized_rgba = imageops::resize(
-            &rgba_img,
-            inf_size,
-            inf_size,
-            imageops::FilterType::Triangle,
-        );
-
-        // 3. RGBA → RGB
-        let rgb_data: Vec<u8> = resized_rgba
-            .pixels()
-            .flat_map(|p| vec![p.0[0], p.0[1], p.0[2]])
-            .collect();
-
-        // 4. RGB → DynamicImage
-        let rgb_img = match RgbImage::from_raw(inf_size, inf_size, rgb_data) {
+        // Convert 320x320 RGB to DynamicImage
+        let rgb_img = match RgbImage::from_raw(inf_size, inf_size, resized_frame.rgb_data) {
             Some(img) => img,
             None => {
                 eprintln!("❌ RGB图像转换失败!");
@@ -164,7 +137,6 @@ pub fn inference_thread(
             }
         };
         let img = DynamicImage::ImageRgb8(rgb_img);
-
 
         // 首帧时检查图像数据
         if receive_count == 1 {
@@ -295,20 +267,14 @@ pub fn inference_thread(
             count = 0;
         }
 
-        // 构造渲染数据: 原始帧 + 检测结果
-        let render_data = RenderData {
-            rgba_data: decoded_frame.rgba_data,
-            width: decoded_frame.width,
-            height: decoded_frame.height,
-            decode_fps: decoded_frame.decode_fps,
-            decoder_name: decoded_frame.decoder_name,
+        let inferred = InferredFrame {
             bboxes,
             keypoints,
             inference_fps: current_fps,
             inference_ms,
         };
 
-        let _ = tx_render.try_send(render_data);
+        let _ = tx_result.try_send(inferred);
     }
 
     println!("✅ Inference thread exited");

@@ -1,12 +1,14 @@
 #![allow(clippy::type_complexity)]
 // Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
-pub mod xbus;
-
+pub mod acquisition; // 视频采集系统
+pub mod detection; // 智能检测系统
 pub mod fastestv2;
+
 pub mod model;
 pub mod ort_backend;
+pub mod renderer;
 pub mod rtsp;
-pub mod systems; // 系统架构
+pub mod xbus;
 pub mod yolo_result;
 
 pub use crate::fastestv2::{FastestV2Config, FastestV2Postprocessor};

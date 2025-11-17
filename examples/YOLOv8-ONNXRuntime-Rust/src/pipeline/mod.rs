@@ -1,12 +1,12 @@
-/// 系统架构 (System Architecture)
-/// 
-/// 两个独立工作线程 + 一个主渲染线程:
-/// - Acquisition System: 视频采集系统 (独立线程)
-/// - Detection System:   智能检测系统 (独立线程)
-/// - Sentinel:           数字卫兵主程序 (主线程/渲染)
-
-pub mod acquisition;
-pub mod detection;
+/// 视频处理流水线 (Video Processing Pipeline)
+///
+/// 三线程架构,通过XBus消息总线通信:
+/// - Decoder:  视频解码 (独立线程)
+/// - Detector: 目标检测 (独立线程)
+/// - Renderer: 渲染显示 (主线程)
+pub mod decoder;
+pub mod detector;
+pub mod renderer;
 
 use crate::rtsp::types;
 

@@ -1,6 +1,5 @@
 /// 自适应解码器选择模块
 /// Adaptive decoder selection module with hardware detection
-
 use super::decode_filter::DecodeFilter;
 use ez_ffmpeg::core::context::null_output::create_null_output;
 use ez_ffmpeg::filter::frame_pipeline_builder::FramePipelineBuilder;
@@ -11,11 +10,11 @@ use wmi::{COMLibrary, WMIConnection};
 
 /// 解码器类型
 pub enum DecoderType {
-    NvidiaCuda,    // NVIDIA GPU硬件解码
-    IntelQsv,      // Intel QuickSync硬件解码
-    AmdAmf,        // AMD GPU硬件解码
-    Dxva2,         // Windows DXVA2通用硬件解码
-    Software,      // CPU软件解码
+    NvidiaCuda, // NVIDIA GPU硬件解码
+    IntelQsv,   // Intel QuickSync硬件解码
+    AmdAmf,     // AMD GPU硬件解码
+    Dxva2,      // Windows DXVA2通用硬件解码
+    Software,   // CPU软件解码
 }
 
 impl DecoderType {
@@ -38,7 +37,7 @@ impl DecoderType {
             DecoderType::Software => vec![], // 无需设置环境变量
         }
     }
-    
+
     /// 检测硬件是否可用 (使用WMI API)
     fn is_hardware_available(&self) -> bool {
         match self {
@@ -92,29 +91,27 @@ impl DecoderType {
 #[cfg(windows)]
 fn check_gpu_vendor(vendor: &str) -> bool {
     use serde::Deserialize;
-    
+
     #[derive(Deserialize)]
     struct Win32_VideoController {
         Name: String,
     }
-    
+
     match COMLibrary::new() {
-        Ok(com_con) => {
-            match WMIConnection::new(com_con) {
-                Ok(wmi_con) => {
-                    if let Ok(gpus) = wmi_con.raw_query::<Win32_VideoController>(
-                        "SELECT Name FROM Win32_VideoController"
-                    ) {
-                        for gpu in gpus {
-                            if gpu.Name.to_lowercase().contains(vendor) {
-                                return true;
-                            }
+        Ok(com_con) => match WMIConnection::new(com_con) {
+            Ok(wmi_con) => {
+                if let Ok(gpus) = wmi_con
+                    .raw_query::<Win32_VideoController>("SELECT Name FROM Win32_VideoController")
+                {
+                    for gpu in gpus {
+                        if gpu.Name.to_lowercase().contains(vendor) {
+                            return true;
                         }
                     }
                 }
-                Err(_) => return false,
             }
-        }
+            Err(_) => return false,
+        },
         Err(_) => return false,
     }
     false
@@ -139,16 +136,22 @@ fn try_decoder(
 
     // 清除之前的环境变量
     std::env::remove_var("FFMPEG_HWACCEL");
-    
+
     // 设置新的环境变量
     for (key, val) in decoder.env_vars() {
         std::env::set_var(key, val);
     }
 
+    // 设置 RTSP 优化参数(通过环境变量)
+    std::env::set_var("FFMPEG_RTSP_TRANSPORT", "tcp"); // 使用TCP避免丢包
+    std::env::set_var("FFMPEG_RTSP_FLAGS", "prefer_tcp"); // 优先TCP
+    std::env::set_var("FFMPEG_FLAGS", "low_delay"); // 低延迟模式
+    std::env::set_var("FFMPEG_FFLAGS", "nobuffer+discardcorrupt"); // 丢弃损坏帧
+    std::env::set_var("FFMPEG_BUFFER_SIZE", "8192000"); // 8MB接收缓冲区 (防止高清码流丢包)
+
     let pipe: FramePipelineBuilder = AVMediaType::AVMEDIA_TYPE_VIDEO.into();
     let pipe = pipe.filter("decode", Box::new(filter));
     let out = create_null_output().add_frame_pipeline(pipe);
-
     // 尝试构建FFmpeg上下文
     let ctx = FfmpegContext::builder()
         .input(rtsp_url)
@@ -158,9 +161,7 @@ fn try_decoder(
         .map_err(|e| format!("构建失败: {}", e))?;
 
     // 尝试启动
-    let sch = ctx.start()
-        .map_err(|e| format!("启动失败: {}", e))?;
-    
+    let sch = ctx.start().map_err(|e| format!("启动失败: {}", e))?;
     println!("✅ {} 连接成功,开始解码!", decoder.name());
     let _ = sch.wait();
     Ok(())
@@ -169,11 +170,11 @@ fn try_decoder(
 /// 自适应解码器选择: 优先硬件,失败则降级
 pub fn adaptive_decode(rtsp_url: &str, filter: DecodeFilter) {
     let decoders = vec![
-        DecoderType::NvidiaCuda,  // 优先NVIDIA (最快)
-        DecoderType::IntelQsv,    // 次选Intel
-        DecoderType::AmdAmf,      // 再次AMD
-        DecoderType::Dxva2,       // 通用硬件解码
-        DecoderType::Software,    // 最后软解
+        DecoderType::NvidiaCuda, // 优先NVIDIA (最快)
+        DecoderType::IntelQsv,   // 次选Intel
+        DecoderType::AmdAmf,     // 再次AMD
+        DecoderType::Dxva2,      // 通用硬件解码
+        DecoderType::Software,   // 最后软解
     ];
 
     println!("� 自适应解码器选择 (优先硬件加速)");

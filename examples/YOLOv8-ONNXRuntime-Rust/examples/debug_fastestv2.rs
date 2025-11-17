@@ -2,7 +2,7 @@
 use anyhow::Result;
 use clap::Parser;
 use image::{DynamicImage, GenericImageView};
-use ndarray::{Array, IxDyn};
+use ndarray::{s, Array, IxDyn};
 use std::path::PathBuf;
 
 use yolov8_rs::*;
@@ -79,10 +79,24 @@ fn main() -> Result<()> {
                 println!("      ch[{:2}] = {:.6}", ch, val);
             }
 
-            println!("    Last 10 channels (classes):");
-            for ch in (c - 10).max(0)..c {
+            println!("    Channels 12-14 (obj confidence):");
+            for ch in 12..15 {
                 let val = output[[0, h_center, w_center, ch]];
                 println!("      ch[{:2}] = {:.6}", ch, val);
+            }
+
+            println!("    Channels 15-24 (first 10 classes):");
+            for ch in 15..25 {
+                let val = output[[0, h_center, w_center, ch]];
+                let class_id = ch - 15;
+                println!("      ch[{:2}] = {:.6} (class {})", ch, val, class_id);
+            }
+
+            println!("    Last 10 channels (classes 70-79):");
+            for ch in (c - 10).max(0)..c {
+                let val = output[[0, h_center, w_center, ch]];
+                let class_id = ch - 15;
+                println!("      ch[{:2}] = {:.6} (class {})", ch, val, class_id);
             }
 
             // 统计值分布
@@ -107,6 +121,31 @@ fn main() -> Result<()> {
             println!("    Min: {:.6}", min_val);
             println!("    Max: {:.6}", max_val);
             println!("    Mean: {:.6}", sum / count as f32);
+
+            // 找出最大置信度位置
+            println!("\n  Finding max confidence detections:");
+            for h_idx in 0..h {
+                for w_idx in 0..w {
+                    for b in 0..3 {
+                        let obj_conf = output[[0, h_idx, w_idx, 12 + b]];
+                        if obj_conf > 0.15 {
+                            let class_scores = &output.slice(s![0, h_idx, w_idx, 15..95]);
+                            let (class_id, &class_score) = class_scores
+                                .iter()
+                                .enumerate()
+                                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                                .unwrap();
+                            let confidence = obj_conf * class_score;
+                            if confidence > 0.05 {
+                                println!(
+                                    "    pos[{},{},anchor{}]: obj={:.3}, class{}={:.3}, conf={:.3}",
+                                    h_idx, w_idx, b, obj_conf, class_id, class_score, confidence
+                                );
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 

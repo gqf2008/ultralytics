@@ -1,13 +1,11 @@
-/// 检测器 (Detector)
-/// 职责: 订阅DecodedFrame → YOLO检测 → 发送DetectionResult消息
-
-use crate::rtsp::{types, TrackerType};
-use crate::systems::{DecodedFrame, DetectionResult};
-use crate::xbus;
-use crate::{Args as YoloArgs, YOLOv8, YOLOTask};
 use crate::fastestv2::{FastestV2Config, FastestV2Postprocessor};
+use crate::realtime_detection::{DecodedFrame, DetectionResult};
+/// 检测模块 - 独立线程运行
+/// 负责: 订阅DecodedFrame → YOLO检测+追踪 → 发送DetectionResult
+use crate::rtsp::{self, TrackerType};
+use crate::xbus::{self, Subscription};
+use crate::{Args as YoloArgs, YOLOTask, YOLOv8};
 use image::{imageops, DynamicImage, ImageBuffer, Rgb, RgbImage, Rgba};
-use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 pub struct Detector {
@@ -15,7 +13,7 @@ pub struct Detector {
     pose_model_path: String,
     tracker_type: TrackerType,
     inf_size: u32,
-    
+
     // 统计
     count: u64,
     last: Instant,
@@ -71,7 +69,7 @@ impl Detector {
         let mut detect_model = match YOLOv8::new(detect_args) {
             Ok(m) => {
                 println!("✅ 检测模型加载成功");
-                Arc::new(Mutex::new(m))
+                m
             }
             Err(e) => {
                 eprintln!("❌ 检测模型加载失败: {}", e);
@@ -84,15 +82,12 @@ impl Detector {
             let config = FastestV2Config {
                 conf_threshold: 0.20,
                 iou_threshold: 0.45,
-                num_classes: 80,  // COCO 类别数
-                num_anchors: 3,   // 每个尺度3个anchor
-                strides: vec![8, 16, 32],  // YOLOv8默认stride
                 anchors: vec![
-                    12.64, 19.39, 37.88, 51.48, 55.71, 138.31,
-                    79.57, 257.11, 140.63, 149.70, 279.92, 258.87,
+                    12.64, 19.39, 37.88, 51.48, 55.71, 138.31, 79.57, 257.11, 140.63, 149.70,
+                    279.92, 258.87,
                 ],
             };
-            Some(FastestV2Postprocessor::new(config, self.inf_size as usize, self.inf_size as usize))
+            Some(FastestV2Postprocessor::new(config))
         } else {
             None
         };
@@ -180,17 +175,13 @@ impl Detector {
             // 5. YOLO检测
             let detect_results = if let Some(ref pp) = fastestv2_postprocessor {
                 // FastestV2专用后处理
-                let mut model = detect_model.lock().unwrap();
-                let xs = model
+                let xs = detect_model
                     .preprocess(&vec![img.clone()])
                     .unwrap_or_default();
-                let ys = model.engine_mut().run(xs, false).unwrap_or_default();
-                drop(model);
-                pp.postprocess(ys, &vec![img.clone()])
-                    .unwrap_or_default()
+                let ys = detect_model.engine_mut().run(xs, false).unwrap_or_default();
+                pp.postprocess(ys, &vec![img.clone()]).unwrap_or_default()
             } else {
-                let mut model = detect_model.lock().unwrap();
-                model.run(&vec![img.clone()]).unwrap_or_default()
+                detect_model.run(&vec![img.clone()]).unwrap_or_default()
             };
 
             // 6. 提取检测框
@@ -200,13 +191,13 @@ impl Detector {
                     for bbox in boxes {
                         // 只检测人 (class=0)
                         if bbox.id() == 0 && bbox.confidence() >= 0.20 {
-                            bboxes.push(types::BBox {
+                            bboxes.push(rtsp::BBox {
                                 x1: bbox.xmin(),
                                 y1: bbox.ymin(),
                                 x2: bbox.xmax(),
                                 y2: bbox.ymax(),
                                 confidence: bbox.confidence(),
-                                class_id: bbox.id() as u32,
+                                class_id: bbox.id(),
                             });
                         }
                     }
@@ -218,7 +209,7 @@ impl Detector {
 
             // 8. 计算FPS
             let inference_ms = start.elapsed().as_secs_f64() * 1000.0;
-            
+
             // 9. 发送检测结果
             xbus::post(DetectionResult {
                 frame_id: frame.frame_id,
@@ -234,7 +225,7 @@ impl Detector {
         // 保持线程运行
         loop {
             std::thread::sleep(std::time::Duration::from_secs(1));
-            
+
             // TODO: 监听SystemControl消息,支持优雅退出
         }
     }

@@ -92,36 +92,36 @@ fn main() -> GameResult {
     println!();
 
     // Channel 1: Decode -> Render (动态分辨率 frames)
-    // ========== 新架构的Channel设置 ==========
-    // Channel 1: 解码线程 → 渲染线程 (原始视频帧,用于显示)
-    let (tx_decode_to_render, rx_decode_to_render) = bounded::<DecodedFrame>(60);
+    // 增大缓冲区: 30 → 60 帧,避免关键帧丢失
+    let (tx_decode, rx_decode) = bounded::<DecodedFrame>(60);
 
-    // Channel 2: 解码线程 → 检测线程 (原始视频帧,用于检测)
-    let (tx_decode_to_inference, rx_decode_to_inference) = bounded::<DecodedFrame>(60);
+    // Channel 2: Render -> Inference (320x320 resized frames)
+    // 增大缓冲区: 2 → 60 帧,避免阻塞渲染线程(FastestV2每帧推理)
+    let (tx_to_inference, rx_resized) = bounded::<ResizedFrame>(60);
 
-    // Channel 3: 检测线程 → 渲染线程 (检测结果+绘制数据)
-    let (tx_inference_to_render, rx_inference_to_render) = bounded::<RenderData>(60);
+    // Channel 3: Inference -> Render (detection results)
+    // 增大缓冲区: 2 → 60 帧,避免阻塞推理线程
+    let (tx_result, rx_result) = bounded::<InferredFrame>(60);
 
-    // 启动解码线程 (发送到两个channel)
+    // 启动解码线程 (自适应选择最佳解码器)
     let rtsp_url = args.rtsp_url.clone();
-    let tx_render = tx_decode_to_render.clone();
-    let tx_inference = tx_decode_to_inference.clone();
+    let tx_decode_clone = tx_decode.clone();
     std::thread::spawn(move || {
         println!("🎬 开始连接 RTSP...");
 
-        let filter = DecodeFilter::new(tx_render, tx_inference);
+        let filter = DecodeFilter::new();
 
         // 自适应解码器选择
         adaptive_decode(&rtsp_url, filter);
     });
 
-    // 启动检测线程 (接收原始帧,自己resize,发送结果+绘制数据)
+    // Start inference thread
     let detect_model_clone = detect_model.clone();
     let pose_model_clone = pose_model.clone();
     std::thread::spawn(move || {
         inference_thread(
-            rx_decode_to_inference,
-            tx_inference_to_render,
+            rx_resized,
+            tx_result,
             detect_model_clone,
             pose_model_clone,
             INF_SIZE,
@@ -150,8 +150,9 @@ fn main() -> GameResult {
 
     let app = YoloApp::new(
         &mut ctx,
-        rx_decode_to_render,      // 接收原始帧(用于显示)
-        rx_inference_to_render,   // 接收检测结果+绘制数据
+        rx_decode,
+        rx_result,
+        tx_to_inference,
         INF_SIZE,
         WINDOW_WIDTH,
         WINDOW_HEIGHT,

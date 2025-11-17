@@ -352,6 +352,17 @@ impl EventHandler for YoloApp {
 
         // Update inference results when available
         if let Ok(results) = self.rx_result.try_recv() {
+            static mut RESULT_COUNT: u32 = 0;
+            unsafe {
+                RESULT_COUNT += 1;
+                if RESULT_COUNT % 30 == 1 {
+                    eprintln!(
+                        "📊 渲染器收到检测结果: {}人 | {}关键点组",
+                        results.bboxes.len(),
+                        results.keypoints.len()
+                    );
+                }
+            }
             self.current_results = Some(results);
         }
 

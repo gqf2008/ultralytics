@@ -1,8 +1,7 @@
-﻿/// 解码器 (Decoder)
-/// 职责: RTSP视频流解码 → 发送DecodedFrame消息
-
+﻿use crate::pipeline::DecodedFrame;
+/// 解码器 (Decoder)
+/// 职责: RTSP视频流解码  发送DecodedFrame消息
 use crate::rtsp;
-use crate::systems::DecodedFrame;
 use crate::xbus;
 use std::sync::mpsc;
 
