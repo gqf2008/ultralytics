@@ -153,7 +153,7 @@ impl ByteTracker {
         Self {
             tracked_persons: Vec::new(),
             next_id: 1,
-            max_lost_frames: 20,       // 20帧 (减少长时间漂移)
+            max_lost_frames: 60,       // 60帧(约2秒) - 提高遮挡容忍度
             high_score_threshold: 0.4, // 高分阈值 (降低让更多框参与)
             low_score_threshold: 0.1,  // 低分阈值 (救援用)
             high_iou_threshold: 0.4,   // 高分匹配阈值 (提高避免误匹配)

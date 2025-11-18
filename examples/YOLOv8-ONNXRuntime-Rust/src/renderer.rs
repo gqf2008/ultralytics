@@ -66,7 +66,7 @@ impl Renderer {
             }
         });
 
-        // 订阅Det ectionResult
+        // 订阅DetectionResult
         let result_sub = xbus::subscribe::<DetectionResult, _>(move |result| {
             if let Err(err) = tx.try_send(RenderFrame::Detection(result.clone())) {
                 eprintln!("渲染器通道发送DetectionResult失败: {}", err);
@@ -92,66 +92,6 @@ impl Renderer {
             detect_fps: 0.0,
             decode_fps: 0.0,
         })
-    }
-
-    /// 验证帧质量 - 防止灰屏/单调帧渲染
-    fn is_valid_frame(frame: &DecodedFrame) -> bool {
-        // 采样检查RGBA数据 (检查RGB,忽略Alpha)
-        let data = &frame.rgba_data;
-        let pixel_count = (frame.width * frame.height) as usize;
-
-        if pixel_count == 0 || data.len() < pixel_count * 4 {
-            return false;
-        }
-
-        // 采样25个点检查对比度
-        let sample_indices = [
-            pixel_count / 6,
-            pixel_count / 3,
-            pixel_count / 2,
-            pixel_count * 2 / 3,
-            pixel_count * 5 / 6,
-            pixel_count / 4,
-            pixel_count * 3 / 8,
-            pixel_count * 5 / 8,
-            pixel_count * 3 / 4,
-            pixel_count / 5,
-        ];
-
-        let mut r_min = 255u8;
-        let mut r_max = 0u8;
-        let mut g_min = 255u8;
-        let mut g_max = 0u8;
-        let mut b_min = 255u8;
-        let mut b_max = 0u8;
-
-        for &idx in &sample_indices {
-            if idx * 4 + 2 < data.len() {
-                let r = data[idx * 4];
-                let g = data[idx * 4 + 1];
-                let b = data[idx * 4 + 2];
-
-                r_min = r_min.min(r);
-                r_max = r_max.max(r);
-                g_min = g_min.min(g);
-                g_max = g_max.max(g);
-                b_min = b_min.min(b);
-                b_max = b_max.max(b);
-            }
-        }
-
-        let r_range = r_max - r_min;
-        let g_range = g_max - g_min;
-        let b_range = b_max - b_min;
-        let total_range = r_range.max(g_range).max(b_range);
-
-        // 降低阈值避免窗口无响应 (从10降到3)
-        if total_range < 3 {
-            // 不再打印警告,避免刷屏
-            return false;
-        }
-
-        true
     }
 
     /// 绘制系统统计信息面板 (左上角)
@@ -247,18 +187,14 @@ impl EventHandler for Renderer {
         if let Some(frame) = self.render_frame_buffer.try_iter().last() {
             match frame {
                 RenderFrame::Video(decoded_frame) => {
-                    // 只更新有效帧,低质量帧保留上一帧 (不要return,保持事件循环)
-                    if Self::is_valid_frame(&decoded_frame) {
-                        let image = Image::from_pixels(
-                            ctx,
-                            &decoded_frame.rgba_data,
-                            ggez::graphics::ImageFormat::Rgba8UnormSrgb,
-                            decoded_frame.width,
-                            decoded_frame.height,
-                        );
-                        self.last_frame.replace(image);
-                    }
-                    // 即使跳过帧也继续,不要return,保持窗口响应
+                    let image = Image::from_pixels(
+                        ctx,
+                        &decoded_frame.rgba_data,
+                        ggez::graphics::ImageFormat::Rgba8UnormSrgb,
+                        decoded_frame.width,
+                        decoded_frame.height,
+                    );
+                    self.last_frame.replace(image);
                 }
                 RenderFrame::Detection(detection_result) => {
                     self.last_detection.replace(detection_result);

@@ -1,0 +1,20 @@
+{
+    "detection_conf_threshold": 0.10,
+    "detection_iou_threshold": 0.45,
+    "post_process_threshold": 0.01,
+    "bytetrack_max_lost_frames": 60,
+    "bytetrack_high_score_threshold": 0.4,
+    "bytetrack_low_score_threshold": 0.1,
+    "bytetrack_high_iou_threshold": 0.4,
+    "bytetrack_low_iou_threshold": 0.3,
+    "bytetrack_kalman_obs_noise": 0.5,
+    "deepsort_max_lost_frames": 90,
+    "deepsort_iou_threshold": 0.2,
+    "deepsort_appearance_threshold": 0.15,
+    "deepsort_reid_skip_frames": 3,
+    "deepsort_reid_max_count": 5,
+    "deepsort_kalman_obs_noise": 1.5,
+    "kalman_process_noise": 0.1,
+    "kalman_velocity_decay": 0.95,
+    "kalman_stationary_threshold": 2.0
+}

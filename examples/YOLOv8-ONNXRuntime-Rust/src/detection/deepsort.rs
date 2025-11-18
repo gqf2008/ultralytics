@@ -422,12 +422,12 @@ impl PersonTracker {
         Self {
             tracked_persons: Vec::new(),
             next_id: 1,
-            max_lost_frames: 20,        // 降低到20帧,减少长时间漂移
-            iou_threshold: 0.2,         // 降低IOU阈值,提高匹配成功率
+            max_lost_frames: 90, // 90帧(约3秒) - DeepSort可利用ReID特征长时间恢复
+            iou_threshold: 0.2,  // 降低IOU阈值,提高匹配成功率
             mahalanobis_threshold: 9.4, // 标准DeepSort值 (运动一致性检查)
             appearance_threshold: 0.15, // 降低外观阈值,更容易匹配
-            max_cascade_depth: 30,      // 标准级联深度
-            min_confirmation_hits: 2,   // 降低到2帧,更快确认,减少初期漂移
+            max_cascade_depth: 30, // 标准级联深度
+            min_confirmation_hits: 2, // 降低到2帧,更快确认,减少初期漂移
             color_palette,
             reid_model: Self::load_reid_model(),
             frame_counter: 0,
