@@ -52,6 +52,9 @@ pub struct TrackedPerson {
 
     /// 连续匹配次数
     consecutive_matches: u32,
+
+    /// 是否静止 (速度小于阈值)
+    is_stationary: bool,
 }
 
 impl TrackedPerson {
@@ -62,8 +65,8 @@ impl TrackedPerson {
         keypoints: Option<&PoseKeypoints>,
         reid_features: Option<Vec<f32>>,
     ) -> Self {
-        // DeepSort标准参数: 小过程噪声(q=0.1)和中等观测噪声(r=10.0)
-        let kalman = KalmanBoxFilter::new(&bbox, 0.1, 10.0);
+        // 优化参数: 降低观测噪声(r=1.5),更信任检测结果,减少漂移
+        let kalman = KalmanBoxFilter::new(&bbox, 0.1, 1.5);
         let smoothed_bbox = kalman.get_state_bbox();
 
         let center = TrackPoint {
@@ -98,6 +101,7 @@ impl TrackedPerson {
             time_since_update: 0,
             confirmed: false,
             consecutive_matches: 0,
+            is_stationary: false, // 初始为运动状态
         }
     }
 
@@ -114,6 +118,14 @@ impl TrackedPerson {
         keypoints: Option<&PoseKeypoints>,
         min_confirmation_hits: u32,
     ) {
+        // 检测是否静止 (检测框和预测框的距离)
+        let predicted = self.kalman.get_predicted_bbox();
+        let dx = (bbox.x1 + bbox.x2) / 2.0 - (predicted.x1 + predicted.x2) / 2.0;
+        let dy = (bbox.y1 + bbox.y2) / 2.0 - (predicted.y1 + predicted.y2) / 2.0;
+        let movement = (dx * dx + dy * dy).sqrt();
+
+        self.is_stationary = movement < 3.0; // 小于3像素视为静止
+
         // 卡尔曼滤波更新
         self.kalman.update(&bbox);
         self.bbox = self.kalman.get_state_bbox();
@@ -167,6 +179,14 @@ impl TrackedPerson {
         reid_features: Option<Vec<f32>>,
         min_confirmation_hits: u32,
     ) {
+        // 检测是否静止
+        let predicted = self.kalman.get_predicted_bbox();
+        let dx = (bbox.x1 + bbox.x2) / 2.0 - (predicted.x1 + predicted.x2) / 2.0;
+        let dy = (bbox.y1 + bbox.y2) / 2.0 - (predicted.y1 + predicted.y2) / 2.0;
+        let movement = (dx * dx + dy * dy).sqrt();
+
+        self.is_stationary = movement < 3.0;
+
         // 卡尔曼滤波更新
         self.kalman.update(&bbox);
         self.bbox = self.kalman.get_state_bbox();
@@ -379,6 +399,9 @@ pub struct PersonTracker {
 
     /// OSNet ReID模型
     reid_model: Option<Session>,
+
+    /// 帧计数器(用于跳帧ReID提取)
+    frame_counter: u32,
 }
 
 impl PersonTracker {
@@ -399,27 +422,40 @@ impl PersonTracker {
         Self {
             tracked_persons: Vec::new(),
             next_id: 1,
-            max_lost_frames: 30,  // 减少: 30帧 ≈ 1秒@30fps (防止误匹配)
-            iou_threshold: 0.3,   // 提高IOU阈值 (更严格的位置匹配)
+            max_lost_frames: 20,        // 降低到20帧,减少长时间漂移
+            iou_threshold: 0.2,         // 降低IOU阈值,提高匹配成功率
             mahalanobis_threshold: 9.4, // 标准DeepSort值 (运动一致性检查)
-            appearance_threshold: 0.2, // 提高外观阈值 (更严格的相似度要求)
-            max_cascade_depth: 30, // 标准级联深度
-            min_confirmation_hits: 3, // 标准确认要求 (3帧确认,防止抖动)
+            appearance_threshold: 0.15, // 降低外观阈值,更容易匹配
+            max_cascade_depth: 30,      // 标准级联深度
+            min_confirmation_hits: 2,   // 降低到2帧,更快确认,减少初期漂移
             color_palette,
             reid_model: Self::load_reid_model(),
+            frame_counter: 0,
         }
     }
 
     /// 加载OSNet-AIN ReID模型 (x1.0跨域泛化最强版本)
     /// 性能指标: Rank-1 94.7%, mAP 84.9% (跨域场景表现最优)
     fn load_reid_model() -> Option<Session> {
-        // 尝试加载模型,失败则返回None(回退到姿态ReID)
+        println!("[DeepSort] 尝试加载ReID模型: models/osnet_ain_x1_0.onnx");
+
         match Session::builder() {
             Ok(builder) => match builder.commit_from_file("models/osnet_ain_x1_0.onnx") {
-                Ok(session) => Some(session),
-                Err(_) => None,
+                Ok(session) => {
+                    println!("[DeepSort] ✓ ReID模型加载成功! 使用深度ReID特征 (95% IOU + 5% ReID)");
+                    Some(session)
+                }
+                Err(e) => {
+                    println!("[DeepSort] ✗ ReID模型加载失败: {}", e);
+                    println!("[DeepSort] → 回退到纯IOU匹配模式");
+                    None
+                }
             },
-            Err(_) => None,
+            Err(e) => {
+                println!("[DeepSort] ✗ Session创建失败: {}", e);
+                println!("[DeepSort] → 回退到纯IOU匹配模式");
+                None
+            }
         }
     }
 
@@ -526,6 +562,9 @@ impl PersonTracker {
         keypoints: &[PoseKeypoints],
         frame_rgba: Option<(&[u8], u32, u32)>, // (数据, 宽, 高)
     ) -> &[TrackedPerson] {
+        // 帧计数器递增(用于跳帧ReID提取)
+        self.frame_counter += 1;
+
         // 1. 所有跟踪对象先预测下一帧
         for tracked in &mut self.tracked_persons {
             tracked.predict();
@@ -582,8 +621,11 @@ impl PersonTracker {
                 matched_det[det_idx] = true;
                 matched_track[track_idx] = true;
 
-                // 提取ReID特征并更新
-                let reid_features =
+                // 性能优化: 仅每3帧提取一次ReID特征,且最多提取前5个目标
+                let should_extract_reid =
+                    self.frame_counter % 3 == 0 && det_idx < 5 && self.reid_model.is_some();
+
+                let reid_features = if should_extract_reid {
                     if let (Some(reid), Some((rgba, w, h))) = (&mut self.reid_model, frame_rgba) {
                         Some(Self::extract_reid_features_from_image(
                             reid,
@@ -594,7 +636,10 @@ impl PersonTracker {
                         ))
                     } else {
                         None
-                    };
+                    }
+                } else {
+                    None // 其他帧使用缓存特征,不重新提取
+                };
 
                 let kpts = keypoints.get(det_idx);
                 self.tracked_persons[track_idx].update_with_reid(
@@ -682,7 +727,7 @@ impl PersonTracker {
         &mut self,
         detections: &[(usize, &BBox)],
         track_indices: &[usize],
-        keypoints: &[PoseKeypoints],
+        _keypoints: &[PoseKeypoints],
         frame_rgba: Option<(&[u8], u32, u32)>,
     ) -> Vec<(usize, usize)> {
         let mut candidates = Vec::new();
@@ -693,28 +738,21 @@ impl PersonTracker {
 
                 let iou = Self::compute_iou(detection, &track.get_predicted_bbox());
 
-                // 计算外观相似度
-                let (appearance_sim, _feature_type) = if let (Some(reid), Some((rgba, w, h))) =
-                    (&mut self.reid_model, frame_rgba)
-                {
-                    // 使用深度ReID模型
-                    let det_features =
-                        Self::extract_reid_features_from_image(reid, rgba, w, h, detection);
-                    let sim = Self::cosine_similarity(&track.appearance_features, &det_features);
-                    (sim, "深度ReID")
-                } else if let Some(kpts) = keypoints.get(*det_idx) {
-                    // 回退到姿态ReID
-                    (track.compute_reid_similarity(kpts, detection), "姿态ReID")
-                } else {
-                    // 最后回退到几何特征
-                    (track.compute_appearance_similarity(detection), "几何特征")
-                };
-
-                // 首次使用时输出特征类型
-                // 融合代价: 10%运动 + 90%外观
-                let motion_cost = 1.0 - iou;
-                let appearance_cost = 1.0 - appearance_sim;
-                let cost = motion_cost * 0.1 + appearance_cost * 0.9;
+                // 计算代价
+                let cost =
+                    if let (Some(reid), Some((rgba, w, h))) = (&mut self.reid_model, frame_rgba) {
+                        // 有ReID模型: 使用融合匹配 (95%位置 + 5%外观)
+                        let det_features =
+                            Self::extract_reid_features_from_image(reid, rgba, w, h, detection);
+                        let appearance_sim =
+                            Self::cosine_similarity(&track.appearance_features, &det_features);
+                        let motion_cost = 1.0 - iou;
+                        let appearance_cost = 1.0 - appearance_sim;
+                        motion_cost * 0.95 + appearance_cost * 0.05
+                    } else {
+                        // 无ReID模型: 纯IOU匹配 (避免几何特征干扰)
+                        1.0 - iou
+                    };
 
                 candidates.push((cost, *det_idx, local_det_idx, track_idx, local_track_idx));
             }
@@ -840,6 +878,14 @@ impl PersonTracker {
     /// 获取当前所有跟踪对象
     pub fn get_tracked_persons(&self) -> &[TrackedPerson] {
         &self.tracked_persons
+    }
+
+    /// 获取所有跟踪对象的ReID特征(用于可视化)
+    pub fn get_reid_features(&self) -> Vec<Vec<f32>> {
+        self.tracked_persons
+            .iter()
+            .map(|p| p.appearance_features.clone())
+            .collect()
     }
 
     /// 获取跟踪统计信息

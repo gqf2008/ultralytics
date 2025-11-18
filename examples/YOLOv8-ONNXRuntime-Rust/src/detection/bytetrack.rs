@@ -36,12 +36,15 @@ pub struct ByteTrackedPerson {
 
     /// 检测置信度 (用于判断是否为高分轨迹)
     pub score: f32,
+
+    /// 是否静止
+    is_stationary: bool,
 }
 
 impl ByteTrackedPerson {
     fn new(id: u32, bbox: BBox, color: (u8, u8, u8)) -> Self {
-        // ByteTrack使用较小的过程噪声(q=0.1)和观测噪声(r=1.0)
-        let kalman = KalmanBoxFilter::new(&bbox, 0.1, 1.0);
+        // ByteTrack优化: 降低观测噪声(r=0.5),更信任检测结果,快速响应移动
+        let kalman = KalmanBoxFilter::new(&bbox, 0.1, 0.5);
         let smoothed_bbox = kalman.get_state_bbox();
 
         let center = TrackPoint {
@@ -58,6 +61,7 @@ impl ByteTrackedPerson {
             color,
             total_frames: 1,
             score: bbox.confidence,
+            is_stationary: false,
         }
     }
 
@@ -67,6 +71,14 @@ impl ByteTrackedPerson {
     }
 
     fn update(&mut self, bbox: BBox) {
+        // 检测是否静止
+        let predicted = self.kalman.get_predicted_bbox();
+        let dx = (bbox.x1 + bbox.x2) / 2.0 - (predicted.x1 + predicted.x2) / 2.0;
+        let dy = (bbox.y1 + bbox.y2) / 2.0 - (predicted.y1 + predicted.y2) / 2.0;
+        let movement = (dx * dx + dy * dy).sqrt();
+
+        self.is_stationary = movement < 3.0; // 小于3像素视为静止
+
         self.kalman.update(&bbox);
         self.bbox = self.kalman.get_state_bbox();
         self.frames_lost = 0;
@@ -141,11 +153,11 @@ impl ByteTracker {
         Self {
             tracked_persons: Vec::new(),
             next_id: 1,
-            max_lost_frames: 30,       // 30帧 ≈ 1秒@30fps
-            high_score_threshold: 0.5, // 高分阈值
+            max_lost_frames: 20,       // 20帧 (减少长时间漂移)
+            high_score_threshold: 0.4, // 高分阈值 (降低让更多框参与)
             low_score_threshold: 0.1,  // 低分阈值 (救援用)
-            high_iou_threshold: 0.3,   // 高分匹配阈值
-            low_iou_threshold: 0.5,    // 低分匹配阈值 (更严格)
+            high_iou_threshold: 0.4,   // 高分匹配阈值 (提高避免误匹配)
+            low_iou_threshold: 0.3,    // 低分匹配阈值 (降低救援更宽松)
             color_palette,
         }
     }

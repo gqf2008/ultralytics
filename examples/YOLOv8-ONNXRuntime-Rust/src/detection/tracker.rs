@@ -17,19 +17,19 @@ pub struct TrackPoint {
 pub struct TrackedObject {
     /// 唯一跟踪ID
     pub id: u32,
-    
+
     /// 当前边界框 (滤波平滑后)
     pub bbox: BBox,
-    
+
     /// 历史轨迹 (中心点)
     pub trajectory: Vec<TrackPoint>,
-    
+
     /// 连续丢失帧数
     pub frames_lost: u32,
-    
+
     /// 显示颜色 (每个ID不同颜色)
     pub color: (u8, u8, u8),
-    
+
     /// 总共被跟踪的帧数 (age)
     pub total_frames: u32,
 }
@@ -41,12 +41,12 @@ impl TrackedObject {
         let cy = (self.bbox.y1 + self.bbox.y2) / 2.0;
         (cx, cy)
     }
-    
+
     /// 添加轨迹点
     pub fn add_trajectory_point(&mut self) {
         let (cx, cy) = self.center();
         self.trajectory.push(TrackPoint { x: cx, y: cy });
-        
+
         // 限制轨迹长度
         if self.trajectory.len() > 30 {
             self.trajectory.remove(0);
@@ -62,20 +62,29 @@ impl TrackedObject {
 pub struct KalmanBoxFilter {
     /// 状态估计: [cx, cy, w, h, vx, vy, vw, vh]
     state: [f32; 8],
-    
+
     /// 估计误差协方差 (简化为对角阵)
     p: [f32; 8],
-    
+
     /// 过程噪声 (运动不确定性)
     q: f32,
-    
+
     /// 观测噪声 (测量不确定性)
     r: f32,
+
+    /// 速度衰减因子 (用于静止目标,0.9-0.99)
+    velocity_decay: f32,
+
+    /// 静止阈值 (像素/帧)
+    stationary_threshold: f32,
+
+    /// 连续静止帧数计数器
+    stationary_count: u32,
 }
 
 impl KalmanBoxFilter {
     /// 创建新的卡尔曼滤波器
-    /// 
+    ///
     /// # 参数
     /// - `bbox`: 初始边界框
     /// - `q`: 过程噪声 (0.1-1.0, 越小越平滑)
@@ -91,48 +100,90 @@ impl KalmanBoxFilter {
             p: [10.0; 8],
             q,
             r,
+            velocity_decay: 0.95,      // 速度衰减因子:每帧保留95%速度
+            stationary_threshold: 2.0, // 静止阈值:小于2像素/帧视为静止
+            stationary_count: 0,       // 初始未静止
         }
     }
 
-    /// 预测下一帧状态 (匀速运动模型)
+    /// 预测下一帧状态 (匀速运动模型 + 速度衰减)
     pub fn predict(&mut self) {
+        // 检测是否静止 (速度小于阈值)
+        let speed = (self.state[4] * self.state[4] + self.state[5] * self.state[5]).sqrt();
+        let is_stationary = speed < self.stationary_threshold;
+
+        if is_stationary {
+            self.stationary_count += 1;
+            // 静止时更强的速度衰减
+            let decay = if self.stationary_count > 3 {
+                0.7 // 连续静止3帧后,大幅衰减速度
+            } else {
+                self.velocity_decay
+            };
+            self.state[4] *= decay;
+            self.state[5] *= decay;
+            self.state[6] *= decay;
+            self.state[7] *= decay;
+        } else {
+            self.stationary_count = 0;
+            // 正常运动时轻微衰减
+            self.state[4] *= self.velocity_decay;
+            self.state[5] *= self.velocity_decay;
+            self.state[6] *= 0.98; // 尺寸变化更慢
+            self.state[7] *= 0.98;
+        }
+
         // 状态转移: x = x + vx, y = y + vy, w = w + vw, h = h + vh
         self.state[0] += self.state[4]; // cx += vx
         self.state[1] += self.state[5]; // cy += vy
         self.state[2] += self.state[6]; // w += vw
         self.state[3] += self.state[7]; // h += vh
 
-        // 协方差预测: P = P + Q
+        // 协方差预测: P = P + Q (静止时减小过程噪声)
+        let q_factor = if is_stationary { 0.5 } else { 1.0 };
         for i in 0..8 {
-            self.p[i] += self.q;
+            self.p[i] += self.q * q_factor;
         }
     }
 
-    /// 更新 (融合观测值)
+    /// 更新 (融合观测值,自适应噪声调整)
     pub fn update(&mut self, bbox: &BBox) {
         let cx = (bbox.x1 + bbox.x2) / 2.0;
         let cy = (bbox.y1 + bbox.y2) / 2.0;
         let w = bbox.x2 - bbox.x1;
         let h = bbox.y2 - bbox.y1;
 
-        // 卡尔曼增益: K = P / (P + R)
-        let k = [
-            self.p[0] / (self.p[0] + self.r),
-            self.p[1] / (self.p[1] + self.r),
-            self.p[2] / (self.p[2] + self.r),
-            self.p[3] / (self.p[3] + self.r),
-            self.p[4] / (self.p[4] + self.r * 10.0),
-            self.p[5] / (self.p[5] + self.r * 10.0),
-            self.p[6] / (self.p[6] + self.r * 10.0),
-            self.p[7] / (self.p[7] + self.r * 10.0),
-        ];
-
-        // 观测残差
+        // 计算观测残差
         let y = [
             cx - self.state[0],
             cy - self.state[1],
             w - self.state[2],
             h - self.state[3],
+        ];
+
+        // 根据残差大小自适应调整观测噪声
+        let residual_norm = (y[0] * y[0] + y[1] * y[1]).sqrt();
+        let adaptive_r = if residual_norm < self.stationary_threshold {
+            // 静止或小幅移动:降低观测噪声,更信任观测值
+            self.r * 0.3
+        } else if residual_norm < 10.0 {
+            // 正常运动
+            self.r
+        } else {
+            // 大幅跳变:增加观测噪声,更信任预测值
+            self.r * 3.0
+        };
+
+        // 卡尔曼增益: K = P / (P + R)
+        let k = [
+            self.p[0] / (self.p[0] + adaptive_r),
+            self.p[1] / (self.p[1] + adaptive_r),
+            self.p[2] / (self.p[2] + adaptive_r),
+            self.p[3] / (self.p[3] + adaptive_r),
+            self.p[4] / (self.p[4] + adaptive_r * 10.0),
+            self.p[5] / (self.p[5] + adaptive_r * 10.0),
+            self.p[6] / (self.p[6] + adaptive_r * 10.0),
+            self.p[7] / (self.p[7] + adaptive_r * 10.0),
         ];
 
         // 状态更新: x = x + K * y
@@ -141,15 +192,25 @@ impl KalmanBoxFilter {
         self.state[2] += k[2] * y[2];
         self.state[3] += k[3] * y[3];
 
-        // 速度更新
-        self.state[4] += k[4] * y[0];
-        self.state[5] += k[5] * y[1];
-        self.state[6] += k[6] * y[2];
-        self.state[7] += k[7] * y[3];
+        // 速度更新 (静止时减小速度估计影响)
+        let velocity_gain = if residual_norm < self.stationary_threshold {
+            0.3
+        } else {
+            1.0
+        };
+        self.state[4] += k[4] * y[0] * velocity_gain;
+        self.state[5] += k[5] * y[1] * velocity_gain;
+        self.state[6] += k[6] * y[2] * velocity_gain;
+        self.state[7] += k[7] * y[3] * velocity_gain;
 
         // 协方差更新: P = (I - K) * P
         for i in 0..8 {
             self.p[i] *= 1.0 - k[i];
+        }
+
+        // 重置静止计数器 (收到新观测)
+        if residual_norm >= self.stationary_threshold {
+            self.stationary_count = 0;
         }
     }
 
@@ -206,16 +267,16 @@ impl KalmanBoxFilter {
 // ========== 跟踪器统一接口 ==========
 
 /// 多目标跟踪器 Trait
-/// 
+///
 /// 所有跟踪算法(DeepSort, ByteTrack等)都应实现此接口
 pub trait Tracker {
     /// 更新跟踪器
-    /// 
+    ///
     /// # 参数
     /// - `detections`: 当前帧的检测框
     /// - `keypoints`: 当前帧的姿态关键点 (用于外观特征)
     /// - `frame_rgba`: 可选的图像数据 (格式: RGBA, width, height)
-    /// 
+    ///
     /// # 返回
     /// 当前所有活跃的跟踪对象
     fn update(

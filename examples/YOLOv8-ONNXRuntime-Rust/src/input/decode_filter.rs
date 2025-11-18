@@ -193,7 +193,8 @@ impl FrameFilter for DecodeFilter {
             }
 
             // 3. 中灰色单调帧: Y值在110-140之间 且 对比度<10 (只过滤真正的解码错误帧)
-            if y_avg >= 110 && y_avg <= 140 && y_range < 10 {
+            // ⚠️ 放宽条件: 对比度<5 才算异常 (范围0-4是真正的解码错误)
+            if y_avg >= 110 && y_avg <= 140 && y_range < 5 {
                 self.dropped_frames += 1;
                 if self.total_frames <= 50 || self.dropped_frames <= 10 {
                     println!(

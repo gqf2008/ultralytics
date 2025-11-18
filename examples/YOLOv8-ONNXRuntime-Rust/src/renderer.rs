@@ -280,7 +280,7 @@ impl EventHandler for Renderer {
             // 绘制检测结果
             if let Some(detection_result) = &self.last_detection {
                 // bbox坐标在原始视频分辨率下,需要缩放到窗口尺寸
-                for bbox in &detection_result.bboxes {
+                for (idx, bbox) in detection_result.bboxes.iter().enumerate() {
                     let x1 = bbox.x1 * scale_x;
                     let y1 = bbox.y1 * scale_y;
                     let w = (bbox.x2 - bbox.x1) * scale_x;
@@ -297,7 +297,7 @@ impl EventHandler for Renderer {
                     canvas.draw(&box_mesh, DrawParam::default());
 
                     // 置信度标签
-                    let label = format!("Person {:.2}", bbox.confidence);
+                    let label = format!("ID:{} {:.2}", bbox.class_id, bbox.confidence);
                     let text =
                         Text::new(TextFragment::new(label).font("MicrosoftYaHei").scale(18.0));
                     canvas.draw(
@@ -309,6 +309,39 @@ impl EventHandler for Renderer {
                             })
                             .color(Color::from_rgb(0, 255, 0)),
                     );
+
+                    // 绘制ReID特征可视化 (色块)
+                    if idx < detection_result.reid_features.len() {
+                        let features = &detection_result.reid_features[idx];
+                        if !features.is_empty() {
+                            // 使用前3个特征维度作为RGB颜色
+                            let r =
+                                ((features.get(0).unwrap_or(&0.0).abs() * 255.0).min(255.0)) as u8;
+                            let g =
+                                ((features.get(1).unwrap_or(&0.0).abs() * 255.0).min(255.0)) as u8;
+                            let b =
+                                ((features.get(2).unwrap_or(&0.0).abs() * 255.0).min(255.0)) as u8;
+
+                            // 在bbox右上角绘制ReID特征色块
+                            let reid_rect = Rect::new(x1 + w - 30.0, y1, 30.0, 30.0);
+                            let reid_mesh = Mesh::new_rectangle(
+                                ctx,
+                                DrawMode::fill(),
+                                reid_rect,
+                                Color::from_rgb(r, g, b),
+                            )?;
+                            canvas.draw(&reid_mesh, DrawParam::default());
+
+                            // 绘制边框
+                            let reid_border = Mesh::new_rectangle(
+                                ctx,
+                                DrawMode::stroke(2.0),
+                                reid_rect,
+                                Color::WHITE,
+                            )?;
+                            canvas.draw(&reid_border, DrawParam::default());
+                        }
+                    }
                 }
 
                 // 绘制姿态骨架
@@ -377,7 +410,7 @@ impl EventHandler for Renderer {
 
                         // 计算预览窗口位置 (首次默认右下角,之后使用拖动位置)
                         let margin = 10.0;
-                        let preview_size = 200.0; // 预览窗口大小
+                        let preview_size = detection_result.resized_size.min(300) as f32; // 动态尺寸,最大300
                         let preview_scale = preview_size / detection_result.resized_size as f32;
 
                         // 如果还未初始化位置,设为右下角

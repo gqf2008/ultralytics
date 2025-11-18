@@ -11,7 +11,7 @@ use image::{DynamicImage, ImageBuffer, RgbImage, Rgba};
 use super::types::DecodedFrame;
 use super::{ByteTracker, PersonTracker};
 use crate::detection::types;
-use crate::models::{FastestV2, Model, ModelType, NanoDet, YOLOv8, YOLOX};
+use crate::models::{FastestV2, Model, ModelType, NanoDet, YOLOv10, YOLOv11, YOLOv8, YOLOX};
 use crate::{xbus, Args, YOLOTask};
 
 /// 检测结果 (检测模块 → 渲染模块)
@@ -25,6 +25,7 @@ pub struct DetectionResult {
     pub tracker_ms: f64,                // 追踪器耗时
     pub resized_image: Option<Vec<u8>>, // Resize后的RGB图像数据 (用于右下角显示)
     pub resized_size: u32,              // Resize后的图像尺寸
+    pub reid_features: Vec<Vec<f32>>,   // 每个bbox对应的ReID特征向量
 }
 
 /// 跟踪器类型
@@ -154,6 +155,35 @@ impl Detector {
                 }
                 Err(e) => {
                     eprintln!("❌ NanoDet 模型加载失败: {}", e);
+                    return;
+                }
+            },
+            ModelType::YOLOv10 => match YOLOv10::new(detect_args) {
+                Ok(m) => {
+                    println!("✅ YOLOv10 检测模型加载成功 (NMS-Free)");
+                    Arc::new(Mutex::new(Box::new(m)))
+                }
+                Err(e) => {
+                    eprintln!("❌ YOLOv10 模型加载失败: {}", e);
+                    return;
+                }
+            },
+            ModelType::YOLOv11 => match YOLOv11::new(detect_args) {
+                Ok(m) => {
+                    println!("✅ YOLOv11 检测模型加载成功");
+                    // 检查姿态估计能力
+                    if self.pose_enabled {
+                        if m.supports_task(YOLOTask::Pose) {
+                            println!("✅ 姿态估计: 已启用 (模型支持)");
+                        } else {
+                            println!("⚠️ 姿态估计: 已请求但模型不支持,将禁用");
+                            self.pose_enabled = false;
+                        }
+                    }
+                    Arc::new(Mutex::new(Box::new(m)))
+                }
+                Err(e) => {
+                    eprintln!("❌ YOLOv11 模型加载失败: {}", e);
                     return;
                 }
             },
@@ -381,11 +411,14 @@ impl Detector {
 
         // 8. 跟踪器更新
         let tracker_start = Instant::now();
-        let tracked_bboxes = match &mut self.tracker {
+        let (tracked_bboxes, reid_features) = match &mut self.tracker {
             TrackerType::DeepSort(tracker) => {
-                let tracked = tracker.update(&bboxes, &keypoints, None);
+                // 传入原始图像数据以启用ReID特征提取
+                let frame_data = Some((rgba_img.as_raw().as_slice(), frame.width, frame.height));
+                let tracked = tracker.update(&bboxes, &keypoints, frame_data);
+
                 // 将跟踪结果转换为BBox格式(保持原有结构)
-                tracked
+                let bboxes: Vec<types::BBox> = tracked
                     .iter()
                     .map(|t| types::BBox {
                         x1: t.bbox.x1,
@@ -395,11 +428,15 @@ impl Detector {
                         confidence: t.bbox.confidence,
                         class_id: t.id, // 使用跟踪ID替换class_id
                     })
-                    .collect()
+                    .collect();
+
+                // 获取ReID特征
+                let reid_feats = tracker.get_reid_features();
+                (bboxes, reid_feats)
             }
             TrackerType::ByteTrack(tracker) => {
                 let tracked = tracker.update(&bboxes);
-                tracked
+                let bboxes = tracked
                     .iter()
                     .map(|t| types::BBox {
                         x1: t.bbox.x1,
@@ -409,9 +446,10 @@ impl Detector {
                         confidence: t.bbox.confidence,
                         class_id: t.id,
                     })
-                    .collect()
+                    .collect();
+                (bboxes, Vec::new())
             }
-            TrackerType::None => bboxes.clone(), // 不使用跟踪器,直接返回检测结果
+            TrackerType::None => (bboxes.clone(), Vec::new()), // 不使用跟踪器,直接返回检测结果
         };
         let tracker_ms = tracker_start.elapsed().as_secs_f64() * 1000.0;
 
@@ -471,11 +509,12 @@ impl Detector {
             bboxes,
             keypoints,
             inference_fps: self.current_fps,
-            inference_ms: total_ms,
+            inference_ms,
             tracker_fps: self.tracker_current_fps,
             tracker_ms,
             resized_image: Some(resized_rgba),
             resized_size: inf_size,
+            reid_features,
         });
     }
 }

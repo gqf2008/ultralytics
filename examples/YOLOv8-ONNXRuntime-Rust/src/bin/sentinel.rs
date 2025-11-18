@@ -24,15 +24,15 @@ use yolov8_rs::{detection, input};
 #[derive(Parser, Debug)]
 #[command(author, version, about = "数字卫兵 - 智能视频监控系统", long_about = None)]
 struct Args {
-    /// RTSP流地址
+    /// RTSP流地址 (当input_mode=rtsp时使用)
     #[arg(
         short,
         long,
         default_value = "rtsp://admin:Wosai2018@172.19.54.45/cam/realmonitor?channel=1&subtype=0"
     )]
-    rtsp_url: String,
+    url: String,
 
-    /// 检测模型 (n/s/m/l/x/fastest/fastest-xl/n-int8/m-int8/v5n/v5s/v5m/nanodet/nanodet-m/nanodet-plus/yolox_s/yolox_m/yolox_l)
+    /// 检测模型 (n/s/m/l/x/v10n/v10s/v10m/v11n/v11s/v11m/fastest/fastest-xl/n-int8/m-int8/v5n/v5s/v5m/nanodet/nanodet-m/nanodet-plus/yolox_s/yolox_m/yolox_l)
     #[arg(short, long, default_value = "n")]
     model: String,
 
@@ -58,6 +58,14 @@ fn main() -> GameResult {
     let detect_model = if args.model.starts_with("yolox") {
         // YOLOX 模型 (例如: yolox_s -> yolox_s.onnx, yolox_m -> yolox_m.onnx)
         format!("models/{}.onnx", args.model)
+    } else if args.model.starts_with("v10") {
+        // YOLOv10 模型 (例如: v10n -> yolov10n.onnx)
+        let variant = args.model.trim_start_matches("v10");
+        format!("models/yolov10{}.onnx", variant)
+    } else if args.model.starts_with("v11") {
+        // YOLOv11 模型 (例如: v11n -> yolov11n.onnx)
+        let variant = args.model.trim_start_matches("v11");
+        format!("models/yolov11{}.onnx", variant)
     } else if args.model == "fastest" || args.model.starts_with("fastest") {
         format!("models/{}.onnx", fastest_variant)
     } else if args.model.starts_with("nanodet") {
@@ -96,13 +104,15 @@ fn main() -> GameResult {
     println!("📦 检测模型: {}", detect_model);
     println!("🎯 跟踪算法: {}", args.tracker);
     println!("🧍 姿态估计: {}", if args.pose { "启用" } else { "禁用" });
-    println!("📹 RTSP地址: {}", args.rtsp_url);
+
+    // ========== 启动解码线程 ==========
+    println!("🎬 输入模式: 主动拉流");
+    println!("📹 流地址: {}", args.url);
     println!();
 
-    // ========== 启动输入线程 ==========
-    let rtsp_url = args.rtsp_url.clone();
+    let url = args.url.clone();
     std::thread::spawn(move || {
-        let mut decoder = input::Decoder::new(rtsp_url);
+        let mut decoder = input::Decoder::new(url);
         decoder.run();
     });
 

@@ -1,9 +1,9 @@
-/// 自适应解码器选择模块
-/// Adaptive decoder selection module with hardware detection
+/// RTSP主动拉流解码器
+/// RTSP active pulling decoder with adaptive hardware detection
 use super::decode_filter::DecodeFilter;
 use ez_ffmpeg::core::context::null_output::create_null_output;
 use ez_ffmpeg::filter::frame_pipeline_builder::FramePipelineBuilder;
-use ez_ffmpeg::{AVMediaType, FfmpegContext};
+use ez_ffmpeg::{AVMediaType, FfmpegContext, Input};
 
 #[cfg(windows)]
 use wmi::{COMLibrary, WMIConnection};
@@ -163,27 +163,50 @@ fn try_decoder(
         std::env::set_var(key, val);
     }
 
-    // 设置 RTSP 优化参数(通过环境变量)
-    std::env::set_var("FFMPEG_RTSP_TRANSPORT", "tcp"); // 使用TCP避免丢包
-    std::env::set_var("FFMPEG_RTSP_FLAGS", "prefer_tcp"); // 优先TCP
+    // ========== 🔥 VLC级别画质优化参数 (CSDN优化方案) ==========
+    // RTSP传输优化
+    std::env::set_var("FFMPEG_RTSP_TRANSPORT", "tcp"); // 强制TCP传输(可靠,防止UDP丢包)
+    std::env::set_var("FFMPEG_RTSP_FLAGS", "prefer_tcp");
+    std::env::set_var("FFMPEG_BUFFER_SIZE", "8192000"); // 8MB缓冲区
+
+    // 🎯 低延迟参数
     std::env::set_var("FFMPEG_FLAGS", "low_delay"); // 低延迟模式
-    std::env::set_var("FFMPEG_FFLAGS", "nobuffer+discardcorrupt"); // 丢弃损坏帧
-    std::env::set_var("FFMPEG_BUFFER_SIZE", "8192000"); // 8MB接收缓冲区 (防止高清码流丢包)
+    std::env::set_var("FFMPEG_FFLAGS", "nobuffer"); // 无缓冲(降低延迟)
+
+    // 🎯 解码质量优化 - 关键! (保留完整环路滤波)
+    std::env::set_var("FFMPEG_SKIP_FRAME", "noref"); // 只跳过非参考帧(保留画质)
+    std::env::set_var("FFMPEG_SKIP_LOOP_FILTER", "noref"); // 保留环路滤波(去块效应核心)
+    std::env::set_var("FFMPEG_ERR_DETECT", "careful"); // 错误检测但不丢弃可修复帧
+
+    // 🔧 H.264/HEVC解码器优化选项
+    std::env::set_var("FFMPEG_THREADS", "auto"); // 多线程解码
+    std::env::set_var("FFMPEG_THREAD_TYPE", "frame+slice"); // 帧级+切片级并行
+
+    // 🎨 后处理滤镜(去块+降噪)
+    std::env::set_var("FFMPEG_POST_PROCESS", "1"); // 启用后处理
 
     let pipe: FramePipelineBuilder = AVMediaType::AVMEDIA_TYPE_VIDEO.into();
     let pipe = pipe.filter("decode", Box::new(filter));
     let out = create_null_output().add_frame_pipeline(pipe);
-    // 尝试构建FFmpeg上下文
+    let input = Input::new(rtsp_url).set_input_opts(
+        [
+            ("rtsp_transport", "tcp"),
+            ("buffer_size", "67108864"),
+            ("rtsp_flags", "prefer_tcp "),
+        ]
+        .into(),
+    ); //4,194,304
+       // 构建FFmpeg上下文 - 添加画质滤镜
     let ctx = FfmpegContext::builder()
-        .input(rtsp_url)
-        .filter_desc("format=yuv420p")
+        .input(input)
+        .filter_descs(["format=yuv420p"].into())
         .output(out)
         .build()
         .map_err(|e| format!("构建失败: {}", e))?;
 
     // 尝试启动
     let sch = ctx.start().map_err(|e| format!("启动失败: {}", e))?;
-    println!("✅ {} 连接成功,开始解码!", decoder.name());
+    println!("✅ {} 连接成功,开始解码! (画质增强模式)", decoder.name());
     let _ = sch.wait();
     Ok(())
 }

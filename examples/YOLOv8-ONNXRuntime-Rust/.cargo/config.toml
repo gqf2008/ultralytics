@@ -3,7 +3,7 @@
 [env]
 # vcpkg 根目录 (用于 FFmpeg 等 C/C++ 依赖)
 VCPKG_ROOT = "D:\\workspace\\vcpkg"
-
+VLC_LIB_DIR = "D:\\my\\Desktop\\vlc-3.0.21"
 # FFmpeg 路径 (如果 vcpkg 已安装 ffmpeg)
 # FFMPEG_DIR = "D:\\workspace\\vcpkg\\installed\\x64-windows"
 
