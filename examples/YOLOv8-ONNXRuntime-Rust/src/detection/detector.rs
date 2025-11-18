@@ -350,7 +350,7 @@ impl Detector {
                         if bbox.id() == 0 {
                             person_detections_count += 1;
                         }
-                        if bbox.confidence() >= 0.05 {
+                        if bbox.confidence() >= 0.01 {
                             bboxes.push(types::BBox {
                                 x1: bbox.xmin() * scale_x,
                                 y1: bbox.ymin() * scale_y,
@@ -360,7 +360,7 @@ impl Detector {
                                 class_id: bbox.id() as u32,
                             });
                         } else if self.count % 30 == 0 && bbox.id() == 0 {
-                            eprintln!("⚠️ 低置信度人检测: conf={:.3}", bbox.confidence());
+                            eprintln!("⚠️ 极低置信度人检测被过滤: conf={:.3}", bbox.confidence());
                         }
                     }
                 }

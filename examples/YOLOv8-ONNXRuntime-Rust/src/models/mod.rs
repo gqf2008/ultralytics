@@ -81,12 +81,12 @@ impl ModelType {
     pub fn default_conf_threshold(&self) -> f32 {
         match self {
             ModelType::YOLOv10 => 0.20, // v10端到端模型已过滤
-            ModelType::YOLOv11 => 0.15, // v11与v8相同
+            ModelType::YOLOv11 => 0.10, // v11降低阈值检测静止目标
             ModelType::YOLOX => 0.25,
             ModelType::FastestV2 => 0.10,
             ModelType::NanoDet => 0.35,
             ModelType::YOLOv5 => 0.25,
-            ModelType::YOLOv8 => 0.15,
+            ModelType::YOLOv8 => 0.10, // 降低阈值检测静止目标
         }
     }
 
