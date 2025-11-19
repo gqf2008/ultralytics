@@ -8,55 +8,30 @@ use ez_ffmpeg::{AVMediaType, FfmpegContext, Input};
 #[cfg(windows)]
 use wmi::{COMLibrary, WMIConnection};
 
-/// 输入源类型
-#[derive(Debug, Clone)]
-pub enum InputSource {
-    Rtsp(String), // RTSP流
-    Camera(i32),  // 本地摄像头 (设备ID)
-}
-
-/// 解码器包装器
+/// RTSP解码器
 pub struct Decoder {
-    source: InputSource,
+    rtsp_url: String,
+    generation: usize,
 }
 
 impl Decoder {
     /// 创建RTSP解码器
-    pub fn new(rtsp_url: String) -> Self {
+    pub fn new(rtsp_url: String, generation: usize) -> Self {
         Self {
-            source: InputSource::Rtsp(rtsp_url),
+            rtsp_url,
+            generation,
         }
     }
 
-    /// 创建摄像头解码器
-    pub fn from_camera(camera_id: i32) -> Self {
-        Self {
-            source: InputSource::Camera(camera_id),
-        }
-    }
-
+    /// 运行RTSP解码
     pub fn run(&mut self) {
-        println!("🎬 解码器启动");
-        let filter = DecodeFilter::new();
+        println!("🎬 RTSP解码器启动 (Gen: {})", self.generation);
+        println!("📹 流地址: {}", self.rtsp_url);
 
-        match &self.source {
-            InputSource::Rtsp(url) => {
-                let rtsp_url = url.clone();
-                adaptive_decode(&rtsp_url, filter);
-            }
-            InputSource::Camera(id) => {
-                let camera_url = format_camera_url(*id);
-                camera_decode(&camera_url, filter);
-            }
-        }
+        let filter = DecodeFilter::new(self.generation);
+        adaptive_decode(&self.rtsp_url, filter);
 
-        println!("❌ 解码器退出");
-    }
-
-    /// 带停止信号的运行 (用于热切换)
-    pub fn run_with_stop_signal(&mut self, _stop_rx: crossbeam_channel::Receiver<()>) {
-        // 目前直接调用run，解码循环内部会检查全局停止标志
-        self.run();
+        println!("❌ RTSP解码器退出");
     }
 }
 
@@ -272,65 +247,4 @@ pub fn adaptive_decode(rtsp_url: &str, filter: DecodeFilter) {
     }
 
     eprintln!("❌ 所有解码器均失败!");
-}
-
-/// 格式化摄像头URL
-fn format_camera_url(camera_id: i32) -> String {
-    #[cfg(windows)]
-    {
-        // Windows使用DirectShow
-        // 常见的摄像头名称，按优先级尝试
-        if camera_id == 0 {
-            // 尝试常见的设备名称
-            "1080P USB Camera".to_string()
-        } else {
-            format!("{}", camera_id)
-        }
-    }
-    #[cfg(not(windows))]
-    {
-        format!("/dev/video{}", camera_id)
-    }
-}
-
-/// 摄像头解码 (使用DirectShow/V4L2)
-pub fn camera_decode(camera_url: &str, mut filter: DecodeFilter) {
-    println!("📹 启动摄像头解码");
-
-    filter.decoder_name = "摄像头".to_string();
-
-    // 清除环境变量
-    std::env::remove_var("FFMPEG_HWACCEL");
-
-    let pipe: FramePipelineBuilder = AVMediaType::AVMEDIA_TYPE_VIDEO.into();
-    let pipe = pipe.filter("decode", Box::new(filter));
-    let out = create_null_output().add_frame_pipeline(pipe);
-
-    #[cfg(windows)]
-    let input = Input::new(&format!("video={}", camera_url))
-        .set_format("dshow")
-        .set_input_opts([("video_size", "640x480"), ("framerate", "30")].into());
-
-    #[cfg(not(windows))]
-    let input = Input::new(camera_url).set_input_opts([("f", "v4l2"), ("framerate", "30")].into());
-
-    match FfmpegContext::builder()
-        .input(input)
-        .filter_descs(["format=yuv420p"].into())
-        .output(out)
-        .build()
-    {
-        Ok(ctx) => match ctx.start() {
-            Ok(sch) => {
-                println!("✅ 摄像头连接成功,开始解码!");
-                let _ = sch.wait();
-            }
-            Err(e) => {
-                eprintln!("❌ 摄像头启动失败: {}", e);
-            }
-        },
-        Err(e) => {
-            eprintln!("❌ 摄像头构建失败: {}", e);
-        }
-    }
 }

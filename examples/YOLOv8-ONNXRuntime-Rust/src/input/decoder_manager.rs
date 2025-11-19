@@ -1,10 +1,16 @@
 /// 解码器管理器 - 支持动态切换输入源
-use super::decoder::InputSource;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// 全局解码器命令发送器（占位）
-static DECODER_COMMAND_SENDER: once_cell::sync::Lazy<Arc<Mutex<Option<()>>>> =
-    once_cell::sync::Lazy::new(|| Arc::new(Mutex::new(None)));
+/// 全局活跃解码器代数ID (用于平滑切换)
+pub static ACTIVE_DECODER_GENERATION: AtomicUsize = AtomicUsize::new(0);
+
+/// 输入源类型
+#[derive(Debug, Clone)]
+pub enum InputSource {
+    Rtsp(String),          // RTSP流
+    Camera(usize, String), // 本地摄像头 (索引, 名称)
+    Desktop,               // 桌面捕获
+}
 
 /// 视频设备信息
 #[derive(Debug, Clone)]
@@ -22,40 +28,55 @@ impl DecoderManager {
     }
 }
 
-/// 切换输入源 - 通过退出程序实现
+/// 切换输入源 - 在新线程中启动解码器
 pub fn switch_decoder_source(source: InputSource) {
     println!("\n🔄 ============ 切换输入源 ============");
 
-    let cmd = match source {
+    use super::{CameraDecoder, Decoder, DesktopDecoder};
+    use std::thread;
+
+    // 1. 增加代数ID，使旧解码器失效
+    let new_gen = ACTIVE_DECODER_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+    println!("🔄 切换解码器代数: {} -> {}", new_gen - 1, new_gen);
+
+    match source {
         InputSource::Rtsp(url) => {
             println!("📹 新输入源: RTSP流");
             println!("   地址: {}", url);
-            format!(".\\target\\release\\sentinel-mq.exe -i rtsp -u \"{}\"", url)
+
+            thread::spawn(move || {
+                // 等待旧解码器退出
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                let mut decoder = Decoder::new(url, new_gen);
+                decoder.run();
+            });
         }
-        InputSource::Camera(id) => {
+        InputSource::Camera(index, name) => {
             println!("📷 新输入源: 本地摄像头");
-            println!("   设备ID: {}", id);
-            format!(".\\target\\release\\sentinel-mq.exe -i camera -c {}", id)
+            println!("   设备索引: {}", index);
+            println!("   设备名称: {}", name);
+
+            thread::spawn(move || {
+                // 等待旧解码器退出 (摄像头释放需要更多时间)
+                std::thread::sleep(std::time::Duration::from_millis(1000));
+                let mut camera = CameraDecoder::new(index, name, new_gen);
+                camera.run();
+            });
         }
-    };
+        InputSource::Desktop => {
+            println!("🖥️ 新输入源: 桌面捕获");
 
-    println!("\n💡 由于FFmpeg解码无法中断，需要重启程序");
-    println!("📋 启动命令已复制到剪贴板:");
-    println!("   {}", cmd);
-    println!("\n⚡ 操作步骤:");
-    println!("   1. 关闭当前窗口");
-    println!("   2. 在PowerShell中粘贴运行上述命令");
-    println!("\n🔄 正在尝试自动复制到剪贴板...");
-
-    // 尝试复制到剪贴板
-    use arboard::Clipboard;
-    if let Ok(mut clipboard) = Clipboard::new() {
-        if clipboard.set_text(&cmd).is_ok() {
-            println!("✅ 命令已复制到剪贴板！直接粘贴即可");
+            thread::spawn(move || {
+                // 等待旧解码器退出
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                let mut desktop = DesktopDecoder::new(new_gen);
+                desktop.run();
+            });
         }
     }
 
-    println!("\n========================================\n");
+    println!("✅ 解码器已在后台线程启动");
+    println!("========================================\n");
 }
 
 pub fn should_stop() -> bool {

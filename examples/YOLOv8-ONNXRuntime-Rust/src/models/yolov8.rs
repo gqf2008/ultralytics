@@ -468,6 +468,10 @@ impl YOLOv8 {
         self.iou
     }
 
+    pub fn set_iou(&mut self, val: f32) {
+        self.iou = val;
+    }
+
     pub fn task(&self) -> &YOLOTask {
         &self.task
     }
@@ -538,6 +542,22 @@ impl super::Model for YOLOv8 {
             task,
             YOLOTask::Detect | YOLOTask::Pose | YOLOTask::Segment | YOLOTask::Classify
         )
+    }
+
+    fn set_conf(&mut self, val: f32) {
+        self.conf = val;
+    }
+
+    fn conf(&self) -> f32 {
+        self.conf
+    }
+
+    fn set_iou(&mut self, val: f32) {
+        self.iou = val;
+    }
+
+    fn iou(&self) -> f32 {
+        self.iou
     }
 }
 

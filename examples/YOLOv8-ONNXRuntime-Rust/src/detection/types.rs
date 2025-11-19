@@ -59,6 +59,13 @@ pub struct InferredFrame {
     pub inference_ms: f64,
 }
 
+/// 配置更新消息 (渲染线程 → 推理线程)
+#[derive(Clone, Debug)]
+pub struct ConfigMessage {
+    pub conf_threshold: f32,
+    pub iou_threshold: f32,
+}
+
 impl PoseKeypoints {
     /// 提取ReID特征向量 (基于姿态关键点)
     /// 返回64维特征向量

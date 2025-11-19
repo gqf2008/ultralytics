@@ -10,7 +10,7 @@ use image::{DynamicImage, ImageBuffer, RgbImage, Rgba};
 
 use super::types::DecodedFrame;
 use super::{ByteTracker, PersonTracker};
-use crate::detection::types;
+use crate::detection::types::{self, ConfigMessage};
 use crate::models::{FastestV2, Model, ModelType, NanoDet, YOLOv10, YOLOv11, YOLOv8, YOLOX};
 use crate::{xbus, Args, YOLOTask};
 
@@ -40,6 +40,7 @@ pub struct Detector {
     inf_size: u32,
     tracker: TrackerType,
     pose_enabled: bool,
+    config_rx: Option<Receiver<ConfigMessage>>,
 
     // 统计
     count: u64,
@@ -79,6 +80,7 @@ impl Detector {
             inf_size,
             tracker,
             pose_enabled,
+            config_rx: None,
             count: 0,
             last: Instant::now(),
             current_fps: 0.0,
@@ -86,6 +88,10 @@ impl Detector {
             tracker_last: Instant::now(),
             tracker_current_fps: 0.0,
         }
+    }
+
+    pub fn set_config_receiver(&mut self, rx: Receiver<ConfigMessage>) {
+        self.config_rx = Some(rx);
     }
 
     pub fn run(&mut self) {
@@ -215,6 +221,16 @@ impl Detector {
 
         // 工作线程: 异步处理检测任务
         loop {
+            // 检查配置更新
+            if let Some(rx) = &self.config_rx {
+                while let Ok(config) = rx.try_recv() {
+                    let mut model = detect_model.lock().unwrap();
+                    model.set_conf(config.conf_threshold);
+                    model.set_iou(config.iou_threshold);
+                    // println!("⚙️ 模型参数更新: conf={:.2}, iou={:.2}", config.conf_threshold, config.iou_threshold);
+                }
+            }
+
             match rx.recv() {
                 Ok(frame) => {
                     self.process_frame(frame, &detect_model, inf_size);

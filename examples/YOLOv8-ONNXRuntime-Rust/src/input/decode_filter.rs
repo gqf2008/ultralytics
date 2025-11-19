@@ -1,4 +1,6 @@
 use crate::xbus;
+use super::decoder_manager::ACTIVE_DECODER_GENERATION;
+use std::sync::atomic::Ordering;
 
 /// FFmpeg解码过滤器模块
 /// FFmpeg decode filter module
@@ -17,10 +19,11 @@ pub struct DecodeFilter {
     pub decoder_name: String,  // 当前使用的解码器名称
     pub dropped_frames: usize, // 丢弃的帧数
     pub total_frames: usize,   // 总帧数
+    pub generation: usize,     // 解码器代数ID
 }
 
 impl DecodeFilter {
-    pub fn new() -> Self {
+    pub fn new(generation: usize) -> Self {
         Self {
             count: 0,
             last: Instant::now(),
@@ -28,6 +31,7 @@ impl DecodeFilter {
             decoder_name: String::from("Unknown"),
             dropped_frames: 0,
             total_frames: 0,
+            generation,
         }
     }
 }
@@ -47,6 +51,13 @@ impl FrameFilter for DecodeFilter {
         frame: Frame,
         _ctx: &FrameFilterContext,
     ) -> Result<Option<Frame>, String> {
+        // ✅ 检查解码器代数ID，如果已过期则停止解码
+        let current_gen = ACTIVE_DECODER_GENERATION.load(Ordering::Relaxed);
+        if self.generation != current_gen {
+            println!("🛑 解码器已过期 (Gen: {} != Current: {}), 停止解码", self.generation, current_gen);
+            return Err("Decoder expired".to_string());
+        }
+
         unsafe {
             self.total_frames += 1;
 

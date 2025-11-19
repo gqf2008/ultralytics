@@ -228,4 +228,20 @@ impl crate::models::Model for YOLOv10 {
     fn supports_task(&self, task: YOLOTask) -> bool {
         matches!(task, YOLOTask::Detect)
     }
+
+    fn set_conf(&mut self, val: f32) {
+        self.conf = val;
+    }
+
+    fn conf(&self) -> f32 {
+        self.conf
+    }
+
+    fn set_iou(&mut self, val: f32) {
+        self.iou = val;
+    }
+
+    fn iou(&self) -> f32 {
+        self.iou
+    }
 }

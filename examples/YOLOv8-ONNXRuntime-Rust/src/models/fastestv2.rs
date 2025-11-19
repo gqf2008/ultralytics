@@ -364,4 +364,20 @@ impl super::Model for FastestV2 {
         // FastestV2 仅支持目标检测
         matches!(task, crate::YOLOTask::Detect)
     }
+
+    fn set_conf(&mut self, val: f32) {
+        self.postprocessor.config.conf_threshold = val;
+    }
+
+    fn conf(&self) -> f32 {
+        self.postprocessor.config.conf_threshold
+    }
+
+    fn set_iou(&mut self, val: f32) {
+        self.postprocessor.config.iou_threshold = val;
+    }
+
+    fn iou(&self) -> f32 {
+        self.postprocessor.config.iou_threshold
+    }
 }

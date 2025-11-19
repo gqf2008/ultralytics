@@ -177,6 +177,18 @@ pub trait Model {
     /// }
     /// ```
     fn supports_task(&self, task: YOLOTask) -> bool;
+
+    /// 设置置信度阈值
+    fn set_conf(&mut self, val: f32);
+
+    /// 获取置信度阈值
+    fn conf(&self) -> f32;
+
+    /// 设置IOU阈值
+    fn set_iou(&mut self, val: f32);
+
+    /// 获取IOU阈值
+    fn iou(&self) -> f32;
 }
 
 // 各模型的具体实现

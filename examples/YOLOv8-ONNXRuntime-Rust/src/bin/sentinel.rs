@@ -6,7 +6,7 @@
 /// 1. 采集线程: 视频解码与预处理 (独立工作线程)
 /// 2. 检测线程: 目标检测与追踪 (独立工作线程)
 /// 3. 主线程:   渲染显示 (macroquad事件循环)
-
+//
 // 使用 mimalloc 替代系统默认分配器 (性能提升 10-30%)
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -14,8 +14,8 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use clap::Parser;
 use egui_macroquad::egui;
 use macroquad::prelude::*;
+use yolov8_rs::detection;
 use yolov8_rs::detection::INF_SIZE;
-use yolov8_rs::{detection, input};
 
 #[path = "../renderer_macroquad.rs"]
 mod renderer_macroquad;
@@ -25,22 +25,6 @@ use renderer_macroquad::Renderer;
 #[derive(Parser, Debug)]
 #[command(author, version, about = "数字卫兵 - 智能视频监控系统", long_about = None)]
 struct Args {
-    /// 输入模式 (rtsp/camera)
-    #[arg(short = 'i', long, default_value = "rtsp")]
-    input_mode: String,
-
-    /// RTSP流地址 (当input_mode=rtsp时使用)
-    #[arg(
-        short,
-        long,
-        default_value = "rtsp://admin:Wosai2018@172.19.54.45/cam/realmonitor?channel=1&subtype=0"
-    )]
-    url: String,
-
-    /// 摄像头设备ID (当input_mode=camera时使用, 0=默认摄像头)
-    #[arg(short = 'c', long, default_value_t = 0)]
-    camera_id: i32,
-
     /// 检测模型 (n/s/m/l/x/v10n/v10s/v10m/v11n/v11s/v11m/fastest/fastest-xl/n-int8/m-int8/v5n/v5s/v5m/nanodet/nanodet-m/nanodet-plus/yolox_s/yolox_m/yolox_l)
     #[arg(short, long, default_value = "n")]
     model: String,
@@ -155,32 +139,14 @@ async fn main() {
     println!("📦 检测模型: {}", detect_model);
     println!("🎯 跟踪算法: {}", args.tracker);
     println!("🧍 姿态估计: {}", if args.pose { "启用" } else { "禁用" });
+    println!("\n💡 请在UI中配置输入源并点击'立即切换输入源'按钮启动视频流");
+    println!();
 
-    // 启动解码线程
-    match args.input_mode.as_str() {
-        "camera" => {
-            println!("🎬 输入模式: 本地摄像头");
-            println!("📷 摄像头ID: {}", args.camera_id);
-            println!();
+    // 创建配置更新通道
+    let (config_tx, config_rx) = crossbeam_channel::bounded(5);
 
-            let camera_id = args.camera_id;
-            std::thread::spawn(move || {
-                let mut decoder = input::Decoder::from_camera(camera_id);
-                decoder.run();
-            });
-        }
-        _ => {
-            println!("🎬 输入模式: RTSP流");
-            println!("📹 流地址: {}", args.url);
-            println!();
-
-            let url = args.url.clone();
-            std::thread::spawn(move || {
-                let mut decoder = input::Decoder::new(url);
-                decoder.run();
-            });
-        }
-    }
+    // 不再自动启动解码器,等待用户在UI中配置
+    // 解码器将通过 switch_decoder_source() 函数启动
 
     // 启动检测线程
     let detect_model_clone = detect_model.clone();
@@ -189,6 +155,7 @@ async fn main() {
 
     std::thread::spawn(move || {
         let mut det = detection::Detector::new(detect_model_clone, INF_SIZE, tracker, pose_enabled);
+        det.set_config_receiver(config_rx);
         det.run();
     });
 
@@ -196,8 +163,9 @@ async fn main() {
     let detect_model_name = detect_model.replace("models/", "").replace(".onnx", "");
 
     let mut renderer = Renderer::new(detect_model_name, String::new(), args.tracker.clone());
+    renderer.set_config_sender(config_tx);
 
-    println!("✅ 系统就绪,开始监控...\n");
+    println!("✅ 系统就绪,等待配置输入源...\n");
 
     // 主循环
     loop {

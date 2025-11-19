@@ -63,4 +63,20 @@ impl crate::models::Model for YOLOv11 {
     fn supports_task(&self, task: YOLOTask) -> bool {
         self.inner.supports_task(task)
     }
+
+    fn set_conf(&mut self, val: f32) {
+        self.inner.set_conf(val);
+    }
+
+    fn conf(&self) -> f32 {
+        self.inner.conf()
+    }
+
+    fn set_iou(&mut self, val: f32) {
+        self.inner.set_iou(val);
+    }
+
+    fn iou(&self) -> f32 {
+        self.inner.iou()
+    }
 }
