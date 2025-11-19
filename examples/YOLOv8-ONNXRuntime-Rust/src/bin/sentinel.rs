@@ -163,7 +163,15 @@ async fn main() {
     let detect_model_name = detect_model.replace("models/", "").replace(".onnx", "");
 
     let mut renderer = Renderer::new(detect_model_name, String::new(), args.tracker.clone());
-    renderer.set_config_sender(config_tx);
+    renderer.set_config_sender(config_tx.clone());
+
+    // 发送初始模型参数 (确保启动参数生效)
+    if let Err(e) = config_tx.send(yolov8_rs::detection::types::ConfigMessage::UpdateParams {
+        conf_threshold: renderer.confidence_threshold,
+        iou_threshold: renderer.iou_threshold,
+    }) {
+        eprintln!("⚠️ 发送初始参数失败: {}", e);
+    }
 
     println!("✅ 系统就绪,等待配置输入源...\n");
 

@@ -1,6 +1,7 @@
 use crate::xbus;
 use super::decoder_manager::ACTIVE_DECODER_GENERATION;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 /// FFmpeg解码过滤器模块
 /// FFmpeg decode filter module
@@ -276,7 +277,7 @@ impl FrameFilter for DecodeFilter {
             }
 
             let decoded = DecodedFrame {
-                rgba_data,
+                rgba_data: Arc::new(rgba_data),
                 width: w,
                 height: h,
                 decode_fps: self.current_fps,

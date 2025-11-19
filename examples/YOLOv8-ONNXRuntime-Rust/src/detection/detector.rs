@@ -94,15 +94,13 @@ impl Detector {
         self.config_rx = Some(rx);
     }
 
-    pub fn run(&mut self) {
-        println!("🔍 检测模块启动");
-
+    fn load_model(&self, model_path: &str) -> Option<Arc<Mutex<Box<dyn Model>>>> {
         // 识别模型类型
-        let model_type = ModelType::from_path(&self.detect_model_path);
+        let model_type = ModelType::from_path(model_path);
 
         // 加载检测模型
         let detect_args = Args {
-            model: self.detect_model_path.clone(),
+            model: model_path.to_string(),
             width: Some(self.inf_size),
             height: Some(self.inf_size),
             conf: model_type.default_conf_threshold(),
@@ -123,92 +121,95 @@ impl Detector {
             profile: false,
         };
 
-        // 根据模型类型创建对应的模型实例
-        let detect_model: Arc<Mutex<Box<dyn Model>>> = match model_type {
+        match model_type {
             ModelType::YOLOv8 | ModelType::YOLOv5 => match YOLOv8::new(detect_args) {
                 Ok(m) => {
-                    println!("✅ YOLOv8 检测模型加载成功");
-                    // 检查姿态估计能力
-                    if self.pose_enabled {
-                        if m.supports_task(YOLOTask::Pose) {
-                            println!("✅ 姿态估计: 已启用 (模型支持)");
-                        } else {
-                            println!("⚠️ 姿态估计: 已请求但模型不支持,将禁用");
-                            self.pose_enabled = false;
-                        }
-                    }
-                    Arc::new(Mutex::new(Box::new(m)))
+                    println!("✅ YOLOv8/v5 检测模型加载成功: {}", model_path);
+                    Some(Arc::new(Mutex::new(Box::new(m))))
                 }
                 Err(e) => {
-                    eprintln!("❌ YOLOv8 模型加载失败: {}", e);
-                    return;
+                    eprintln!("❌ YOLOv8/v5 模型加载失败: {}", e);
+                    None
                 }
             },
             ModelType::FastestV2 => match FastestV2::new(detect_args) {
                 Ok(m) => {
                     println!("✅ YOLO-FastestV2 检测模型加载成功");
-                    Arc::new(Mutex::new(Box::new(m)))
+                    Some(Arc::new(Mutex::new(Box::new(m))))
                 }
                 Err(e) => {
                     eprintln!("❌ FastestV2 模型加载失败: {}", e);
-                    return;
+                    None
                 }
             },
             ModelType::NanoDet => match NanoDet::new(detect_args) {
                 Ok(m) => {
                     println!("✅ NanoDet 检测模型加载成功");
-                    Arc::new(Mutex::new(Box::new(m)))
+                    Some(Arc::new(Mutex::new(Box::new(m))))
                 }
                 Err(e) => {
                     eprintln!("❌ NanoDet 模型加载失败: {}", e);
-                    return;
+                    None
                 }
             },
             ModelType::YOLOv10 => match YOLOv10::new(detect_args) {
                 Ok(m) => {
-                    println!("✅ YOLOv10 检测模型加载成功 (NMS-Free)");
-                    Arc::new(Mutex::new(Box::new(m)))
+                    println!("✅ YOLOv10 检测模型加载成功");
+                    Some(Arc::new(Mutex::new(Box::new(m))))
                 }
                 Err(e) => {
                     eprintln!("❌ YOLOv10 模型加载失败: {}", e);
-                    return;
+                    None
                 }
             },
             ModelType::YOLOv11 => match YOLOv11::new(detect_args) {
                 Ok(m) => {
                     println!("✅ YOLOv11 检测模型加载成功");
-                    // 检查姿态估计能力
-                    if self.pose_enabled {
-                        if m.supports_task(YOLOTask::Pose) {
-                            println!("✅ 姿态估计: 已启用 (模型支持)");
-                        } else {
-                            println!("⚠️ 姿态估计: 已请求但模型不支持,将禁用");
-                            self.pose_enabled = false;
-                        }
-                    }
-                    Arc::new(Mutex::new(Box::new(m)))
+                    Some(Arc::new(Mutex::new(Box::new(m))))
                 }
                 Err(e) => {
                     eprintln!("❌ YOLOv11 模型加载失败: {}", e);
-                    return;
+                    None
                 }
             },
             ModelType::YOLOX => match YOLOX::new(detect_args) {
                 Ok(m) => {
                     println!("✅ YOLOX 检测模型加载成功");
-                    Arc::new(Mutex::new(Box::new(m)))
+                    Some(Arc::new(Mutex::new(Box::new(m))))
                 }
                 Err(e) => {
                     eprintln!("❌ YOLOX 模型加载失败: {}", e);
-                    return;
+                    None
                 }
             },
-        };
+        }
+    }
+
+    pub fn run(&mut self) {
+        println!("🔍 检测模块启动");
+
+        // 初始加载模型
+        let mut detect_model = self
+            .load_model(&self.detect_model_path)
+            .expect("Initial model load failed");
+
+        // 检查姿态估计支持
+        {
+            let m = detect_model.lock().unwrap();
+            if self.pose_enabled && !m.supports_task(YOLOTask::Pose) {
+                println!("⚠️ 姿态估计: 已请求但模型不支持,将禁用");
+                self.pose_enabled = false;
+            } else if self.pose_enabled {
+                println!("✅ 姿态估计: 已启用");
+            }
+        }
 
         // 订阅解码帧 - 仅将任务放入队列
         let inf_size = self.inf_size;
+        // 进一步减小队列长度以降低内存占用 (5 -> 2)
+        // 牺牲少量延迟稳定性换取更低的内存占用
         let (tx, rx): (Sender<DecodedFrame>, Receiver<DecodedFrame>) =
-            crossbeam_channel::bounded(60);
+            crossbeam_channel::bounded(2);
 
         let _sub = xbus::subscribe::<DecodedFrame, _>(move |frame| {
             // 轻量级操作：仅将帧放入工作队列
@@ -223,11 +224,53 @@ impl Detector {
         loop {
             // 检查配置更新
             if let Some(rx) = &self.config_rx {
-                while let Ok(config) = rx.try_recv() {
-                    let mut model = detect_model.lock().unwrap();
-                    model.set_conf(config.conf_threshold);
-                    model.set_iou(config.iou_threshold);
-                    // println!("⚙️ 模型参数更新: conf={:.2}, iou={:.2}", config.conf_threshold, config.iou_threshold);
+                while let Ok(msg) = rx.try_recv() {
+                    match msg {
+                        ConfigMessage::UpdateParams {
+                            conf_threshold,
+                            iou_threshold,
+                        } => {
+                            let mut model = detect_model.lock().unwrap();
+                            model.set_conf(conf_threshold);
+                            model.set_iou(iou_threshold);
+                        }
+                        ConfigMessage::SwitchModel(model_path) => {
+                            println!("🔄 正在切换模型: {}", model_path);
+                            if let Some(new_model) = self.load_model(&model_path) {
+                                detect_model = new_model;
+                                self.detect_model_path = model_path;
+
+                                // 重新检查姿态估计支持
+                                let m = detect_model.lock().unwrap();
+                                if self.pose_enabled && !m.supports_task(YOLOTask::Pose) {
+                                    println!("⚠️ 新模型不支持姿态估计,已自动禁用");
+                                    self.pose_enabled = false;
+                                }
+                            }
+                        }
+                        ConfigMessage::SwitchTracker(tracker_name) => {
+                            println!("🔄 正在切换跟踪器: {}", tracker_name);
+                            self.tracker = match tracker_name.to_lowercase().as_str() {
+                                "deepsort" => TrackerType::DeepSort(PersonTracker::new()),
+                                "bytetrack" => TrackerType::ByteTrack(ByteTracker::new()),
+                                _ => TrackerType::None,
+                            };
+                        }
+                        ConfigMessage::TogglePose(enabled) => {
+                            self.pose_enabled = enabled;
+                            if enabled {
+                                let m = detect_model.lock().unwrap();
+                                if !m.supports_task(YOLOTask::Pose) {
+                                    println!("⚠️ 当前模型不支持姿态估计,无法启用");
+                                    self.pose_enabled = false;
+                                } else {
+                                    println!("✅ 姿态估计已启用");
+                                }
+                            } else {
+                                println!("🚫 姿态估计已禁用");
+                            }
+                        }
+                    }
                 }
             }
 
@@ -254,31 +297,26 @@ impl Detector {
     ) {
         let start_total = Instant::now();
 
-        // 1. RGBA → RgbaImage
-        let rgba_img = match ImageBuffer::<Rgba<u8>, _>::from_raw(
-            frame.width,
-            frame.height,
-            frame.rgba_data,
-        ) {
-            Some(img) => img,
-            None => {
-                eprintln!("❌ RGBA图像转换失败");
-                return;
-            }
-        };
-
         // 2. Resize: 动态分辨率 → 320x320 (使用 fast_image_resize 高性能库 + Nearest 插值)
         let t2 = Instant::now();
 
-        // 创建源图像 (RGBA)
-        let src_buffer = rgba_img.as_raw().clone();
-        let src_image = fr::images::Image::from_vec_u8(
+        // 创建源图像 (RGBA) - 直接使用Arc中的数据切片,零拷贝!
+        // 注意: fast_image_resize 5.x 的 from_slice_u8 需要 &mut [u8]
+        // 因为我们使用的是 Arc (不可变共享), 所以这里必须 clone 一次数据
+        // 虽然引入了一次拷贝, 但相比之前的多次拷贝(每个订阅者一次)已经大大优化
+        let src_buffer = frame.rgba_data.to_vec();
+        let src_image = match fr::images::Image::from_vec_u8(
             frame.width,
             frame.height,
             src_buffer,
             fr::PixelType::U8x4,
-        )
-        .unwrap();
+        ) {
+            Ok(img) => img,
+            Err(e) => {
+                eprintln!("❌ 创建源图像失败: {}", e);
+                return;
+            }
+        };
 
         // 创建目标图像 (RGBA)
         let mut dst_image = fr::images::Image::new(inf_size, inf_size, fr::PixelType::U8x4);
@@ -303,15 +341,6 @@ impl Detector {
             rgb_data.push(chunk[1]); // G
             rgb_data.push(chunk[2]); // B
                                      // 跳过 Alpha 通道
-        }
-
-        // 保存一份用于右下角显示 (转换为RGBA格式,ggez需要)
-        let mut resized_rgba = Vec::with_capacity((inf_size * inf_size * 4) as usize);
-        for chunk in dst_pixels.chunks_exact(4) {
-            resized_rgba.push(chunk[0]); // R
-            resized_rgba.push(chunk[1]); // G
-            resized_rgba.push(chunk[2]); // B
-            resized_rgba.push(255); // A (不透明)
         }
 
         // 4. RGB → DynamicImage
@@ -430,7 +459,8 @@ impl Detector {
         let (tracked_bboxes, reid_features) = match &mut self.tracker {
             TrackerType::DeepSort(tracker) => {
                 // 传入原始图像数据以启用ReID特征提取
-                let frame_data = Some((rgba_img.as_raw().as_slice(), frame.width, frame.height));
+                // 注意: 这里需要传入原始图像数据,我们直接使用Arc切片
+                let frame_data = Some((frame.rgba_data.as_slice(), frame.width, frame.height));
                 let tracked = tracker.update(&bboxes, &keypoints, frame_data);
 
                 // 将跟踪结果转换为BBox格式(保持原有结构)
@@ -521,6 +551,7 @@ impl Detector {
         }
 
         // 10. 发送检测结果到XBus
+        // 移除 resized_image 以节省内存 (每帧 640x640x4 = 1.6MB)
         xbus::post(DetectionResult {
             bboxes,
             keypoints,
@@ -528,7 +559,7 @@ impl Detector {
             inference_ms,
             tracker_fps: self.tracker_current_fps,
             tracker_ms,
-            resized_image: Some(resized_rgba),
+            resized_image: None, // 不再传输预览图像,节省内存
             resized_size: inf_size,
             reid_features,
         });

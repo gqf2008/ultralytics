@@ -1,3 +1,4 @@
+use arboard::Clipboard;
 use crossbeam_channel::{Receiver, Sender};
 use egui_macroquad::egui;
 use macroquad::prelude::*;
@@ -83,22 +84,17 @@ pub struct Renderer {
     render_count: u64,
     render_last: Instant,
     render_fps: f64,
-    preview_visible: bool,
     show_control_panel: bool,
 
     // 系统配置信息
     detect_model_name: String,
-    pose_model_name: String,
     tracker_name: String,
     detect_fps: f64,
     decode_fps: f64,
 
     // egui 参数调整
-    // show_params_panel: bool, // 合并到主面板
     pub confidence_threshold: f32,
     pub iou_threshold: f32,
-    pub max_age: i32,
-    pub min_hits: i32,
 
     // 输入源配置界面
     // show_input_source_panel: bool, // 合并到主面板
@@ -125,7 +121,10 @@ pub struct Renderer {
     pose_enabled: bool,
 
     // 窗口状态
-    resize_window_pos: egui::Pos2,
+    is_mouse_over_ui: bool,
+
+    // 剪贴板
+    clipboard: Option<Clipboard>,
 }
 
 enum RenderFrame {
@@ -134,9 +133,10 @@ enum RenderFrame {
 }
 
 impl Renderer {
-    pub fn new(detect_model: String, pose_model: String, tracker: String) -> Self {
+    pub fn new(detect_model: String, _pose_model: String, tracker: String) -> Self {
         println!("渲染器启动");
-        let (tx, rx) = crossbeam_channel::bounded(25);
+        // 进一步减小队列长度以降低内存占用 (5 -> 2)
+        let (tx, rx) = crossbeam_channel::bounded(2);
 
         // 订阅DecodedFrame
         let tx1 = tx.clone();
@@ -163,19 +163,13 @@ impl Renderer {
             render_count: 0,
             render_last: Instant::now(),
             render_fps: 0.0,
-            preview_visible: true,
             show_control_panel: true,
             detect_model_name: detect_model.clone(),
-            pose_model_name: pose_model,
             tracker_name: tracker.clone(),
             detect_fps: 0.0,
             decode_fps: 0.0,
-            // show_params_panel: false,
             confidence_threshold: 0.5,
             iou_threshold: 0.45,
-            max_age: 30,
-            min_hits: 3,
-            // show_input_source_panel: true,
             input_source_type: 0,
             rtsp_url: "rtsp://admin:Wosai2018@172.19.54.45/cam/realmonitor?channel=1&subtype=0"
                 .to_string(),
@@ -204,13 +198,13 @@ impl Renderer {
             pan_offset: Vec2::ZERO,
             is_panning: false,
             last_mouse_pos: Vec2::ZERO,
-            // show_model_config_panel: true,
             selected_model_index: *MODEL_INDICES.get(detect_model.as_str()).unwrap_or(&0),
             selected_tracker_index: *TRACKER_INDICES
                 .get(tracker.to_lowercase().as_str())
                 .unwrap_or(&2),
             pose_enabled: false,
-            resize_window_pos: egui::pos2(screen_width() - 330.0, 310.0),
+            is_mouse_over_ui: false,
+            clipboard: Clipboard::new().ok(),
         }
     }
 
@@ -219,6 +213,7 @@ impl Renderer {
     }
 
     // 获取当前选择的模型名称
+    #[allow(dead_code)]
     pub fn get_selected_model(&self) -> String {
         static SHORT_NAMES: [&str; 25] = [
             "n",
@@ -254,6 +249,7 @@ impl Renderer {
     }
 
     // 获取当前选择的跟踪器
+    #[allow(dead_code)]
     pub fn get_selected_tracker(&self) -> String {
         static SHORT_TRACKERS: [&str; 3] = ["deepsort", "bytetrack", "none"];
         SHORT_TRACKERS
@@ -263,22 +259,53 @@ impl Renderer {
     }
 
     // 获取姿态估计状态
+    #[allow(dead_code)]
     pub fn is_pose_enabled(&self) -> bool {
         self.pose_enabled
     }
 
+    fn resolve_model_path(&self, model_name: &str) -> String {
+        match model_name {
+            "yolo-fastestv2" => "models/yolo-fastestv2-opt.onnx".to_string(),
+            "yolo-fastest-xl" => "models/yolo-fastest-1.1.onnx".to_string(),
+            "nanodet" => "models/nanodet-plus-m_320.onnx".to_string(),
+            "nanodet-plus" => "models/nanodet-plus-m_416.onnx".to_string(),
+            name if name.ends_with("-int8") => format!("models/{}.onnx", name.replace("-", "_")),
+            _ => format!("models/{}.onnx", model_name),
+        }
+    }
+
     pub fn update(&mut self) {
-        // 处理帧缓冲
+        // 处理帧缓冲 - 只保留最新一帧，丢弃旧帧
         if let Some(frame) = self.render_frame_buffer.try_iter().last() {
             match frame {
                 RenderFrame::Video(decoded_frame) => {
-                    let texture = Texture2D::from_rgba8(
-                        decoded_frame.width as u16,
-                        decoded_frame.height as u16,
-                        &decoded_frame.rgba_data,
-                    );
-                    texture.set_filter(FilterMode::Linear);
-                    self.last_frame = Some(texture);
+                    // 释放旧纹理（macroquad会自动管理）
+                    // 只在分辨率变化时重建纹理，否则更新像素数据
+                    let needs_rebuild = if let Some(ref tex) = self.last_frame {
+                        tex.width() != decoded_frame.width as f32
+                            || tex.height() != decoded_frame.height as f32
+                    } else {
+                        true
+                    };
+
+                    if needs_rebuild {
+                        let texture = Texture2D::from_rgba8(
+                            decoded_frame.width as u16,
+                            decoded_frame.height as u16,
+                            &decoded_frame.rgba_data,
+                        );
+                        texture.set_filter(FilterMode::Linear);
+                        self.last_frame = Some(texture);
+                    } else if let Some(ref tex) = self.last_frame {
+                        // 更新现有纹理的像素数据（避免重新分配GPU内存）
+                        let img = Image {
+                            bytes: decoded_frame.rgba_data.to_vec(),
+                            width: decoded_frame.width as u16,
+                            height: decoded_frame.height as u16,
+                        };
+                        tex.update(&img);
+                    }
                 }
                 RenderFrame::Detection(detection_result) => {
                     self.last_detection = Some(detection_result);
@@ -394,7 +421,25 @@ impl Renderer {
 
     pub fn draw_egui(&mut self) {
         egui_macroquad::ui(|egui_ctx| {
-            // 1. 主控制面板 (合并所有配置)
+            self.is_mouse_over_ui = egui_ctx.wants_pointer_input();
+
+            // --- 剪贴板处理 (Clipboard Handling) ---
+            if let Some(clipboard) = &mut self.clipboard {
+                let ctrl = is_key_down(KeyCode::LeftControl) || is_key_down(KeyCode::RightControl);
+
+                // 粘贴 (Paste): Ctrl+V
+                if ctrl && is_key_pressed(KeyCode::V) {
+                    if let Ok(text) = clipboard.get_text() {
+                        egui_ctx.input_mut(|i| i.events.push(egui::Event::Paste(text)));
+                    }
+                }
+
+                // 剪切 (Cut): Ctrl+X
+                if ctrl && is_key_pressed(KeyCode::X) {
+                    egui_ctx.input_mut(|i| i.events.push(egui::Event::Cut));
+                }
+            }
+            // --------------------------------------            // 1. 主控制面板 (合并所有配置)
             if self.show_control_panel {
                 egui::Window::new("控制面板")
                     .default_pos(egui::pos2(10.0, 10.0))
@@ -465,11 +510,56 @@ impl Renderer {
                                             }
                                         });
 
-                                    // 宽输入框
-                                    ui.add(
+                                    // 宽输入框 - 捕获响应以支持剪贴板操作
+                                    let rtsp_response = ui.add(
                                         egui::TextEdit::singleline(&mut self.rtsp_url)
                                             .desired_width(ui.available_width()),
                                     );
+
+                                    // 处理剪贴板复制
+                                    if let Some(clipboard) = &mut self.clipboard {
+                                        let ctrl = is_key_down(KeyCode::LeftControl)
+                                            || is_key_down(KeyCode::RightControl);
+
+                                        // 如果文本框有焦点且按下 Ctrl+C
+                                        if rtsp_response.has_focus()
+                                            && ctrl
+                                            && is_key_pressed(KeyCode::C)
+                                        {
+                                            // 尝试获取选中的文本，如果没有选中则复制全部
+                                            if let Some(state) = egui::TextEdit::load_state(
+                                                ui.ctx(),
+                                                rtsp_response.id,
+                                            ) {
+                                                let text_to_copy = if let Some(range) =
+                                                    state.cursor.char_range()
+                                                {
+                                                    // 有选中文本，复制选中部分
+                                                    let start = range
+                                                        .primary
+                                                        .index
+                                                        .min(range.secondary.index);
+                                                    let end = range
+                                                        .primary
+                                                        .index
+                                                        .max(range.secondary.index);
+                                                    if start < end && end <= self.rtsp_url.len() {
+                                                        self.rtsp_url[start..end].to_string()
+                                                    } else {
+                                                        // 范围无效，复制全部
+                                                        self.rtsp_url.clone()
+                                                    }
+                                                } else {
+                                                    // 没有选中，复制全部
+                                                    self.rtsp_url.clone()
+                                                };
+
+                                                if !text_to_copy.is_empty() {
+                                                    let _ = clipboard.set_text(text_to_copy);
+                                                }
+                                            }
+                                        }
+                                    }
                                 } else if self.input_source_type == 1 {
                                     if !self.devices_loaded {
                                         if ui.button("🔄 刷新设备列表").clicked() {
@@ -551,6 +641,7 @@ impl Renderer {
                             .default_open(true)
                             .show(ui, |ui| {
                                 ui.label("检测模型:");
+                                let mut selected_model = self.selected_model_index;
                                 egui::ComboBox::from_label("模型")
                                     .selected_text(
                                         MODELS
@@ -560,15 +651,22 @@ impl Renderer {
                                     )
                                     .show_ui(ui, |ui| {
                                         for (idx, model) in MODELS.iter().enumerate() {
-                                            ui.selectable_value(
-                                                &mut self.selected_model_index,
-                                                idx,
-                                                *model,
-                                            );
+                                            ui.selectable_value(&mut selected_model, idx, *model);
                                         }
                                     });
 
+                                if selected_model != self.selected_model_index {
+                                    self.selected_model_index = selected_model;
+                                    let model_name = MODELS[selected_model];
+                                    self.detect_model_name = model_name.to_string();
+                                    let model_path = self.resolve_model_path(model_name);
+                                    if let Some(tx) = &self.config_tx {
+                                        let _ = tx.send(ConfigMessage::SwitchModel(model_path));
+                                    }
+                                }
+
                                 ui.label("跟踪算法:");
+                                let mut selected_tracker = self.selected_tracker_index;
                                 egui::ComboBox::from_label("跟踪")
                                     .selected_text(
                                         TRACKERS
@@ -579,14 +677,33 @@ impl Renderer {
                                     .show_ui(ui, |ui| {
                                         for (idx, tracker) in TRACKERS.iter().enumerate() {
                                             ui.selectable_value(
-                                                &mut self.selected_tracker_index,
+                                                &mut selected_tracker,
                                                 idx,
                                                 *tracker,
                                             );
                                         }
                                     });
 
-                                ui.checkbox(&mut self.pose_enabled, "启用姿态估计");
+                                if selected_tracker != self.selected_tracker_index {
+                                    self.selected_tracker_index = selected_tracker;
+                                    let tracker_name = TRACKERS[selected_tracker];
+                                    self.tracker_name = tracker_name.to_string();
+                                    if let Some(tx) = &self.config_tx {
+                                        let _ = tx.send(ConfigMessage::SwitchTracker(
+                                            tracker_name.to_string(),
+                                        ));
+                                    }
+                                }
+
+                                if ui
+                                    .checkbox(&mut self.pose_enabled, "启用姿态估计")
+                                    .changed()
+                                {
+                                    if let Some(tx) = &self.config_tx {
+                                        let _ =
+                                            tx.send(ConfigMessage::TogglePose(self.pose_enabled));
+                                    }
+                                }
 
                                 ui.separator();
                                 ui.label("阈值设置:");
@@ -615,7 +732,7 @@ impl Renderer {
 
                                 if params_changed {
                                     if let Some(tx) = &self.config_tx {
-                                        let _ = tx.send(ConfigMessage {
+                                        let _ = tx.send(ConfigMessage::UpdateParams {
                                             conf_threshold: self.confidence_threshold,
                                             iou_threshold: self.iou_threshold,
                                         });
@@ -629,7 +746,6 @@ impl Renderer {
                         egui::CollapsingHeader::new("👁️ 视图控制")
                             .default_open(true)
                             .show(ui, |ui| {
-                                ui.checkbox(&mut self.preview_visible, "显示 Resize 预览窗口");
                                 if ui.button("重置缩放 (R)").clicked() {
                                     self.zoom_scale = 1.0;
                                     self.pan_offset = Vec2::ZERO;
@@ -638,83 +754,9 @@ impl Renderer {
                     });
             }
 
-            // 2. Resize 预览窗口 (无边框, 可拖拽)
-            if self.preview_visible {
-                if let Some(detection_result) = &self.last_detection {
-                    egui::Window::new("Resize Preview")
-                        .title_bar(false) // 无标题栏
-                        .frame(egui::Frame::window(&egui_ctx.style()).inner_margin(0.0)) // 紧凑边框
-                        .current_pos(self.resize_window_pos)
-                        .resizable(false)
-                        .show(egui_ctx, |ui| {
-                            // 整个区域作为拖拽手柄
-                            let size = detection_result.resized_size as f32;
-                            let (rect, response) =
-                                ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::drag());
-
-                            if response.dragged() {
-                                self.resize_window_pos += response.drag_delta();
-                            }
-
-                            // 绘制图像
-                            if let Some(resized_data) = &detection_result.resized_image {
-                                if resized_data.len()
-                                    == (detection_result.resized_size
-                                        * detection_result.resized_size
-                                        * 4) as usize
-                                {
-                                    let img_size = detection_result.resized_size as usize;
-                                    let image = egui::ColorImage::from_rgba_unmultiplied(
-                                        [img_size, img_size],
-                                        resized_data,
-                                    );
-
-                                    let texture = egui_ctx.load_texture(
-                                        "resized_preview",
-                                        image,
-                                        egui::TextureOptions::LINEAR,
-                                    );
-
-                                    // 在分配的矩形中绘制
-                                    let painter = ui.painter();
-                                    painter.image(
-                                        texture.id(),
-                                        rect,
-                                        egui::Rect::from_min_max(
-                                            egui::pos2(0.0, 0.0),
-                                            egui::pos2(1.0, 1.0),
-                                        ),
-                                        egui::Color32::WHITE,
-                                    );
-
-                                    // 绘制边框提示可拖拽
-                                    painter.rect_stroke(
-                                        rect,
-                                        0.0,
-                                        egui::Stroke::new(1.0, egui::Color32::from_white_alpha(50)),
-                                        egui::StrokeKind::Middle,
-                                    );
-                                } else {
-                                    ui.painter().text(
-                                        rect.center(),
-                                        egui::Align2::CENTER_CENTER,
-                                        "数据错误",
-                                        egui::FontId::default(),
-                                        egui::Color32::RED,
-                                    );
-                                }
-                            } else {
-                                ui.painter().text(
-                                    rect.center(),
-                                    egui::Align2::CENTER_CENTER,
-                                    "无图像数据",
-                                    egui::FontId::default(),
-                                    egui::Color32::WHITE,
-                                );
-                            }
-                        });
-                }
-            }
+            // 2. Resize 预览窗口 - 已移除以节省内存
+            // 原先每帧传输 640x640x4 = 1.6MB 的预览图像
+            // 现在使用主窗口显示即可
         });
 
         egui_macroquad::draw();
@@ -722,9 +764,6 @@ impl Renderer {
 
     pub fn handle_input(&mut self) {
         // 键盘输入
-        if is_key_pressed(KeyCode::V) {
-            self.preview_visible = !self.preview_visible;
-        }
         if is_key_pressed(KeyCode::Tab) {
             self.show_control_panel = !self.show_control_panel;
         }
@@ -735,7 +774,7 @@ impl Renderer {
 
         // 鼠标滚轮缩放
         let mouse_wheel = mouse_wheel();
-        if mouse_wheel.1 != 0.0 {
+        if mouse_wheel.1 != 0.0 && !self.is_mouse_over_ui {
             // 使用指数缩放 (更平滑自然)
             let zoom_factor = 1.1f32;
             let scale_mult = if mouse_wheel.1 > 0.0 {

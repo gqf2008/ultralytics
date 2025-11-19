@@ -1,3 +1,4 @@
+use std::sync::Arc;
 /// RTSP检测系统数据结构定义
 /// Data structures for RTSP detection system
 
@@ -37,7 +38,7 @@ pub struct PoseKeypoints {
 /// 已解码帧 (解码线程 → 渲染线程)
 #[derive(Clone)]
 pub struct DecodedFrame {
-    pub rgba_data: Vec<u8>, // 直接RGBA,无需二次转换
+    pub rgba_data: Arc<Vec<u8>>, // 使用Arc共享数据,避免复制
     pub width: u32,
     pub height: u32,
     pub decode_fps: f64,
@@ -61,9 +62,14 @@ pub struct InferredFrame {
 
 /// 配置更新消息 (渲染线程 → 推理线程)
 #[derive(Clone, Debug)]
-pub struct ConfigMessage {
-    pub conf_threshold: f32,
-    pub iou_threshold: f32,
+pub enum ConfigMessage {
+    UpdateParams {
+        conf_threshold: f32,
+        iou_threshold: f32,
+    },
+    SwitchModel(String),
+    SwitchTracker(String),
+    TogglePose(bool),
 }
 
 impl PoseKeypoints {

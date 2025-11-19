@@ -44,7 +44,7 @@ impl CameraDecoder {
     }
 
     /// 格式化摄像头URL - 根据平台选择
-    fn format_camera_url(index: usize, name: &str) -> String {
+    fn format_camera_url(_index: usize, name: &str) -> String {
         #[cfg(target_os = "windows")]
         {
             format!("video={}", name)
