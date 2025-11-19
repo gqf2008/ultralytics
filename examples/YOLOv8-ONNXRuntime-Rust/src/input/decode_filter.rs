@@ -1,5 +1,5 @@
-use crate::xbus;
 use super::decoder_manager::ACTIVE_DECODER_GENERATION;
+use crate::xbus;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -55,7 +55,10 @@ impl FrameFilter for DecodeFilter {
         // ✅ 检查解码器代数ID，如果已过期则停止解码
         let current_gen = ACTIVE_DECODER_GENERATION.load(Ordering::Relaxed);
         if self.generation != current_gen {
-            println!("🛑 解码器已过期 (Gen: {} != Current: {}), 停止解码", self.generation, current_gen);
+            println!(
+                "🛑 解码器已过期 (Gen: {} != Current: {}), 停止解码",
+                self.generation, current_gen
+            );
             return Err("Decoder expired".to_string());
         }
 
@@ -127,110 +130,6 @@ impl FrameFilter for DecodeFilter {
                 }
                 return Ok(None);
             }
-
-            // ✅ 新增：YUV数据采样检查 - 检测花屏/全黑/全白帧
-            // 采样25个点检查是否有异常值(增加采样密度)
-            let sample_points = [
-                // 第一行
-                (w / 6, h / 6),
-                (w / 3, h / 6),
-                (w / 2, h / 6),
-                (2 * w / 3, h / 6),
-                (5 * w / 6, h / 6),
-                // 第二行
-                (w / 6, h / 3),
-                (w / 3, h / 3),
-                (w / 2, h / 3),
-                (2 * w / 3, h / 3),
-                (5 * w / 6, h / 3),
-                // 中间行
-                (w / 6, h / 2),
-                (w / 3, h / 2),
-                (w / 2, h / 2),
-                (2 * w / 3, h / 2),
-                (5 * w / 6, h / 2),
-                // 第四行
-                (w / 6, 2 * h / 3),
-                (w / 3, 2 * h / 3),
-                (w / 2, 2 * h / 3),
-                (2 * w / 3, 2 * h / 3),
-                (5 * w / 6, 2 * h / 3),
-                // 第五行
-                (w / 6, 5 * h / 6),
-                (w / 3, 5 * h / 6),
-                (w / 2, 5 * h / 6),
-                (2 * w / 3, 5 * h / 6),
-                (5 * w / 6, 5 * h / 6),
-            ];
-
-            let mut y_sum = 0u32;
-            let mut y_min = 255u8;
-            let mut y_max = 0u8;
-
-            for (sx, sy) in sample_points.iter() {
-                let y_val = *data_y.add((sy * y_stride as u32 + sx) as usize);
-                y_sum += y_val as u32;
-                y_min = y_min.min(y_val);
-                y_max = y_max.max(y_val);
-            }
-
-            let y_avg = (y_sum / sample_points.len() as u32) as u8;
-            let y_range = y_max - y_min;
-
-            // ✅ 只检测极端异常帧 - 降低误杀率
-            // 组合条件: 同时满足低对比度+异常亮度才丢弃
-
-            // 1. 全黑帧: 平均亮度<16 且 对比度<8
-            if y_avg < 16 && y_range < 8 {
-                self.dropped_frames += 1;
-                if self.total_frames <= 50 || self.dropped_frames <= 10 {
-                    println!(
-                        "⚠️ 丢弃帧 #{}: 全黑帧 (Y平均={}, 范围={}, min={}, max={})",
-                        self.total_frames, y_avg, y_range, y_min, y_max
-                    );
-                }
-                return Ok(None);
-            }
-
-            // 2. 全白帧: 平均亮度>240 且 对比度<8
-            if y_avg > 240 && y_range < 8 {
-                self.dropped_frames += 1;
-                if self.total_frames <= 50 || self.dropped_frames <= 10 {
-                    println!(
-                        "⚠️ 丢弃帧 #{}: 全白帧 (Y平均={}, 范围={}, min={}, max={})",
-                        self.total_frames, y_avg, y_range, y_min, y_max
-                    );
-                }
-                return Ok(None);
-            }
-
-            // 3. 中灰色单调帧: Y值在110-140之间 且 对比度<10 (只过滤真正的解码错误帧)
-            // ⚠️ 放宽条件: 对比度<5 才算异常 (范围0-4是真正的解码错误)
-            if y_avg >= 110 && y_avg <= 140 && y_range < 5 {
-                self.dropped_frames += 1;
-                if self.total_frames <= 50 || self.dropped_frames <= 10 {
-                    println!(
-                        "⚠️ 丢弃帧 #{}: 灰色单调帧 (Y平均={}, 范围={}, min={}, max={})",
-                        self.total_frames, y_avg, y_range, y_min, y_max
-                    );
-                }
-                return Ok(None);
-            }
-
-            // 4. 严重花屏: 对比度<3 (几乎完全单调)
-            if y_range < 3 {
-                self.dropped_frames += 1;
-                if self.total_frames <= 50 || self.dropped_frames <= 10 {
-                    println!(
-                        "⚠️ 丢弃帧 #{}: 严重花屏 (Y平均={}, 范围={}, min={}, max={})",
-                        self.total_frames, y_avg, y_range, y_min, y_max
-                    );
-                }
-                return Ok(None);
-            }
-
-            // ❌ 移除关键帧检查 - 硬件解码器可能不设置此标志
-            // 直接处理所有帧,依赖 decode_error_flags 来过滤损坏帧
 
             self.count += 1;
 

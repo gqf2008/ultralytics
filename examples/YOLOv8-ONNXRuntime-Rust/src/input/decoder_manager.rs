@@ -29,7 +29,7 @@ impl DecoderManager {
 }
 
 /// 切换输入源 - 在新线程中启动解码器
-pub fn switch_decoder_source(source: InputSource) {
+pub fn switch_decoder_source(source: InputSource, preference: super::decoder::DecoderPreference) {
     println!("\n🔄 ============ 切换输入源 ============");
 
     use super::{CameraDecoder, Decoder, DesktopDecoder};
@@ -47,7 +47,7 @@ pub fn switch_decoder_source(source: InputSource) {
             thread::spawn(move || {
                 // 等待旧解码器退出
                 std::thread::sleep(std::time::Duration::from_millis(500));
-                let mut decoder = Decoder::new(url, new_gen);
+                let mut decoder = Decoder::new(url, new_gen, preference);
                 decoder.run();
             });
         }

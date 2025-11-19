@@ -1,3 +1,4 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 /// 数字卫兵 (Digital Sentinel)
 ///
 /// 智能视频监控系统
@@ -13,6 +14,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use clap::Parser;
 use egui_macroquad::egui;
+use macroquad::miniquad::window;
 use macroquad::prelude::*;
 use yolov8_rs::detection;
 use yolov8_rs::detection::INF_SIZE;
@@ -166,7 +168,7 @@ async fn main() {
     renderer.set_config_sender(config_tx.clone());
 
     // 发送初始模型参数 (确保启动参数生效)
-    if let Err(e) = config_tx.send(yolov8_rs::detection::types::ConfigMessage::UpdateParams {
+    if let Err(e) = config_tx.try_send(yolov8_rs::detection::types::ConfigMessage::UpdateParams {
         conf_threshold: renderer.confidence_threshold,
         iou_threshold: renderer.iou_threshold,
     }) {

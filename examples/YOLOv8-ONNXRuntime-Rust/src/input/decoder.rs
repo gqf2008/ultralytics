@@ -12,14 +12,16 @@ use wmi::{COMLibrary, WMIConnection};
 pub struct Decoder {
     rtsp_url: String,
     generation: usize,
+    preference: DecoderPreference,
 }
 
 impl Decoder {
     /// 创建RTSP解码器
-    pub fn new(rtsp_url: String, generation: usize) -> Self {
+    pub fn new(rtsp_url: String, generation: usize, preference: DecoderPreference) -> Self {
         Self {
             rtsp_url,
             generation,
+            preference,
         }
     }
 
@@ -27,15 +29,41 @@ impl Decoder {
     pub fn run(&mut self) {
         println!("🎬 RTSP解码器启动 (Gen: {})", self.generation);
         println!("📹 流地址: {}", self.rtsp_url);
+        println!("⚙️ 解码偏好: {:?}", self.preference);
 
         let filter = DecodeFilter::new(self.generation);
-        adaptive_decode(&self.rtsp_url, filter);
+        adaptive_decode(&self.rtsp_url, filter, &self.preference);
 
         println!("❌ RTSP解码器退出");
     }
 }
 
+/// 解码器偏好设置
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DecoderPreference {
+    Auto,
+    NvidiaCuda,
+    IntelQsv,
+    AmdAmf,
+    Dxva2,
+    Software,
+}
+
+impl DecoderPreference {
+    pub fn name(&self) -> &str {
+        match self {
+            DecoderPreference::Auto => "自动选择 (Auto)",
+            DecoderPreference::NvidiaCuda => "NVIDIA CUDA",
+            DecoderPreference::IntelQsv => "Intel QuickSync",
+            DecoderPreference::AmdAmf => "AMD AMF",
+            DecoderPreference::Dxva2 => "DXVA2 (Windows通用)",
+            DecoderPreference::Software => "CPU软件解码",
+        }
+    }
+}
+
 /// 解码器类型
+#[derive(Debug, Clone, Copy)]
 pub enum DecoderType {
     NvidiaCuda, // NVIDIA GPU硬件解码
     IntelQsv,   // Intel QuickSync硬件解码
@@ -47,21 +75,42 @@ pub enum DecoderType {
 impl DecoderType {
     pub fn name(&self) -> &str {
         match self {
-            DecoderType::NvidiaCuda => "尝试CUDA(若无N卡则软解)",
-            DecoderType::IntelQsv => "尝试QuickSync(若无Intel核显则软解)",
-            DecoderType::AmdAmf => "尝试AMF(若无AMD卡则软解)",
-            DecoderType::Dxva2 => "DXVA2通用硬解",
+            DecoderType::NvidiaCuda => "CUDA (NVIDIA)",
+            DecoderType::IntelQsv => "QuickSync (Intel)",
+            DecoderType::AmdAmf => "AMF (AMD)",
+            DecoderType::Dxva2 => "DXVA2",
             DecoderType::Software => "CPU软件解码",
         }
     }
 
+    pub fn hwaccel_name(&self) -> Option<&str> {
+        match self {
+            DecoderType::NvidiaCuda => Some("cuda"),
+            DecoderType::IntelQsv => Some("qsv"),
+            DecoderType::AmdAmf => Some("d3d11va"), // Windows上AMD通常用d3d11va或dxva2，ez-ffmpeg示例用vulkan解码? 暂且用d3d11va或dxva2
+            DecoderType::Dxva2 => Some("dxva2"),
+            DecoderType::Software => None,
+        }
+    }
+
+    pub fn video_codec(&self) -> Option<&str> {
+        match self {
+            DecoderType::NvidiaCuda => Some("h264_cuvid"),
+            DecoderType::IntelQsv => Some("h264_qsv"),
+            DecoderType::AmdAmf => None, // 让FFmpeg自动选择
+            DecoderType::Dxva2 => None,
+            DecoderType::Software => None,
+        }
+    }
+
     fn env_vars(&self) -> Vec<(&str, &str)> {
+        // 仍然保留环境变量设置，作为双重保险
         match self {
             DecoderType::NvidiaCuda => vec![("FFMPEG_HWACCEL", "cuda")],
             DecoderType::IntelQsv => vec![("FFMPEG_HWACCEL", "qsv")],
-            DecoderType::AmdAmf => vec![("FFMPEG_HWACCEL", "amf")],
+            DecoderType::AmdAmf => vec![("FFMPEG_HWACCEL", "d3d11va")],
             DecoderType::Dxva2 => vec![("FFMPEG_HWACCEL", "dxva2")],
-            DecoderType::Software => vec![], // 无需设置环境变量
+            DecoderType::Software => vec![],
         }
     }
 
@@ -196,18 +245,30 @@ fn try_decoder(
     let pipe: FramePipelineBuilder = AVMediaType::AVMEDIA_TYPE_VIDEO.into();
     let pipe = pipe.filter("decode", Box::new(filter));
     let out = create_null_output().add_frame_pipeline(pipe);
-    let input = Input::new(rtsp_url).set_input_opts(
+
+    let mut input = Input::new(rtsp_url).set_input_opts(
         [
             ("rtsp_transport", "tcp"),
             ("buffer_size", "67108864"),
             ("rtsp_flags", "prefer_tcp "),
         ]
         .into(),
-    ); //4,194,304
-       // 构建FFmpeg上下文 - 添加画质滤镜
+    );
+
+    // ✅ 设置硬件加速
+    if let Some(hwaccel) = decoder.hwaccel_name() {
+        println!("   🚀 启用硬件加速: {}", hwaccel);
+        input = input.set_hwaccel(hwaccel);
+        if let Some(codec) = decoder.video_codec() {
+            println!("   🎞️ 指定解码器: {}", codec);
+            input = input.set_video_codec(codec);
+        }
+    }
+
+    // 构建FFmpeg上下文 - 添加画质滤镜
     let ctx = FfmpegContext::builder()
         .input(input)
-        .filter_descs(["format=yuv420p"].into())
+        .filter_descs(["scale=1280:720"].into())
         .output(out)
         .build()
         .map_err(|e| format!("构建失败: {}", e))?;
@@ -220,17 +281,27 @@ fn try_decoder(
 }
 
 /// 自适应解码器选择: 优先硬件,失败则降级
-pub fn adaptive_decode(rtsp_url: &str, filter: DecodeFilter) {
-    let decoders = vec![
-        DecoderType::NvidiaCuda, // 优先NVIDIA (最快)
-        DecoderType::IntelQsv,   // 次选Intel
-        DecoderType::AmdAmf,     // 再次AMD
-        DecoderType::Dxva2,      // 通用硬件解码
-        DecoderType::Software,   // 最后软解
-    ];
+pub fn adaptive_decode(rtsp_url: &str, filter: DecodeFilter, preference: &DecoderPreference) {
+    let decoders = match preference {
+        DecoderPreference::Auto => vec![
+            DecoderType::NvidiaCuda, // 优先NVIDIA (最快)
+            DecoderType::IntelQsv,   // 次选Intel
+            DecoderType::AmdAmf,     // 再次AMD
+            DecoderType::Dxva2,      // 通用硬件解码
+            DecoderType::Software,   // 最后软解
+        ],
+        DecoderPreference::NvidiaCuda => vec![DecoderType::NvidiaCuda, DecoderType::Software],
+        DecoderPreference::IntelQsv => vec![DecoderType::IntelQsv, DecoderType::Software],
+        DecoderPreference::AmdAmf => vec![DecoderType::AmdAmf, DecoderType::Software],
+        DecoderPreference::Dxva2 => vec![DecoderType::Dxva2, DecoderType::Software],
+        DecoderPreference::Software => vec![DecoderType::Software],
+    };
 
-    println!("� 自适应解码器选择 (优先硬件加速)");
-    println!("📋 尝试顺序: NVIDIA CUDA > Intel QSV > AMD AMF > DXVA2 > 软件解码");
+    println!("🔄 解码策略: {:?}", preference);
+    println!(
+        "📋 尝试顺序: {:?}",
+        decoders.iter().map(|d| d.name()).collect::<Vec<_>>()
+    );
 
     for decoder in &decoders {
         match try_decoder(rtsp_url, decoder, filter.clone()) {

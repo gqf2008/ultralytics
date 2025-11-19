@@ -6,6 +6,7 @@ use phf::phf_map;
 use std::time::Instant;
 use yolov8_rs::detection::detector::DetectionResult;
 use yolov8_rs::detection::types::{ConfigMessage, DecodedFrame};
+use yolov8_rs::input::decoder::DecoderPreference;
 use yolov8_rs::input::{get_video_devices, switch_decoder_source, InputSource, VideoDevice};
 use yolov8_rs::xbus::{self, Subscription};
 use yolov8_rs::SKELETON;
@@ -74,6 +75,15 @@ static TRACKER_INDICES: phf::Map<&'static str, usize> = phf_map! {
     "无" => 2,
 };
 
+static DECODER_NAMES: [&str; 6] = [
+    "自动 (Auto)",
+    "NVIDIA CUDA",
+    "Intel QuickSync",
+    "AMD AMF",
+    "DXVA2 (Windows)",
+    "CPU 软件解码",
+];
+
 pub struct Renderer {
     _frame_sub: Subscription,
     _result_sub: Subscription,
@@ -102,6 +112,7 @@ pub struct Renderer {
     rtsp_url: String,
     rtsp_history: Vec<String>, // RTSP 历史记录
     camera_id: i32,
+    selected_decoder_index: usize, // 解码器选择
 
     // 设备列表
     video_devices: Vec<VideoDevice>,
@@ -191,6 +202,7 @@ impl Renderer {
                 history
             },
             camera_id: 0,
+            selected_decoder_index: 0,
             video_devices: Vec::new(),
             selected_device_index: 0,
             devices_loaded: false,
@@ -516,46 +528,24 @@ impl Renderer {
                                             .desired_width(ui.available_width()),
                                     );
 
-                                    // 处理剪贴板复制
+                                    // 处理剪贴板复制 - 简化版：直接复制整个文本
                                     if let Some(clipboard) = &mut self.clipboard {
                                         let ctrl = is_key_down(KeyCode::LeftControl)
                                             || is_key_down(KeyCode::RightControl);
 
-                                        // 如果文本框有焦点且按下 Ctrl+C
+                                        // 如果文本框有焦点且按下 Ctrl+C，复制整个文本
                                         if rtsp_response.has_focus()
                                             && ctrl
                                             && is_key_pressed(KeyCode::C)
                                         {
-                                            // 尝试获取选中的文本，如果没有选中则复制全部
-                                            if let Some(state) = egui::TextEdit::load_state(
-                                                ui.ctx(),
-                                                rtsp_response.id,
-                                            ) {
-                                                let text_to_copy = if let Some(range) =
-                                                    state.cursor.char_range()
-                                                {
-                                                    // 有选中文本，复制选中部分
-                                                    let start = range
-                                                        .primary
-                                                        .index
-                                                        .min(range.secondary.index);
-                                                    let end = range
-                                                        .primary
-                                                        .index
-                                                        .max(range.secondary.index);
-                                                    if start < end && end <= self.rtsp_url.len() {
-                                                        self.rtsp_url[start..end].to_string()
-                                                    } else {
-                                                        // 范围无效，复制全部
-                                                        self.rtsp_url.clone()
-                                                    }
+                                            if !self.rtsp_url.is_empty() {
+                                                if let Err(e) = clipboard.set_text(&self.rtsp_url) {
+                                                    println!("❌ 剪贴板复制失败: {}", e);
                                                 } else {
-                                                    // 没有选中，复制全部
-                                                    self.rtsp_url.clone()
-                                                };
-
-                                                if !text_to_copy.is_empty() {
-                                                    let _ = clipboard.set_text(text_to_copy);
+                                                    println!(
+                                                        "✅ 已复制到剪贴板: {}",
+                                                        self.rtsp_url
+                                                    );
                                                 }
                                             }
                                         }
@@ -600,6 +590,33 @@ impl Renderer {
                                     ui.label("桌面捕获 (gdigrab)");
                                 }
 
+                                // 硬件解码选择 (目前主要用于RTSP)
+                                ui.separator();
+                                ui.horizontal(|ui| {
+                                    ui.label("解码策略:");
+                                    let mut selected_decoder = self.selected_decoder_index;
+                                    egui::ComboBox::from_id_salt("decoder_select")
+                                        .selected_text(
+                                            DECODER_NAMES
+                                                .get(self.selected_decoder_index)
+                                                .copied()
+                                                .unwrap_or("自动"),
+                                        )
+                                        .show_ui(ui, |ui| {
+                                            for (idx, name) in DECODER_NAMES.iter().enumerate() {
+                                                ui.selectable_value(
+                                                    &mut selected_decoder,
+                                                    idx,
+                                                    *name,
+                                                );
+                                            }
+                                        });
+                                    self.selected_decoder_index = selected_decoder;
+                                });
+                                if self.input_source_type != 0 {
+                                    ui.small("注: 硬件解码目前仅对RTSP流生效");
+                                }
+
                                 if ui.button("🔄 切换输入源").clicked() {
                                     let new_source = if self.input_source_type == 0 {
                                         // 自动保存 RTSP 地址到历史记录
@@ -630,7 +647,17 @@ impl Renderer {
                                     } else {
                                         InputSource::Desktop
                                     };
-                                    switch_decoder_source(new_source);
+
+                                    let preference = match self.selected_decoder_index {
+                                        0 => DecoderPreference::Auto,
+                                        1 => DecoderPreference::NvidiaCuda,
+                                        2 => DecoderPreference::IntelQsv,
+                                        3 => DecoderPreference::AmdAmf,
+                                        4 => DecoderPreference::Dxva2,
+                                        5 => DecoderPreference::Software,
+                                        _ => DecoderPreference::Auto,
+                                    };
+                                    switch_decoder_source(new_source, preference);
                                 }
                             });
 
@@ -661,7 +688,7 @@ impl Renderer {
                                     self.detect_model_name = model_name.to_string();
                                     let model_path = self.resolve_model_path(model_name);
                                     if let Some(tx) = &self.config_tx {
-                                        let _ = tx.send(ConfigMessage::SwitchModel(model_path));
+                                        let _ = tx.try_send(ConfigMessage::SwitchModel(model_path));
                                     }
                                 }
 
@@ -689,7 +716,7 @@ impl Renderer {
                                     let tracker_name = TRACKERS[selected_tracker];
                                     self.tracker_name = tracker_name.to_string();
                                     if let Some(tx) = &self.config_tx {
-                                        let _ = tx.send(ConfigMessage::SwitchTracker(
+                                        let _ = tx.try_send(ConfigMessage::SwitchTracker(
                                             tracker_name.to_string(),
                                         ));
                                     }
@@ -700,8 +727,8 @@ impl Renderer {
                                     .changed()
                                 {
                                     if let Some(tx) = &self.config_tx {
-                                        let _ =
-                                            tx.send(ConfigMessage::TogglePose(self.pose_enabled));
+                                        let _ = tx
+                                            .try_send(ConfigMessage::TogglePose(self.pose_enabled));
                                     }
                                 }
 
@@ -732,7 +759,8 @@ impl Renderer {
 
                                 if params_changed {
                                     if let Some(tx) = &self.config_tx {
-                                        let _ = tx.send(ConfigMessage::UpdateParams {
+                                        // 使用 try_send 避免阻塞UI线程（当Detector忙碌时）
+                                        let _ = tx.try_send(ConfigMessage::UpdateParams {
                                             conf_threshold: self.confidence_threshold,
                                             iou_threshold: self.iou_threshold,
                                         });
