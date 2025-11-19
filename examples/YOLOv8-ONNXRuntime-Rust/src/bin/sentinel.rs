@@ -5,25 +5,30 @@
 /// 系统架构:
 /// 1. 采集线程: 视频解码与预处理 (独立工作线程)
 /// 2. 检测线程: 目标检测与追踪 (独立工作线程)
-/// 3. 主线程:   渲染显示 (ggez事件循环)
+/// 3. 主线程:   渲染显示 (macroquad事件循环)
 
 // 使用 mimalloc 替代系统默认分配器 (性能提升 10-30%)
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use clap::Parser;
-use ggez::conf::{WindowMode, WindowSetup};
-use ggez::event;
-use ggez::graphics::FontData;
-use ggez::{ContextBuilder, GameResult};
+use egui_macroquad::egui;
+use macroquad::prelude::*;
 use yolov8_rs::detection::INF_SIZE;
-use yolov8_rs::renderer::{Renderer, WINDOW_HEIGHT, WINDOW_WIDTH};
 use yolov8_rs::{detection, input};
+
+#[path = "../renderer_macroquad.rs"]
+mod renderer_macroquad;
+use renderer_macroquad::Renderer;
 
 /// 数字卫兵参数
 #[derive(Parser, Debug)]
 #[command(author, version, about = "数字卫兵 - 智能视频监控系统", long_about = None)]
 struct Args {
+    /// 输入模式 (rtsp/camera)
+    #[arg(short = 'i', long, default_value = "rtsp")]
+    input_mode: String,
+
     /// RTSP流地址 (当input_mode=rtsp时使用)
     #[arg(
         short,
@@ -31,6 +36,10 @@ struct Args {
         default_value = "rtsp://admin:Wosai2018@172.19.54.45/cam/realmonitor?channel=1&subtype=0"
     )]
     url: String,
+
+    /// 摄像头设备ID (当input_mode=camera时使用, 0=默认摄像头)
+    #[arg(short = 'c', long, default_value_t = 0)]
+    camera_id: i32,
 
     /// 检测模型 (n/s/m/l/x/v10n/v10s/v10m/v11n/v11s/v11m/fastest/fastest-xl/n-int8/m-int8/v5n/v5s/v5m/nanodet/nanodet-m/nanodet-plus/yolox_s/yolox_m/yolox_l)
     #[arg(short, long, default_value = "n")]
@@ -45,8 +54,57 @@ struct Args {
     pose: bool,
 }
 
-fn main() -> GameResult {
+fn window_conf() -> Conf {
+    Conf {
+        window_title: "数字卫兵 - Digital Sentinel".to_owned(),
+        window_width: 1280,
+        window_height: 720,
+        window_resizable: true,
+        ..Default::default()
+    }
+}
+
+#[macroquad::main(window_conf)]
+async fn main() {
     let args = Args::parse();
+
+    // 加载中文字体
+    let font_data = match std::fs::read("assets/font/msyh.ttc") {
+        Ok(data) => {
+            println!("✅ 中文字体加载成功: 微软雅黑");
+            Some(data)
+        }
+        Err(e) => {
+            eprintln!("⚠️  中文字体加载失败: {}, 将使用默认字体", e);
+            None
+        }
+    };
+
+    // 设置 egui 中文字体
+    if let Some(font_bytes) = font_data {
+        egui_macroquad::cfg(|ctx| {
+            let mut fonts = egui::FontDefinitions::default();
+            fonts.font_data.insert(
+                "msyh".to_owned(),
+                std::sync::Arc::new(egui::FontData::from_owned(font_bytes)),
+            );
+
+            // 将中文字体设置为优先字体
+            fonts
+                .families
+                .entry(egui::FontFamily::Proportional)
+                .or_default()
+                .insert(0, "msyh".to_owned());
+
+            fonts
+                .families
+                .entry(egui::FontFamily::Monospace)
+                .or_default()
+                .push("msyh".to_owned());
+
+            ctx.set_fonts(fonts);
+        });
+    }
 
     // 构建模型路径
     let fastest_variant = if args.model == "fastest" || args.model == "fastestv2" {
@@ -56,20 +114,16 @@ fn main() -> GameResult {
     };
 
     let detect_model = if args.model.starts_with("yolox") {
-        // YOLOX 模型 (例如: yolox_s -> yolox_s.onnx, yolox_m -> yolox_m.onnx)
         format!("models/{}.onnx", args.model)
     } else if args.model.starts_with("v10") {
-        // YOLOv10 模型 (例如: v10n -> yolov10n.onnx)
         let variant = args.model.trim_start_matches("v10");
         format!("models/yolov10{}.onnx", variant)
     } else if args.model.starts_with("v11") {
-        // YOLOv11 模型 (例如: v11n -> yolov11n.onnx)
         let variant = args.model.trim_start_matches("v11");
         format!("models/yolov11{}.onnx", variant)
     } else if args.model == "fastest" || args.model.starts_with("fastest") {
         format!("models/{}.onnx", fastest_variant)
     } else if args.model.starts_with("nanodet") {
-        // NanoDet 模型 (例如: nanodet-m -> nanodet-m.onnx, nanodet-plus -> nanodet-plus-m_320.onnx)
         if args.model == "nanodet" || args.model == "nanodet-m" {
             "models/nanodet-m.onnx".to_string()
         } else if args.model == "nanodet-plus" {
@@ -84,15 +138,12 @@ fn main() -> GameResult {
             format!("models/{}.onnx", args.model)
         }
     } else if args.model.starts_with("v5") {
-        // YOLOv5 模型 (例如: v5n -> yolov5n.onnx)
         let variant = args.model.trim_start_matches("v5");
         format!("models/yolov5{}.onnx", variant)
     } else if args.model.ends_with("-int8") {
-        // INT8量化模型 (例如: n-int8 -> yolov8n_int8.onnx)
         let base = args.model.trim_end_matches("-int8");
         format!("models/yolov8{}_int8.onnx", base)
     } else {
-        // YOLOv8 标准模型 (例如: yolov8n -> yolov8n.onnx, 或直接 n -> yolov8n.onnx)
         if args.model.starts_with("yolov8") {
             format!("models/{}.onnx", args.model)
         } else {
@@ -105,18 +156,33 @@ fn main() -> GameResult {
     println!("🎯 跟踪算法: {}", args.tracker);
     println!("🧍 姿态估计: {}", if args.pose { "启用" } else { "禁用" });
 
-    // ========== 启动解码线程 ==========
-    println!("🎬 输入模式: 主动拉流");
-    println!("📹 流地址: {}", args.url);
-    println!();
+    // 启动解码线程
+    match args.input_mode.as_str() {
+        "camera" => {
+            println!("🎬 输入模式: 本地摄像头");
+            println!("📷 摄像头ID: {}", args.camera_id);
+            println!();
 
-    let url = args.url.clone();
-    std::thread::spawn(move || {
-        let mut decoder = input::Decoder::new(url);
-        decoder.run();
-    });
+            let camera_id = args.camera_id;
+            std::thread::spawn(move || {
+                let mut decoder = input::Decoder::from_camera(camera_id);
+                decoder.run();
+            });
+        }
+        _ => {
+            println!("🎬 输入模式: RTSP流");
+            println!("📹 流地址: {}", args.url);
+            println!();
 
-    // ========== 启动检测线程 ==========
+            let url = args.url.clone();
+            std::thread::spawn(move || {
+                let mut decoder = input::Decoder::new(url);
+                decoder.run();
+            });
+        }
+    }
+
+    // 启动检测线程
     let detect_model_clone = detect_model.clone();
     let tracker = args.tracker.clone();
     let pose_enabled = args.pose;
@@ -126,32 +192,20 @@ fn main() -> GameResult {
         det.run();
     });
 
-    // ========== 主线程: 数字卫兵渲染 ==========
-    let (mut ctx, event_loop) = ContextBuilder::new("sentinel", "ultralytics")
-        .window_setup(
-            WindowSetup::default()
-                .title("数字卫兵 - Digital Sentinel")
-                .vsync(true),
-        )
-        .window_mode(
-            WindowMode::default()
-                .dimensions(WINDOW_WIDTH, WINDOW_HEIGHT)
-                .resizable(true),
-        )
-        .build()?;
-
-    // 加载中文字体
-    let font_data = std::fs::read("assets/font/msyh.ttc")?;
-    let font = FontData::from_vec(font_data)?;
-    ctx.gfx.add_font("MicrosoftYaHei", font);
-    println!("✅ 中文字体加载成功: 微软雅黑");
-
-    // 提取干净的模型名称 (去掉路径和扩展名)
+    // 提取干净的模型名称
     let detect_model_name = detect_model.replace("models/", "").replace(".onnx", "");
 
-    let renderer = Renderer::new(detect_model_name, String::new(), String::new())?;
+    let mut renderer = Renderer::new(detect_model_name, String::new(), args.tracker.clone());
 
     println!("✅ 系统就绪,开始监控...\n");
 
-    event::run(ctx, event_loop, renderer)
+    // 主循环
+    loop {
+        renderer.update();
+        renderer.handle_input();
+        renderer.draw();
+        renderer.draw_egui();
+
+        next_frame().await;
+    }
 }

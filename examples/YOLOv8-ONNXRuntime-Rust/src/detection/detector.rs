@@ -202,7 +202,7 @@ impl Detector {
         // 订阅解码帧 - 仅将任务放入队列
         let inf_size = self.inf_size;
         let (tx, rx): (Sender<DecodedFrame>, Receiver<DecodedFrame>) =
-            crossbeam_channel::bounded(120);
+            crossbeam_channel::bounded(60);
 
         let _sub = xbus::subscribe::<DecodedFrame, _>(move |frame| {
             // 轻量级操作：仅将帧放入工作队列

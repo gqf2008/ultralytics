@@ -7,7 +7,8 @@ pub mod models; // 模型接口与具体实现
 pub mod ui_config; // UI配置面板
 
 pub mod ort_backend;
-pub mod renderer;
+// pub mod renderer; // ggez 版本的 renderer (旧版)
+// macroquad 版本的 renderer 在 bin/sentinel_macroquad.rs 中直接引用
 pub mod xbus;
 
 pub use crate::config::Args;
