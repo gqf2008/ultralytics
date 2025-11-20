@@ -11,6 +11,9 @@ use yolov8_rs::input::{get_video_devices, switch_decoder_source, InputSource, Vi
 use yolov8_rs::xbus::{self, Subscription};
 use yolov8_rs::SKELETON;
 
+// 引入 image crate 用于加载背景图
+use image;
+
 static MODELS: [&str; 25] = [
     "yolov8n",
     "yolov8s",
@@ -102,6 +105,10 @@ pub struct Renderer {
     detect_fps: f64,
     decode_fps: f64,
 
+    // 视频帧率统计
+    video_count: u64,
+    video_last: Instant,
+
     // egui 参数调整
     pub confidence_threshold: f32,
     pub iou_threshold: f32,
@@ -130,12 +137,21 @@ pub struct Renderer {
     selected_model_index: usize,
     selected_tracker_index: usize,
     pose_enabled: bool,
+    detection_enabled: bool,
 
     // 窗口状态
     is_mouse_over_ui: bool,
 
     // 剪贴板
     clipboard: Option<Clipboard>,
+
+    // 背景纹理
+    background_texture: Option<Texture2D>,
+    panel_bg_texture: Option<Texture2D>,
+    panel_bg_egui: Option<egui::TextureHandle>,
+
+    // 中文字体
+    chinese_font: Option<Font>,
 }
 
 enum RenderFrame {
@@ -164,6 +180,55 @@ impl Renderer {
             }
         });
 
+        // 加载背景图片
+        let background_texture = if let Ok(bytes) = std::fs::read("assets/images/background.jpg") {
+            if let Ok(img) = image::load_from_memory(&bytes) {
+                let rgba = img.to_rgba8();
+                Some(Texture2D::from_rgba8(
+                    rgba.width() as u16,
+                    rgba.height() as u16,
+                    &rgba,
+                ))
+            } else {
+                println!("⚠️ 背景图片解码失败");
+                None
+            }
+        } else {
+            println!("⚠️ 未找到背景图片: assets/images/background.jpg");
+            None
+        };
+
+        // 加载控制面板背景纹理
+        let panel_bg_texture = if let Ok(bytes) = std::fs::read("assets/images/panel_bg.jpg") {
+            if let Ok(img) = image::load_from_memory(&bytes) {
+                let rgba = img.to_rgba8();
+                let tex = Texture2D::from_rgba8(rgba.width() as u16, rgba.height() as u16, &rgba);
+                tex.set_filter(FilterMode::Linear);
+                Some(tex)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // 加载中文字体
+        let chinese_font = if let Ok(bytes) = std::fs::read("assets/font/msyh.ttc") {
+            match load_ttf_font_from_bytes(&bytes) {
+                Ok(font) => {
+                    println!("✅ 中文字体加载成功");
+                    Some(font)
+                }
+                Err(e) => {
+                    println!("⚠️ 中文字体加载失败: {}", e);
+                    None
+                }
+            }
+        } else {
+            println!("⚠️ 未找到中文字体文件: assets/font/msyh.ttc");
+            None
+        };
+
         Self {
             render_frame_buffer: rx,
             config_tx: None,
@@ -179,6 +244,8 @@ impl Renderer {
             tracker_name: tracker.clone(),
             detect_fps: 0.0,
             decode_fps: 0.0,
+            video_count: 0,
+            video_last: Instant::now(),
             confidence_threshold: 0.5,
             iou_threshold: 0.45,
             input_source_type: 0,
@@ -215,8 +282,13 @@ impl Renderer {
                 .get(tracker.to_lowercase().as_str())
                 .unwrap_or(&2),
             pose_enabled: false,
+            detection_enabled: true,
             is_mouse_over_ui: false,
             clipboard: Clipboard::new().ok(),
+            background_texture,
+            panel_bg_texture,
+            panel_bg_egui: None,
+            chinese_font,
         }
     }
 
@@ -288,53 +360,102 @@ impl Renderer {
     }
 
     pub fn update(&mut self) {
-        // 处理帧缓冲 - 只保留最新一帧，丢弃旧帧
-        if let Some(frame) = self.render_frame_buffer.try_iter().last() {
+        // 处理帧缓冲 - 统计所有接收到的帧以计算FPS，但只渲染最新一帧
+        let mut latest_video_frame = None;
+        let mut latest_detection_result = None;
+        let mut video_frames_received = 0;
+
+        for frame in self.render_frame_buffer.try_iter() {
             match frame {
                 RenderFrame::Video(decoded_frame) => {
-                    // 释放旧纹理（macroquad会自动管理）
-                    // 只在分辨率变化时重建纹理，否则更新像素数据
-                    let needs_rebuild = if let Some(ref tex) = self.last_frame {
-                        tex.width() != decoded_frame.width as f32
-                            || tex.height() != decoded_frame.height as f32
-                    } else {
-                        true
-                    };
-
-                    if needs_rebuild {
-                        let texture = Texture2D::from_rgba8(
-                            decoded_frame.width as u16,
-                            decoded_frame.height as u16,
-                            &decoded_frame.rgba_data,
-                        );
-                        texture.set_filter(FilterMode::Linear);
-                        self.last_frame = Some(texture);
-                    } else if let Some(ref tex) = self.last_frame {
-                        // 更新现有纹理的像素数据（避免重新分配GPU内存）
-                        let img = Image {
-                            bytes: decoded_frame.rgba_data.to_vec(),
-                            width: decoded_frame.width as u16,
-                            height: decoded_frame.height as u16,
-                        };
-                        tex.update(&img);
-                    }
+                    latest_video_frame = Some(decoded_frame);
+                    video_frames_received += 1;
                 }
                 RenderFrame::Detection(detection_result) => {
-                    self.last_detection = Some(detection_result);
+                    latest_detection_result = Some(detection_result);
                 }
             }
         }
 
-        // 更新FPS和检测状态
+        // 更新解码FPS统计
+        self.video_count += video_frames_received;
+        let now = Instant::now();
+        if now.duration_since(self.video_last).as_secs() >= 1 {
+            self.decode_fps =
+                self.video_count as f64 / now.duration_since(self.video_last).as_secs_f64();
+            self.video_count = 0;
+            self.video_last = now;
+        }
+
+        // 更新视频纹理
+        if let Some(decoded_frame) = latest_video_frame {
+            // 释放旧纹理（macroquad会自动管理）
+            // 只在分辨率变化时重建纹理，否则更新像素数据
+            let needs_rebuild = if let Some(ref tex) = self.last_frame {
+                tex.width() != decoded_frame.width as f32
+                    || tex.height() != decoded_frame.height as f32
+            } else {
+                true
+            };
+
+            if needs_rebuild {
+                let texture = Texture2D::from_rgba8(
+                    decoded_frame.width as u16,
+                    decoded_frame.height as u16,
+                    &decoded_frame.rgba_data,
+                );
+                texture.set_filter(FilterMode::Linear);
+                self.last_frame = Some(texture);
+            } else if let Some(ref tex) = self.last_frame {
+                // 更新现有纹理的像素数据（避免重新分配GPU内存）
+                let img = Image {
+                    bytes: decoded_frame.rgba_data.to_vec(),
+                    width: decoded_frame.width as u16,
+                    height: decoded_frame.height as u16,
+                };
+                tex.update(&img);
+            }
+        }
+
+        // 更新检测结果
+        if let Some(result) = latest_detection_result {
+            self.last_detection = Some(result);
+        }
+
+        // 更新检测FPS
         if let Some(result) = &self.last_detection {
             self.detect_fps = result.inference_fps;
-            // decode_fps 从解码器获取,暂时使用推理FPS
-            self.decode_fps = result.inference_fps;
         }
     }
 
     pub fn draw(&mut self) {
-        clear_background(BLACK);
+        // 先绘制背景图（如果没有视频帧）
+        if self.last_frame.is_none() {
+            if let Some(bg) = &self.background_texture {
+                draw_texture_ex(
+                    bg,
+                    0.0,
+                    0.0,
+                    WHITE,
+                    DrawTextureParams {
+                        dest_size: Some(vec2(screen_width(), screen_height())),
+                        ..Default::default()
+                    },
+                );
+                // 叠加半透明遮罩
+                draw_rectangle(
+                    0.0,
+                    0.0,
+                    screen_width(),
+                    screen_height(),
+                    Color::new(0.0, 0.0, 0.0, 0.5),
+                );
+            } else {
+                clear_background(Color::from_rgba(20, 20, 30, 255));
+            }
+        } else {
+            clear_background(BLACK);
+        }
 
         // 绘制视频帧
         if let Some(texture) = &self.last_frame {
@@ -365,52 +486,88 @@ impl Renderer {
             );
 
             // 绘制检测框
-            if let Some(detection_result) = &self.last_detection {
-                for bbox in &detection_result.bboxes {
-                    let x1 = bbox.x1 * scale_x + center_x;
-                    let y1 = bbox.y1 * scale_y + center_y;
-                    let x2 = bbox.x2 * scale_x + center_x;
-                    let y2 = bbox.y2 * scale_y + center_y;
+            if self.detection_enabled {
+                if let Some(detection_result) = &self.last_detection {
+                    for bbox in &detection_result.bboxes {
+                        let x1 = bbox.x1 * scale_x + center_x;
+                        let y1 = bbox.y1 * scale_y + center_y;
+                        let x2 = bbox.x2 * scale_x + center_x;
+                        let y2 = bbox.y2 * scale_y + center_y;
 
-                    // 绘制边框
-                    draw_rectangle_lines(x1, y1, x2 - x1, y2 - y1, 3.0, GREEN);
+                        // 绘制边框
+                        draw_rectangle_lines(x1, y1, x2 - x1, y2 - y1, 3.0, GREEN);
 
-                    // 绘制标签
-                    let label = format!("ID:{} {:.2}", bbox.class_id, bbox.confidence);
-                    draw_text(&label, x1, y1 - 5.0, 20.0, GREEN);
-                }
-
-                // 绘制姿态骨架
-                for keypoints in &detection_result.keypoints {
-                    if keypoints.points.is_empty() {
-                        continue;
+                        // 绘制标签
+                        let label = format!("ID:{} {:.2}", bbox.class_id, bbox.confidence);
+                        draw_text(&label, x1, y1 - 5.0, 20.0, GREEN);
                     }
 
-                    // 绘制关键点
-                    for (x, y, conf) in &keypoints.points {
-                        if *conf > 0.3 {
-                            draw_circle(*x * scale_x + center_x, *y * scale_y + center_y, 4.0, RED);
+                    // 绘制姿态骨架
+                    for keypoints in &detection_result.keypoints {
+                        if keypoints.points.is_empty() {
+                            continue;
                         }
-                    }
 
-                    // 绘制骨架连接
-                    for (idx1, idx2) in &SKELETON {
-                        if *idx1 < keypoints.points.len() && *idx2 < keypoints.points.len() {
-                            let (x1, y1, c1) = keypoints.points[*idx1];
-                            let (x2, y2, c2) = keypoints.points[*idx2];
-                            if c1 > 0.3 && c2 > 0.3 {
-                                draw_line(
-                                    x1 * scale_x + center_x,
-                                    y1 * scale_y + center_y,
-                                    x2 * scale_x + center_x,
-                                    y2 * scale_y + center_y,
-                                    2.0,
-                                    YELLOW,
+                        // 绘制关键点
+                        for (x, y, conf) in &keypoints.points {
+                            if *conf > 0.3 {
+                                draw_circle(
+                                    *x * scale_x + center_x,
+                                    *y * scale_y + center_y,
+                                    4.0,
+                                    RED,
                                 );
+                            }
+                        }
+
+                        // 绘制骨架连接
+                        for (idx1, idx2) in &SKELETON {
+                            if *idx1 < keypoints.points.len() && *idx2 < keypoints.points.len() {
+                                let (x1, y1, c1) = keypoints.points[*idx1];
+                                let (x2, y2, c2) = keypoints.points[*idx2];
+                                if c1 > 0.3 && c2 > 0.3 {
+                                    draw_line(
+                                        x1 * scale_x + center_x,
+                                        y1 * scale_y + center_y,
+                                        x2 * scale_x + center_x,
+                                        y2 * scale_y + center_y,
+                                        2.0,
+                                        YELLOW,
+                                    );
+                                }
                             }
                         }
                     }
                 }
+            }
+        }
+
+        // 没有视频时显示提示文字
+        if self.last_frame.is_none() {
+            let text = "请在右侧控制面板选择输入源并启动";
+            let font_size = 40.0;
+            let text_params = TextParams {
+                font: self.chinese_font.as_ref(),
+                font_size: font_size as u16,
+                color: WHITE,
+                ..Default::default()
+            };
+            let text_dims = measure_text(text, self.chinese_font.as_ref(), font_size as u16, 1.0);
+            draw_text_ex(
+                text,
+                (screen_width() - text_dims.width) / 2.0,
+                (screen_height() - text_dims.height) / 2.0,
+                text_params,
+            );
+
+            if self.background_texture.is_none() {
+                let warning_params = TextParams {
+                    font: self.chinese_font.as_ref(),
+                    font_size: 24,
+                    color: YELLOW,
+                    ..Default::default()
+                };
+                draw_text_ex("⚠️ 背景图片加载失败", 10.0, 30.0, warning_params);
             }
         }
 
@@ -427,12 +584,101 @@ impl Renderer {
         // 显示缩放提示
         if self.zoom_scale != 1.0 {
             let zoom_text = format!("缩放: {:.1}x (按R键重置)", self.zoom_scale);
-            draw_text(&zoom_text, 10.0, screen_height() - 10.0, 20.0, WHITE);
+            let zoom_params = TextParams {
+                font: self.chinese_font.as_ref(),
+                font_size: 20,
+                color: WHITE,
+                ..Default::default()
+            };
+            draw_text_ex(&zoom_text, 10.0, screen_height() - 10.0, zoom_params);
         }
     }
 
     pub fn draw_egui(&mut self) {
         egui_macroquad::ui(|egui_ctx| {
+            // 注册面板背景纹理到 egui
+            if self.panel_bg_egui.is_none() {
+                if let Some(panel_bg) = &self.panel_bg_texture {
+                    let image = panel_bg.get_texture_data();
+                    let size = [panel_bg.width() as usize, panel_bg.height() as usize];
+                    let color_image = egui::ColorImage::from_rgba_unmultiplied(size, &image.bytes);
+                    let texture = egui_ctx.load_texture(
+                        "panel_bg",
+                        color_image,
+                        egui::TextureOptions::LINEAR,
+                    );
+                    self.panel_bg_egui = Some(texture);
+                }
+                self.panel_bg_texture.take();
+            }
+            // // --- 自定义 UI 样式 (Cyberpunk/Sci-Fi Theme) ---
+            // let mut visuals = egui::Visuals::dark();
+
+            // // 窗口样式
+            // visuals.window_fill = egui::Color32::from_rgba_premultiplied(15, 20, 35, 240); // 深色半透明背景
+            // visuals.window_stroke = egui::Stroke::new(2.0, egui::Color32::from_rgb(0, 200, 255)); // 青色边框
+            // visuals.window_shadow = egui::epaint::Shadow {
+            //     offset: [4, 8],
+            //     blur: 20,
+            //     spread: 0,
+            //     color: egui::Color32::from_rgba_premultiplied(0, 200, 255, 50),
+            // };
+
+            // // 面板和区域背景
+            // visuals.panel_fill = egui::Color32::from_rgba_premultiplied(20, 25, 40, 230);
+            // visuals.extreme_bg_color = egui::Color32::from_rgba_premultiplied(10, 15, 25, 200);
+
+            // // 非交互控件（标签、文本等）
+            // visuals.widgets.noninteractive.bg_fill =
+            //     egui::Color32::from_rgba_premultiplied(30, 35, 50, 180);
+            // visuals.widgets.noninteractive.weak_bg_fill =
+            //     egui::Color32::from_rgba_premultiplied(25, 30, 45, 150);
+            // visuals.widgets.noninteractive.bg_stroke =
+            //     egui::Stroke::new(1.0, egui::Color32::from_rgba_premultiplied(60, 70, 90, 200));
+            // visuals.widgets.noninteractive.fg_stroke =
+            //     egui::Stroke::new(1.0, egui::Color32::from_rgb(200, 210, 220));
+
+            // // 未激活控件（按钮、输入框等）
+            // visuals.widgets.inactive.bg_fill =
+            //     egui::Color32::from_rgba_premultiplied(40, 50, 70, 220);
+            // visuals.widgets.inactive.weak_bg_fill =
+            //     egui::Color32::from_rgba_premultiplied(35, 45, 65, 180);
+            // visuals.widgets.inactive.bg_stroke =
+            //     egui::Stroke::new(1.5, egui::Color32::from_rgb(70, 120, 180));
+            // visuals.widgets.inactive.fg_stroke =
+            //     egui::Stroke::new(1.5, egui::Color32::from_rgb(180, 190, 200));
+
+            // // 悬停控件
+            // visuals.widgets.hovered.bg_fill =
+            //     egui::Color32::from_rgba_premultiplied(60, 80, 120, 255);
+            // visuals.widgets.hovered.weak_bg_fill =
+            //     egui::Color32::from_rgba_premultiplied(50, 70, 110, 220);
+            // visuals.widgets.hovered.bg_stroke =
+            //     egui::Stroke::new(2.0, egui::Color32::from_rgb(0, 200, 255)); // 青色高光
+            // visuals.widgets.hovered.fg_stroke = egui::Stroke::new(2.0, egui::Color32::WHITE);
+            // visuals.widgets.hovered.expansion = 1.5;
+
+            // // 激活/点击控件
+            // visuals.widgets.active.bg_fill =
+            //     egui::Color32::from_rgba_premultiplied(0, 150, 255, 255); // 亮青色
+            // visuals.widgets.active.weak_bg_fill =
+            //     egui::Color32::from_rgba_premultiplied(0, 130, 230, 220);
+            // visuals.widgets.active.bg_stroke =
+            //     egui::Stroke::new(2.5, egui::Color32::from_rgb(100, 220, 255));
+            // visuals.widgets.active.fg_stroke = egui::Stroke::new(2.0, egui::Color32::WHITE);
+
+            // // 选中状态
+            // visuals.selection.bg_fill = egui::Color32::from_rgba_premultiplied(0, 120, 200, 180);
+            // visuals.selection.stroke = egui::Stroke::new(1.5, egui::Color32::from_rgb(0, 200, 255));
+
+            // // 文本颜色
+            // visuals.override_text_color = Some(egui::Color32::from_rgb(230, 240, 250));
+            // visuals.warn_fg_color = egui::Color32::from_rgb(255, 200, 0);
+            // visuals.error_fg_color = egui::Color32::from_rgb(255, 80, 80);
+            // visuals.hyperlink_color = egui::Color32::from_rgb(100, 200, 255);
+
+            // egui_ctx.set_visuals(visuals);
+
             self.is_mouse_over_ui = egui_ctx.wants_pointer_input();
 
             // --- 剪贴板处理 (Clipboard Handling) ---
@@ -453,11 +699,56 @@ impl Renderer {
             }
             // --------------------------------------            // 1. 主控制面板 (合并所有配置)
             if self.show_control_panel {
-                egui::Window::new("控制面板")
+                egui::Window::new("🎯 控制面板")
                     .default_pos(egui::pos2(10.0, 10.0))
                     .default_size(egui::vec2(350.0, 600.0))
-                    .resizable(true)
+                    .resizable(false)
+                    .frame(egui::Frame::NONE)
+                    .title_bar(false)
                     .show(egui_ctx, |ui| {
+                        // 绘制背景纹理
+                        if let Some(tex) = &self.panel_bg_egui {
+                            let window_rect = ui.max_rect();
+                            let painter = ui.painter();
+                            // 绘制背景图片
+                            painter.image(
+                                tex.id(),
+                                window_rect,
+                                egui::Rect::from_min_max(
+                                    egui::pos2(0.0, 0.0),
+                                    egui::pos2(1.0, 1.0),
+                                ),
+                                egui::Color32::WHITE,
+                            );
+
+                            // 叠加半透明遮罩
+                            // painter.rect_filled(
+                            //     window_rect,
+                            //     0.0,
+                            //     egui::Color32::from_rgba_premultiplied(10, 15, 25, 200),
+                            // );
+
+                            // // 顶部高亮条
+                            // painter.rect_filled(
+                            //     egui::Rect::from_min_size(
+                            //         window_rect.min,
+                            //         egui::vec2(window_rect.width(), 3.0),
+                            //     ),
+                            //     0.0,
+                            //     egui::Color32::from_rgb(0, 220, 255),
+                            // );
+
+                            // // 边框
+                            // painter.rect_stroke(
+                            //     window_rect.shrink(1.0),
+                            //     0.0,
+                            //     egui::Stroke::new(2.0, egui::Color32::from_rgb(0, 200, 255)),
+                            //     egui::epaint::StrokeKind::Outside,
+                            // );
+                        }
+
+                        ui.style_mut().visuals.collapsing_header_frame = true;
+
                         // --- 状态监控 ---
                         egui::CollapsingHeader::new("📊 系统状态")
                             .default_open(true)
@@ -729,6 +1020,17 @@ impl Renderer {
                                     if let Some(tx) = &self.config_tx {
                                         let _ = tx
                                             .try_send(ConfigMessage::TogglePose(self.pose_enabled));
+                                    }
+                                }
+
+                                if ui
+                                    .checkbox(&mut self.detection_enabled, "启用目标检测")
+                                    .changed()
+                                {
+                                    if let Some(tx) = &self.config_tx {
+                                        let _ = tx.try_send(ConfigMessage::ToggleDetection(
+                                            self.detection_enabled,
+                                        ));
                                     }
                                 }
 

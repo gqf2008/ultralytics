@@ -40,6 +40,7 @@ pub struct Detector {
     inf_size: u32,
     tracker: TrackerType,
     pose_enabled: bool,
+    detection_enabled: bool,
     config_rx: Option<Receiver<ConfigMessage>>,
 
     // 统计
@@ -80,6 +81,7 @@ impl Detector {
             inf_size,
             tracker,
             pose_enabled,
+            detection_enabled: true,
             config_rx: None,
             count: 0,
             last: Instant::now(),
@@ -270,13 +272,39 @@ impl Detector {
                                 println!("🚫 姿态估计已禁用");
                             }
                         }
+                        ConfigMessage::ToggleDetection(enabled) => {
+                            self.detection_enabled = enabled;
+                            if enabled {
+                                println!("✅ 目标检测已启用");
+                            } else {
+                                println!("🚫 目标检测已禁用");
+                            }
+                        }
                     }
                 }
             }
 
             match rx.recv() {
                 Ok(frame) => {
-                    self.process_frame(frame, &detect_model, inf_size);
+                    if self.detection_enabled {
+                        self.process_frame(frame, &detect_model, inf_size);
+                    } else {
+                        // 如果检测被禁用，仍然需要发送空结果以维持FPS统计和画面更新
+                        // 或者直接跳过处理，取决于架构设计。
+                        // 这里我们选择发送一个空的检测结果，以便渲染线程知道没有检测到物体
+                        // 但为了节省资源，我们不进行任何图像处理
+                        xbus::post(DetectionResult {
+                            bboxes: Vec::new(),
+                            keypoints: Vec::new(),
+                            inference_fps: 0.0,
+                            inference_ms: 0.0,
+                            tracker_fps: 0.0,
+                            tracker_ms: 0.0,
+                            resized_image: None,
+                            resized_size: inf_size,
+                            reid_features: Vec::new(),
+                        });
+                    }
                 }
                 Err(e) => {
                     eprintln!("❌ 目标检测队列接收失败: {}", e);

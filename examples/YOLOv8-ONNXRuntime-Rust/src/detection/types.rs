@@ -70,6 +70,7 @@ pub enum ConfigMessage {
     SwitchModel(String),
     SwitchTracker(String),
     TogglePose(bool),
+    ToggleDetection(bool),
 }
 
 impl PoseKeypoints {

@@ -68,6 +68,7 @@ async fn main() {
 
     // 设置 egui 中文字体
     if let Some(font_bytes) = font_data {
+        let font = macroquad::text::load_ttf_font_from_bytes(&font_bytes).unwrap();
         egui_macroquad::cfg(|ctx| {
             let mut fonts = egui::FontDefinitions::default();
             fonts.font_data.insert(
