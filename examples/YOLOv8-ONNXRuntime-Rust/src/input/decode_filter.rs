@@ -52,7 +52,7 @@ impl FrameFilter for DecodeFilter {
         frame: Frame,
         _ctx: &FrameFilterContext,
     ) -> Result<Option<Frame>, String> {
-        // ✅ 检查解码器代数ID，如果已过期则停止解码
+        // 检查解码器代数ID,如果已过期则停止解码
         let current_gen = ACTIVE_DECODER_GENERATION.load(Ordering::Relaxed);
         if self.generation != current_gen {
             println!(

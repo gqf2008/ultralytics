@@ -1,12 +1,9 @@
 /// RTSP主动拉流解码器
-/// RTSP active pulling decoder with adaptive hardware detection
+/// RTSP active pulling decoder with software decoding only
 use super::decode_filter::DecodeFilter;
 use ez_ffmpeg::core::context::null_output::create_null_output;
 use ez_ffmpeg::filter::frame_pipeline_builder::FramePipelineBuilder;
 use ez_ffmpeg::{AVMediaType, FfmpegContext, Input};
-
-#[cfg(windows)]
-use wmi::{COMLibrary, WMIConnection};
 
 /// RTSP解码器
 pub struct Decoder {
@@ -38,234 +35,62 @@ impl Decoder {
     }
 }
 
-/// 解码器偏好设置
+/// 解码器偏好设置 (仅CPU软件解码)
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum DecoderPreference {
-    Auto,
-    NvidiaCuda,
-    IntelQsv,
-    AmdAmf,
-    Dxva2,
     Software,
 }
 
 impl DecoderPreference {
     pub fn name(&self) -> &str {
-        match self {
-            DecoderPreference::Auto => "自动选择 (Auto)",
-            DecoderPreference::NvidiaCuda => "NVIDIA CUDA",
-            DecoderPreference::IntelQsv => "Intel QuickSync",
-            DecoderPreference::AmdAmf => "AMD AMF",
-            DecoderPreference::Dxva2 => "DXVA2 (Windows通用)",
-            DecoderPreference::Software => "CPU软件解码",
-        }
+        "CPU软件解码"
     }
 }
 
-/// 解码器类型
-#[derive(Debug, Clone, Copy)]
-pub enum DecoderType {
-    NvidiaCuda, // NVIDIA GPU硬件解码
-    IntelQsv,   // Intel QuickSync硬件解码
-    AmdAmf,     // AMD GPU硬件解码
-    Dxva2,      // Windows DXVA2通用硬件解码
-    Software,   // CPU软件解码
-}
-
-impl DecoderType {
-    pub fn name(&self) -> &str {
-        match self {
-            DecoderType::NvidiaCuda => "CUDA (NVIDIA)",
-            DecoderType::IntelQsv => "QuickSync (Intel)",
-            DecoderType::AmdAmf => "AMF (AMD)",
-            DecoderType::Dxva2 => "DXVA2",
-            DecoderType::Software => "CPU软件解码",
-        }
-    }
-
-    pub fn hwaccel_name(&self) -> Option<&str> {
-        match self {
-            DecoderType::NvidiaCuda => Some("cuda"),
-            DecoderType::IntelQsv => Some("qsv"),
-            DecoderType::AmdAmf => Some("d3d11va"), // Windows上AMD通常用d3d11va或dxva2，ez-ffmpeg示例用vulkan解码? 暂且用d3d11va或dxva2
-            DecoderType::Dxva2 => Some("dxva2"),
-            DecoderType::Software => None,
-        }
-    }
-
-    pub fn video_codec(&self) -> Option<&str> {
-        match self {
-            DecoderType::NvidiaCuda => Some("h264_cuvid"),
-            DecoderType::IntelQsv => Some("h264_qsv"),
-            DecoderType::AmdAmf => None, // 让FFmpeg自动选择
-            DecoderType::Dxva2 => None,
-            DecoderType::Software => None,
-        }
-    }
-
-    fn env_vars(&self) -> Vec<(&str, &str)> {
-        // 仍然保留环境变量设置，作为双重保险
-        match self {
-            DecoderType::NvidiaCuda => vec![("FFMPEG_HWACCEL", "cuda")],
-            DecoderType::IntelQsv => vec![("FFMPEG_HWACCEL", "qsv")],
-            DecoderType::AmdAmf => vec![("FFMPEG_HWACCEL", "d3d11va")],
-            DecoderType::Dxva2 => vec![("FFMPEG_HWACCEL", "dxva2")],
-            DecoderType::Software => vec![],
-        }
-    }
-
-    /// 检测硬件是否可用 (使用WMI API)
-    fn is_hardware_available(&self) -> bool {
-        match self {
-            DecoderType::NvidiaCuda => {
-                #[cfg(windows)]
-                {
-                    check_gpu_vendor("nvidia")
-                }
-                #[cfg(not(windows))]
-                {
-                    false
-                }
-            }
-            DecoderType::IntelQsv => {
-                #[cfg(windows)]
-                {
-                    check_gpu_vendor("intel")
-                }
-                #[cfg(not(windows))]
-                {
-                    false
-                }
-            }
-            DecoderType::AmdAmf => {
-                #[cfg(windows)]
-                {
-                    check_gpu_vendor("amd") || check_gpu_vendor("radeon")
-                }
-                #[cfg(not(windows))]
-                {
-                    false
-                }
-            }
-            DecoderType::Dxva2 => {
-                // DXVA2在Windows上总是可用
-                #[cfg(windows)]
-                {
-                    true
-                }
-                #[cfg(not(windows))]
-                {
-                    false
-                }
-            }
-            DecoderType::Software => true, // 软解总是可用
-        }
-    }
-}
-
-/// Windows平台检测显卡厂商 (使用WMI)
-#[cfg(windows)]
-fn check_gpu_vendor(vendor: &str) -> bool {
-    use serde::Deserialize;
-
-    #[derive(Deserialize)]
-    #[allow(non_camel_case_types)]
-    struct Win32_VideoController {
-        #[serde(rename = "Name")]
-        name: String,
-    }
-
-    match COMLibrary::new() {
-        Ok(com_con) => match WMIConnection::new(com_con) {
-            Ok(wmi_con) => {
-                if let Ok(gpus) = wmi_con
-                    .raw_query::<Win32_VideoController>("SELECT Name FROM Win32_VideoController")
-                {
-                    for gpu in gpus {
-                        if gpu.name.to_lowercase().contains(vendor) {
-                            return true;
-                        }
-                    }
-                }
-            }
-            Err(_) => return false,
-        },
-        Err(_) => return false,
-    }
-    false
-}
-
-/// 尝试使用指定解码器启动FFmpeg
-fn try_decoder(
+/// CPU软件解码
+fn software_decode(
     rtsp_url: &str,
-    decoder: &DecoderType,
     mut filter: DecodeFilter,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    println!("🔍 尝试解码器: {}", decoder.name());
+    println!("🔍 使用CPU软件解码");
 
-    // 先检测硬件是否可用
-    if !decoder.is_hardware_available() {
-        return Err(format!("硬件不可用").into());
-    }
-    println!("   ✅ 硬件检测通过");
+    filter.decoder_name = "CPU软件解码".to_string();
 
-    // 设置解码器名称
-    filter.decoder_name = decoder.name().to_string();
-
-    // 清除之前的环境变量
+    // 清除可能存在的硬件加速环境变量
     std::env::remove_var("FFMPEG_HWACCEL");
 
-    // 设置新的环境变量
-    for (key, val) in decoder.env_vars() {
-        std::env::set_var(key, val);
-    }
-
-    // ========== 🔥 VLC级别画质优化参数 (CSDN优化方案) ==========
     // RTSP传输优化
-    std::env::set_var("FFMPEG_RTSP_TRANSPORT", "tcp"); // 强制TCP传输(可靠,防止UDP丢包)
+    std::env::set_var("FFMPEG_RTSP_TRANSPORT", "tcp");
     std::env::set_var("FFMPEG_RTSP_FLAGS", "prefer_tcp");
-    std::env::set_var("FFMPEG_BUFFER_SIZE", "8192000"); // 8MB缓冲区
+    std::env::set_var("FFMPEG_BUFFER_SIZE", "8192000");
 
-    // 🎯 低延迟参数
-    std::env::set_var("FFMPEG_FLAGS", "low_delay"); // 低延迟模式
-    std::env::set_var("FFMPEG_FFLAGS", "nobuffer"); // 无缓冲(降低延迟)
+    // 低延迟参数
+    std::env::set_var("FFMPEG_FLAGS", "low_delay");
+    std::env::set_var("FFMPEG_FFLAGS", "nobuffer");
 
-    // 🎯 解码质量优化 - 关键! (保留完整环路滤波)
-    std::env::set_var("FFMPEG_SKIP_FRAME", "noref"); // 只跳过非参考帧(保留画质)
-    std::env::set_var("FFMPEG_SKIP_LOOP_FILTER", "noref"); // 保留环路滤波(去块效应核心)
-    std::env::set_var("FFMPEG_ERR_DETECT", "careful"); // 错误检测但不丢弃可修复帧
+    // 解码质量优化
+    std::env::set_var("FFMPEG_SKIP_FRAME", "noref");
+    std::env::set_var("FFMPEG_SKIP_LOOP_FILTER", "noref");
+    std::env::set_var("FFMPEG_ERR_DETECT", "careful");
 
-    // 🔧 H.264/HEVC解码器优化选项
-    std::env::set_var("FFMPEG_THREADS", "auto"); // 多线程解码
-    std::env::set_var("FFMPEG_THREAD_TYPE", "frame+slice"); // 帧级+切片级并行
-
-    // 🎨 后处理滤镜(去块+降噪)
-    std::env::set_var("FFMPEG_POST_PROCESS", "1"); // 启用后处理
+    // 多线程解码
+    std::env::set_var("FFMPEG_THREADS", "auto");
+    std::env::set_var("FFMPEG_THREAD_TYPE", "frame+slice");
 
     let pipe: FramePipelineBuilder = AVMediaType::AVMEDIA_TYPE_VIDEO.into();
     let pipe = pipe.filter("decode", Box::new(filter));
     let out = create_null_output().add_frame_pipeline(pipe);
 
-    let mut input = Input::new(rtsp_url).set_input_opts(
+    let input = Input::new(rtsp_url).set_input_opts(
         [
             ("rtsp_transport", "tcp"),
             ("buffer_size", "67108864"),
-            ("rtsp_flags", "prefer_tcp "),
+            ("rtsp_flags", "prefer_tcp"),
         ]
         .into(),
     );
 
-    // ✅ 设置硬件加速
-    if let Some(hwaccel) = decoder.hwaccel_name() {
-        println!("   🚀 启用硬件加速: {}", hwaccel);
-        input = input.set_hwaccel(hwaccel);
-        if let Some(codec) = decoder.video_codec() {
-            println!("   🎞️ 指定解码器: {}", codec);
-            input = input.set_video_codec(codec);
-        }
-    }
-
-    // 构建FFmpeg上下文 - 添加画质滤镜
+    // 构建FFmpeg上下文
     let ctx = FfmpegContext::builder()
         .input(input)
         .filter_descs(["scale=1280:720"].into())
@@ -273,49 +98,23 @@ fn try_decoder(
         .build()
         .map_err(|e| format!("构建失败: {}", e))?;
 
-    // 尝试启动
     let sch = ctx.start().map_err(|e| format!("启动失败: {}", e))?;
-    println!("✅ {} 连接成功,开始解码! (画质增强模式)", decoder.name());
+    println!("✅ CPU软件解码启动成功");
+
     let _ = sch.wait();
     Ok(())
 }
 
-/// 自适应解码器选择: 优先硬件,失败则降级
-pub fn adaptive_decode(rtsp_url: &str, filter: DecodeFilter, preference: &DecoderPreference) {
-    let decoders = match preference {
-        DecoderPreference::Auto => vec![
-            DecoderType::NvidiaCuda, // 优先NVIDIA (最快)
-            DecoderType::IntelQsv,   // 次选Intel
-            DecoderType::AmdAmf,     // 再次AMD
-            DecoderType::Dxva2,      // 通用硬件解码
-            DecoderType::Software,   // 最后软解
-        ],
-        DecoderPreference::NvidiaCuda => vec![DecoderType::NvidiaCuda, DecoderType::Software],
-        DecoderPreference::IntelQsv => vec![DecoderType::IntelQsv, DecoderType::Software],
-        DecoderPreference::AmdAmf => vec![DecoderType::AmdAmf, DecoderType::Software],
-        DecoderPreference::Dxva2 => vec![DecoderType::Dxva2, DecoderType::Software],
-        DecoderPreference::Software => vec![DecoderType::Software],
-    };
+/// CPU软件解码(简化版)
+pub fn adaptive_decode(rtsp_url: &str, filter: DecodeFilter, _preference: &DecoderPreference) {
+    println!("🔄 解码策略: CPU软件解码");
 
-    println!("🔄 解码策略: {:?}", preference);
-    println!(
-        "📋 尝试顺序: {:?}",
-        decoders.iter().map(|d| d.name()).collect::<Vec<_>>()
-    );
-
-    for decoder in &decoders {
-        match try_decoder(rtsp_url, decoder, filter.clone()) {
-            Ok(_) => {
-                println!("✅ 解码线程正常退出");
-                return;
-            }
-            Err(e) => {
-                println!("⚠️  {} 失败: {}", decoder.name(), e);
-                println!("   正在尝试下一个解码器...");
-                std::thread::sleep(std::time::Duration::from_millis(500));
-            }
+    match software_decode(rtsp_url, filter) {
+        Ok(_) => {
+            println!("✅ 解码线程正常退出");
+        }
+        Err(e) => {
+            eprintln!("❌ CPU软件解码失败: {}", e);
         }
     }
-
-    eprintln!("❌ 所有解码器均失败!");
 }

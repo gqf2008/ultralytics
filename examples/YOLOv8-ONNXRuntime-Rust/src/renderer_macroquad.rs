@@ -78,15 +78,6 @@ static TRACKER_INDICES: phf::Map<&'static str, usize> = phf_map! {
     "无" => 2,
 };
 
-static DECODER_NAMES: [&str; 6] = [
-    "自动 (Auto)",
-    "NVIDIA CUDA",
-    "Intel QuickSync",
-    "AMD AMF",
-    "DXVA2 (Windows)",
-    "CPU 软件解码",
-];
-
 pub struct Renderer {
     _frame_sub: Subscription,
     _result_sub: Subscription,
@@ -118,8 +109,6 @@ pub struct Renderer {
     input_source_type: usize, // 0=RTSP, 1=摄像头, 2=桌面捕获
     rtsp_url: String,
     rtsp_history: Vec<String>, // RTSP 历史记录
-    camera_id: i32,
-    selected_decoder_index: usize, // 解码器选择
 
     // 设备列表
     video_devices: Vec<VideoDevice>,
@@ -268,8 +257,6 @@ impl Renderer {
                 }
                 history
             },
-            camera_id: 0,
-            selected_decoder_index: 0,
             video_devices: Vec::new(),
             selected_device_index: 0,
             devices_loaded: false,
@@ -611,73 +598,71 @@ impl Renderer {
                 }
                 self.panel_bg_texture.take();
             }
-            // // --- 自定义 UI 样式 (Cyberpunk/Sci-Fi Theme) ---
-            // let mut visuals = egui::Visuals::dark();
 
-            // // 窗口样式
-            // visuals.window_fill = egui::Color32::from_rgba_premultiplied(15, 20, 35, 240); // 深色半透明背景
-            // visuals.window_stroke = egui::Stroke::new(2.0, egui::Color32::from_rgb(0, 200, 255)); // 青色边框
-            // visuals.window_shadow = egui::epaint::Shadow {
-            //     offset: [4, 8],
-            //     blur: 20,
-            //     spread: 0,
-            //     color: egui::Color32::from_rgba_premultiplied(0, 200, 255, 50),
-            // };
+            // --- 自定义 UI 样式 (透明背景) ---
+            let mut visuals = egui::Visuals::dark();
 
-            // // 面板和区域背景
-            // visuals.panel_fill = egui::Color32::from_rgba_premultiplied(20, 25, 40, 230);
-            // visuals.extreme_bg_color = egui::Color32::from_rgba_premultiplied(10, 15, 25, 200);
+            // 窗口样式 - 透明背景
+            visuals.window_fill = egui::Color32::TRANSPARENT;
+            visuals.window_stroke = egui::Stroke::new(
+                1.0,
+                egui::Color32::from_rgba_premultiplied(255, 255, 255, 30),
+            );
 
-            // // 非交互控件（标签、文本等）
-            // visuals.widgets.noninteractive.bg_fill =
-            //     egui::Color32::from_rgba_premultiplied(30, 35, 50, 180);
-            // visuals.widgets.noninteractive.weak_bg_fill =
-            //     egui::Color32::from_rgba_premultiplied(25, 30, 45, 150);
-            // visuals.widgets.noninteractive.bg_stroke =
-            //     egui::Stroke::new(1.0, egui::Color32::from_rgba_premultiplied(60, 70, 90, 200));
-            // visuals.widgets.noninteractive.fg_stroke =
-            //     egui::Stroke::new(1.0, egui::Color32::from_rgb(200, 210, 220));
+            // 面板和区域背景 - 透明
+            visuals.panel_fill = egui::Color32::TRANSPARENT;
+            visuals.extreme_bg_color = egui::Color32::TRANSPARENT;
 
-            // // 未激活控件（按钮、输入框等）
-            // visuals.widgets.inactive.bg_fill =
-            //     egui::Color32::from_rgba_premultiplied(40, 50, 70, 220);
-            // visuals.widgets.inactive.weak_bg_fill =
-            //     egui::Color32::from_rgba_premultiplied(35, 45, 65, 180);
-            // visuals.widgets.inactive.bg_stroke =
-            //     egui::Stroke::new(1.5, egui::Color32::from_rgb(70, 120, 180));
-            // visuals.widgets.inactive.fg_stroke =
-            //     egui::Stroke::new(1.5, egui::Color32::from_rgb(180, 190, 200));
+            // 非交互控件（标签、文本等）- 透明背景，无圆角
+            visuals.widgets.noninteractive.bg_fill = egui::Color32::TRANSPARENT;
+            visuals.widgets.noninteractive.weak_bg_fill = egui::Color32::TRANSPARENT;
+            visuals.widgets.noninteractive.bg_stroke = egui::Stroke::NONE;
+            visuals.widgets.noninteractive.fg_stroke =
+                egui::Stroke::new(1.0, egui::Color32::from_rgb(200, 210, 220));
+            visuals.widgets.noninteractive.corner_radius = 0.0.into(); // 无圆角
 
-            // // 悬停控件
-            // visuals.widgets.hovered.bg_fill =
-            //     egui::Color32::from_rgba_premultiplied(60, 80, 120, 255);
-            // visuals.widgets.hovered.weak_bg_fill =
-            //     egui::Color32::from_rgba_premultiplied(50, 70, 110, 220);
-            // visuals.widgets.hovered.bg_stroke =
-            //     egui::Stroke::new(2.0, egui::Color32::from_rgb(0, 200, 255)); // 青色高光
-            // visuals.widgets.hovered.fg_stroke = egui::Stroke::new(2.0, egui::Color32::WHITE);
-            // visuals.widgets.hovered.expansion = 1.5;
+            // 未激活控件（按钮、输入框等）- 透明背景，无圆角
+            visuals.widgets.inactive.bg_fill = egui::Color32::TRANSPARENT;
+            visuals.widgets.inactive.weak_bg_fill = egui::Color32::TRANSPARENT;
+            visuals.widgets.inactive.bg_stroke = egui::Stroke::new(
+                1.0,
+                egui::Color32::from_rgba_premultiplied(180, 190, 200, 80),
+            );
+            visuals.widgets.inactive.fg_stroke =
+                egui::Stroke::new(1.0, egui::Color32::from_rgb(180, 190, 200));
+            visuals.widgets.inactive.corner_radius = 0.0.into(); // 无圆角
 
-            // // 激活/点击控件
-            // visuals.widgets.active.bg_fill =
-            //     egui::Color32::from_rgba_premultiplied(0, 150, 255, 255); // 亮青色
-            // visuals.widgets.active.weak_bg_fill =
-            //     egui::Color32::from_rgba_premultiplied(0, 130, 230, 220);
-            // visuals.widgets.active.bg_stroke =
-            //     egui::Stroke::new(2.5, egui::Color32::from_rgb(100, 220, 255));
-            // visuals.widgets.active.fg_stroke = egui::Stroke::new(2.0, egui::Color32::WHITE);
+            // 悬停控件 - 透明背景+边框，无圆角
+            visuals.widgets.hovered.bg_fill = egui::Color32::TRANSPARENT;
+            visuals.widgets.hovered.weak_bg_fill = egui::Color32::TRANSPARENT;
+            visuals.widgets.hovered.bg_stroke = egui::Stroke::new(
+                1.5,
+                egui::Color32::from_rgba_premultiplied(180, 190, 200, 150),
+            );
+            visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.5, egui::Color32::WHITE);
+            visuals.widgets.hovered.corner_radius = 0.0.into(); // 无圆角
 
-            // // 选中状态
-            // visuals.selection.bg_fill = egui::Color32::from_rgba_premultiplied(0, 120, 200, 180);
-            // visuals.selection.stroke = egui::Stroke::new(1.5, egui::Color32::from_rgb(0, 200, 255));
+            // 激活/点击控件 - 透明背景+加粗边框，无圆角
+            visuals.widgets.active.bg_fill = egui::Color32::TRANSPARENT;
+            visuals.widgets.active.weak_bg_fill = egui::Color32::TRANSPARENT;
+            visuals.widgets.active.bg_stroke = egui::Stroke::new(
+                2.0,
+                egui::Color32::from_rgba_premultiplied(200, 210, 220, 200),
+            );
+            visuals.widgets.active.fg_stroke = egui::Stroke::new(2.0, egui::Color32::WHITE);
+            visuals.widgets.active.corner_radius = 0.0.into(); // 无圆角
 
-            // // 文本颜色
-            // visuals.override_text_color = Some(egui::Color32::from_rgb(230, 240, 250));
-            // visuals.warn_fg_color = egui::Color32::from_rgb(255, 200, 0);
-            // visuals.error_fg_color = egui::Color32::from_rgb(255, 80, 80);
-            // visuals.hyperlink_color = egui::Color32::from_rgb(100, 200, 255);
+            // 选中状态 - 半透明
+            visuals.selection.bg_fill = egui::Color32::from_rgba_premultiplied(100, 150, 255, 100);
+            visuals.selection.stroke = egui::Stroke::new(
+                1.5,
+                egui::Color32::from_rgba_premultiplied(150, 200, 255, 150),
+            );
 
-            // egui_ctx.set_visuals(visuals);
+            // 文本颜色
+            visuals.override_text_color = Some(egui::Color32::from_rgb(230, 240, 250));
+
+            egui_ctx.set_visuals(visuals);
 
             self.is_mouse_over_ui = egui_ctx.wants_pointer_input();
 
@@ -702,7 +687,7 @@ impl Renderer {
                 egui::Window::new("🎯 控制面板")
                     .default_pos(egui::pos2(10.0, 10.0))
                     .default_size(egui::vec2(350.0, 600.0))
-                    .resizable(false)
+                    .resizable(true)
                     .frame(egui::Frame::NONE)
                     .title_bar(false)
                     .show(egui_ctx, |ui| {
@@ -799,7 +784,7 @@ impl Renderer {
                                 if self.input_source_type == 0 {
                                     ui.label("RTSP 地址:");
 
-                                    // 历史记录下拉框
+                                    // 历史记录下拉框 - 选择后自动播放
                                     egui::ComboBox::from_id_salt("rtsp_history")
                                         .selected_text("选择历史记录...")
                                         .show_ui(ui, |ui| {
@@ -809,6 +794,11 @@ impl Renderer {
                                                     .clicked()
                                                 {
                                                     self.rtsp_url = url.clone();
+                                                    // 自动启动播放
+                                                    switch_decoder_source(
+                                                        InputSource::Rtsp(self.rtsp_url.clone()),
+                                                        DecoderPreference::Software,
+                                                    );
                                                 }
                                             }
                                         });
@@ -879,76 +869,6 @@ impl Renderer {
                                     }
                                 } else {
                                     ui.label("桌面捕获 (gdigrab)");
-                                }
-
-                                // 硬件解码选择 (目前主要用于RTSP)
-                                ui.separator();
-                                ui.horizontal(|ui| {
-                                    ui.label("解码策略:");
-                                    let mut selected_decoder = self.selected_decoder_index;
-                                    egui::ComboBox::from_id_salt("decoder_select")
-                                        .selected_text(
-                                            DECODER_NAMES
-                                                .get(self.selected_decoder_index)
-                                                .copied()
-                                                .unwrap_or("自动"),
-                                        )
-                                        .show_ui(ui, |ui| {
-                                            for (idx, name) in DECODER_NAMES.iter().enumerate() {
-                                                ui.selectable_value(
-                                                    &mut selected_decoder,
-                                                    idx,
-                                                    *name,
-                                                );
-                                            }
-                                        });
-                                    self.selected_decoder_index = selected_decoder;
-                                });
-                                if self.input_source_type != 0 {
-                                    ui.small("注: 硬件解码目前仅对RTSP流生效");
-                                }
-
-                                if ui.button("🔄 切换输入源").clicked() {
-                                    let new_source = if self.input_source_type == 0 {
-                                        // 自动保存 RTSP 地址到历史记录
-                                        if !self.rtsp_url.is_empty()
-                                            && !self.rtsp_history.contains(&self.rtsp_url)
-                                        {
-                                            self.rtsp_history.push(self.rtsp_url.clone());
-                                            // 限制历史记录数量
-                                            if self.rtsp_history.len() > 10 {
-                                                self.rtsp_history.remove(0);
-                                            }
-                                            // 保存到文件
-                                            let content = self.rtsp_history.join("\n");
-                                            let _ = std::fs::write("rtsp_history.txt", content);
-                                        }
-                                        InputSource::Rtsp(self.rtsp_url.clone())
-                                    } else if self.input_source_type == 1 {
-                                        let (device_index, device_name) = if self.devices_loaded
-                                            && !self.video_devices.is_empty()
-                                        {
-                                            let dev =
-                                                &self.video_devices[self.selected_device_index];
-                                            (dev.index, dev.name.clone())
-                                        } else {
-                                            (self.camera_id as usize, format!("{}", self.camera_id))
-                                        };
-                                        InputSource::Camera(device_index, device_name)
-                                    } else {
-                                        InputSource::Desktop
-                                    };
-
-                                    let preference = match self.selected_decoder_index {
-                                        0 => DecoderPreference::Auto,
-                                        1 => DecoderPreference::NvidiaCuda,
-                                        2 => DecoderPreference::IntelQsv,
-                                        3 => DecoderPreference::AmdAmf,
-                                        4 => DecoderPreference::Dxva2,
-                                        5 => DecoderPreference::Software,
-                                        _ => DecoderPreference::Auto,
-                                    };
-                                    switch_decoder_source(new_source, preference);
                                 }
                             });
 

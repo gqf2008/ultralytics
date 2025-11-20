@@ -15,7 +15,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use clap::Parser;
 use egui_macroquad::egui;
 use macroquad::miniquad::window;
-use macroquad::prelude::*;
+use macroquad::{conf, prelude::*};
 use yolov8_rs::detection;
 use yolov8_rs::detection::INF_SIZE;
 
@@ -53,7 +53,6 @@ fn window_conf() -> Conf {
 #[macroquad::main(window_conf)]
 async fn main() {
     let args = Args::parse();
-
     // 加载中文字体
     let font_data = match std::fs::read("assets/font/msyh.ttc") {
         Ok(data) => {
@@ -68,7 +67,6 @@ async fn main() {
 
     // 设置 egui 中文字体
     if let Some(font_bytes) = font_data {
-        let font = macroquad::text::load_ttf_font_from_bytes(&font_bytes).unwrap();
         egui_macroquad::cfg(|ctx| {
             let mut fonts = egui::FontDefinitions::default();
             fonts.font_data.insert(
