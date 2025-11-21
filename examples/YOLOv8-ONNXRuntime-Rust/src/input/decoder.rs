@@ -86,14 +86,15 @@ fn software_decode(
             ("rtsp_transport", "tcp"),
             ("buffer_size", "67108864"),
             ("rtsp_flags", "prefer_tcp"),
+            ("thread", "4"),
+            ("thread_queue_size", "1024"),
         ]
         .into(),
     );
-
     // 构建FFmpeg上下文
     let ctx = FfmpegContext::builder()
         .input(input)
-        .filter_descs(["scale=1280:720"].into())
+        // .filter_descs(["scale=1920x1080"].into()) // 让FFmpeg用sws_scale转换YUV→RGBA
         .output(out)
         .build()
         .map_err(|e| format!("构建失败: {}", e))?;

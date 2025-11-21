@@ -10,7 +10,7 @@ use image::{DynamicImage, ImageBuffer, RgbImage, Rgba};
 
 use super::types::DecodedFrame;
 use super::{ByteTracker, PersonTracker};
-use crate::detection::types::{self, ConfigMessage};
+use crate::detection::types::{self, ControlMessage};
 use crate::models::{FastestV2, Model, ModelType, NanoDet, YOLOv10, YOLOv11, YOLOv8, YOLOX};
 use crate::{xbus, Args, YOLOTask};
 
@@ -41,7 +41,13 @@ pub struct Detector {
     tracker: TrackerType,
     pose_enabled: bool,
     detection_enabled: bool,
-    config_rx: Option<Receiver<ConfigMessage>>,
+    config_rx: Option<Receiver<ControlMessage>>,
+
+    // Resize优化: 预计算的映射表
+    resize_x_map: Vec<usize>,
+    resize_y_map: Vec<usize>,
+    src_width: usize,
+    src_height: usize,
 
     // 统计
     count: u64,
@@ -83,6 +89,11 @@ impl Detector {
             pose_enabled,
             detection_enabled: true,
             config_rx: None,
+            // 初始化为空映射表,首帧时更新
+            resize_x_map: Vec::new(),
+            resize_y_map: Vec::new(),
+            src_width: 0,
+            src_height: 0,
             count: 0,
             last: Instant::now(),
             current_fps: 0.0,
@@ -92,7 +103,7 @@ impl Detector {
         }
     }
 
-    pub fn set_config_receiver(&mut self, rx: Receiver<ConfigMessage>) {
+    pub fn set_config_receiver(&mut self, rx: Receiver<ControlMessage>) {
         self.config_rx = Some(rx);
     }
 
@@ -216,7 +227,7 @@ impl Detector {
             if let Some(rx) = &self.config_rx {
                 while let Ok(msg) = rx.try_recv() {
                     match msg {
-                        ConfigMessage::UpdateParams {
+                        ControlMessage::UpdateParams {
                             conf_threshold,
                             iou_threshold,
                         } => {
@@ -226,7 +237,7 @@ impl Detector {
                                 m.set_iou(iou_threshold);
                             }
                         }
-                        ConfigMessage::SwitchModel(model_path) => {
+                        ControlMessage::SwitchModel(model_path) => {
                             println!("🔄 正在切换模型: {}", model_path);
                             if let Some(new_model) = self.load_model(&model_path) {
                                 detect_model = Some(new_model);
@@ -241,7 +252,7 @@ impl Detector {
                                 }
                             }
                         }
-                        ConfigMessage::SwitchTracker(tracker_name) => {
+                        ControlMessage::SwitchTracker(tracker_name) => {
                             println!("🔄 正在切换跟踪器: {}", tracker_name);
                             self.tracker = match tracker_name.to_lowercase().as_str() {
                                 "deepsort" => TrackerType::DeepSort(PersonTracker::new()),
@@ -249,7 +260,7 @@ impl Detector {
                                 _ => TrackerType::None,
                             };
                         }
-                        ConfigMessage::TogglePose(enabled) => {
+                        ControlMessage::TogglePose(enabled) => {
                             self.pose_enabled = enabled;
                             if enabled {
                                 if let Some(ref model) = detect_model {
@@ -265,7 +276,7 @@ impl Detector {
                                 println!("🚫 姿态估计已禁用");
                             }
                         }
-                        ConfigMessage::ToggleDetection(enabled) => {
+                        ControlMessage::ToggleDetection(enabled) => {
                             self.detection_enabled = enabled;
                             if enabled {
                                 println!("✅ 目标检测已启用");
@@ -346,53 +357,50 @@ impl Detector {
     ) {
         let start_total = Instant::now();
 
-        // 2. Resize: 动态分辨率 → 320x320 (使用 fast_image_resize 高性能库 + Nearest 插值)
+        // 2. Resize: 动态分辨率 → 640x640 (查表法 - 极限优化)
         let t2 = Instant::now();
 
-        // 创建源图像 (RGBA) - 直接使用Arc中的数据切片,零拷贝!
-        // 注意: fast_image_resize 5.x 的 from_slice_u8 需要 &mut [u8]
-        // 因为我们使用的是 Arc (不可变共享), 所以这里必须 clone 一次数据
-        // 虽然引入了一次拷贝, 但相比之前的多次拷贝(每个订阅者一次)已经大大优化
-        let src_buffer = frame.rgba_data.to_vec();
-        let src_image = match fr::images::Image::from_vec_u8(
-            frame.width,
-            frame.height,
-            src_buffer,
-            fr::PixelType::U8x4,
-        ) {
-            Ok(img) => img,
-            Err(e) => {
-                eprintln!("❌ 创建源图像失败: {}", e);
-                return;
+        let src_w = frame.width as usize;
+        let src_h = frame.height as usize;
+        let dst_size = inf_size as usize;
+        let src_buffer = &frame.rgba_data;
+
+        // 仅在分辨率变化时重新计算映射表
+        if self.src_width != src_w || self.src_height != src_h {
+            let scale_x = src_w as f32 / dst_size as f32;
+            let scale_y = src_h as f32 / dst_size as f32;
+
+            self.resize_x_map = (0..dst_size)
+                .map(|x| ((x as f32 * scale_x) as usize).min(src_w - 1))
+                .collect();
+            self.resize_y_map = (0..dst_size)
+                .map(|y| ((y as f32 * scale_y) as usize).min(src_h - 1))
+                .collect();
+            self.src_width = src_w;
+            self.src_height = src_h;
+            eprintln!("📐 Resize映射表已更新: {}x{} → {}", src_w, src_h, dst_size);
+        }
+
+        // 预分配输出 (RGBA → RGB直接转换)
+        let mut rgb_data = vec![0u8; dst_size * dst_size * 3];
+
+        // 使用缓存的映射表 - 零计算开销
+        let mut out_idx = 0;
+        for &src_y in &self.resize_y_map {
+            let src_row = src_y * src_w * 4;
+            for &src_x in &self.resize_x_map {
+                let src_idx = src_row + src_x * 4;
+                // 直接写入RGB,跳过Alpha
+                rgb_data[out_idx] = src_buffer[src_idx];
+                rgb_data[out_idx + 1] = src_buffer[src_idx + 1];
+                rgb_data[out_idx + 2] = src_buffer[src_idx + 2];
+                out_idx += 3;
             }
-        };
-
-        // 创建目标图像 (RGBA)
-        let mut dst_image = fr::images::Image::new(inf_size, inf_size, fr::PixelType::U8x4);
-
-        // 执行超快速缩放 (Nearest 算法,比 Bilinear 快 5-10 倍,牺牲少量质量换取极致速度)
-        let mut resizer = fr::Resizer::new();
-        resizer
-            .resize(
-                &src_image,
-                &mut dst_image,
-                &fr::ResizeOptions::new().resize_alg(fr::ResizeAlg::Nearest), // 最快插值算法
-            )
-            .unwrap();
+        }
 
         let resize_ms = t2.elapsed().as_secs_f64() * 1000.0;
 
-        // 3. RGBA → RGB (优化版: 预分配 + 直接循环)
-        let dst_pixels = dst_image.buffer();
-        let mut rgb_data = Vec::with_capacity((inf_size * inf_size * 3) as usize);
-        for chunk in dst_pixels.chunks_exact(4) {
-            rgb_data.push(chunk[0]); // R
-            rgb_data.push(chunk[1]); // G
-            rgb_data.push(chunk[2]); // B
-                                     // 跳过 Alpha 通道
-        }
-
-        // 4. RGB → DynamicImage
+        // 3. RGB → DynamicImage (零拷贝)
         let rgb_img = match RgbImage::from_raw(inf_size, inf_size, rgb_data) {
             Some(img) => img,
             None => {

@@ -1,7 +1,7 @@
 mod control_panel;
 
 use crate::detection::detector::DetectionResult;
-use crate::detection::types::{ConfigMessage, DecodedFrame};
+use crate::detection::types::{ControlMessage, DecodedFrame};
 use crate::input::decoder::DecoderPreference;
 use crate::input::switch_decoder_source;
 use crate::xbus::{self, Subscription};
@@ -97,25 +97,7 @@ impl Renderer {
             println!("⚠️ 未找到背景图片: assets/images/background.jpg");
             None
         };
-        let mut control_panel = ControlPanel::new(detect_model, tracker);
-        // 加载控制面板背景纹理
-        if let Ok(bytes) = std::fs::read("assets/images/panel_bg.jpg") {
-            if let Ok(img) = image::load_from_memory(&bytes) {
-                let rgba = img.to_rgba8();
-                let color_image = egui::ColorImage::from_rgba_unmultiplied(
-                    [rgba.width() as usize, rgba.height() as usize],
-                    &rgba,
-                );
-                egui_macroquad::cfg(|egui_ctx| {
-                    let texture = egui_ctx.load_texture(
-                        "panel_bg",
-                        color_image,
-                        egui::TextureOptions::LINEAR,
-                    );
-                    control_panel.register_background_texture(texture);
-                });
-            }
-        }
+        let control_panel = ControlPanel::new(detect_model, tracker);
 
         // 加载中文字体
         let chinese_font = if let Ok(bytes) = std::fs::read("assets/font/msyh.ttc") {
@@ -160,7 +142,7 @@ impl Renderer {
         }
     }
 
-    pub fn set_config_sender(&mut self, tx: Sender<ConfigMessage>) {
+    pub fn set_config_sender(&mut self, tx: Sender<ControlMessage>) {
         self.control_panel.set_config_chan(tx);
     }
 
@@ -208,7 +190,7 @@ impl Renderer {
             self.control_panel.set_config_chan(config_tx.clone());
 
             // 发送初始参数
-            if let Err(e) = config_tx.try_send(ConfigMessage::UpdateParams {
+            if let Err(e) = config_tx.try_send(ControlMessage::UpdateParams {
                 conf_threshold: self.control_panel.confidence_threshold,
                 iou_threshold: self.control_panel.iou_threshold,
             }) {

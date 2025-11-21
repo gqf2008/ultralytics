@@ -62,7 +62,7 @@ pub struct InferredFrame {
 
 /// 配置更新消息 (渲染线程 → 推理线程)
 #[derive(Clone, Debug)]
-pub enum ConfigMessage {
+pub enum ControlMessage {
     UpdateParams {
         conf_threshold: f32,
         iou_threshold: f32,

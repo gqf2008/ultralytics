@@ -1,111 +1,35 @@
-use crate::detection::types::ConfigMessage;
+use crate::detection::types::ControlMessage;
 use crate::input::decoder::DecoderPreference;
 use crate::input::{get_video_devices, switch_decoder_source, InputSource, VideoDevice};
 use crossbeam_channel::Sender;
 use egui_macroquad::egui::{self, TextureHandle};
 use macroquad::math::Vec2;
-#[cfg(not(windows))]
-use macroquad::miniquad::window::clipboard_set;
 use phf::phf_map;
 
-/// 复制文本到系统剪贴板 (Windows 原生 API - 最可靠)
+/// 复制文本到系统剪贴板 (Windows 专用，使用 clipboard-win)
 #[cfg(windows)]
-fn set_clipboard_windows(text: &str) -> Result<(), String> {
-    use windows::Win32::Foundation::{HANDLE, HWND};
-    use windows::Win32::System::DataExchange::{
-        CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
-    };
-    use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+fn copy_to_clipboard(_ui: &egui::Ui, text: &str) {
+    use clipboard_win::{formats, set_clipboard};
 
-    const CF_UNICODETEXT: u32 = 13;
+    println!("📋 复制到剪贴板: {}", text);
 
-    unsafe {
-        // 1. 打开剪贴板 (重试机制)
-        let mut opened = false;
-        for _ in 0..5 {
-            if OpenClipboard(HWND::default()).is_ok() {
-                opened = true;
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
+    match set_clipboard(formats::Unicode, text) {
+        Ok(_) => {
+            println!("✅ 已成功复制到系统剪贴板!");
+            println!("💡 现在可以在 VS Code 等应用中按 Ctrl+V 粘贴");
         }
-
-        if !opened {
-            return Err("无法打开剪贴板 (被占用)".to_string());
+        Err(e) => {
+            eprintln!("❌ 复制到剪贴板失败: {:?}", e);
         }
-
-        // 2. 清空剪贴板
-        if EmptyClipboard().is_err() {
-            CloseClipboard().ok();
-            return Err("清空剪贴板失败".to_string());
-        }
-
-        // 3. 转换为 UTF-16 (Windows Unicode)
-        let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
-        let size = wide.len() * std::mem::size_of::<u16>();
-
-        // 4. 分配全局内存
-        let hmem = match GlobalAlloc(GMEM_MOVEABLE, size) {
-            Ok(h) => h,
-            Err(_) => {
-                CloseClipboard().ok();
-                return Err("内存分配失败".to_string());
-            }
-        };
-
-        // 5. 锁定内存并写入数据
-        let ptr = GlobalLock(hmem);
-        if ptr.is_null() {
-            CloseClipboard().ok();
-            return Err("内存锁定失败".to_string());
-        }
-
-        std::ptr::copy_nonoverlapping(wide.as_ptr(), ptr as *mut u16, wide.len());
-
-        // 6. 解锁内存 (必须在 SetClipboardData 之前)
-        // GlobalUnlock 返回 BOOL,非零表示仍被锁定,零表示解锁成功
-        let _ = GlobalUnlock(hmem);
-
-        // 7. 设置剪贴板数据 (*mut c_void -> HANDLE)
-        // 注意: 成功后内存所有权转移给系统,不要再释放!
-        use std::mem::transmute;
-        let handle: HANDLE = transmute(hmem.0);
-        if SetClipboardData(CF_UNICODETEXT, handle).is_err() {
-            CloseClipboard().ok();
-            return Err("设置剪贴板数据失败".to_string());
-        }
-
-        // 8. 关闭剪贴板 (数据已安全转移到系统)
-        if CloseClipboard().is_err() {
-            return Err("关闭剪贴板失败".to_string());
-        }
-        Ok(())
     }
 }
 
-/// 复制文本到系统剪贴板和 egui 内部剪贴板 (带重试机制)
-fn copy_to_clipboard(_ui: &egui::Ui, text: &str) {
-    // 1. 通知 egui 内部状态
-    // ui.ctx().copy_text(text.to_string());
-
-    // 2. 写入系统剪贴板
-    #[cfg(windows)]
-    {
-        match set_clipboard_windows(text) {
-            Ok(_) => println!("✅ 已复制到系统剪贴板: {}", text),
-            Err(e) => {
-                eprintln!("❌ 剪贴板操作失败: {}", e);
-                eprintln!("   提示: egui 内部剪贴板仍可用 (应用内 Ctrl+V)");
-            }
-        }
-    }
-
-    #[cfg(not(windows))]
-    {
-        // 非 Windows 平台使用 miniquad API
-        clipboard_set(text);
-        println!("✅ 已复制到系统剪贴板: {}", text);
-    }
+/// 复制文本到系统剪贴板 (非 Windows 平台)
+#[cfg(not(windows))]
+fn copy_to_clipboard(ui: &egui::Ui, text: &str) {
+    println!("📋 复制到剪贴板: {}", text);
+    ui.ctx().copy_text(text.to_string());
+    println!("✅ 已复制!");
 }
 
 static MODELS: [&str; 25] = [
@@ -200,17 +124,39 @@ pub struct ControlPanel {
     pub selected_tracker_index: usize,
     pub pose_enabled: bool,
     pub detection_enabled: bool,
-    config_tx: Option<Sender<ConfigMessage>>,
+    config_tx: Option<Sender<ControlMessage>>,
     // 视图控制
     pub zoom_scale: f32,
     pub pan_offset: macroquad::prelude::Vec2,
 
     // 背景纹理
     pub panel_bg_egui: Option<egui::TextureHandle>,
+    pub panel_bg_size: Option<(usize, usize)>,
 }
 
 impl ControlPanel {
     pub fn new(detect_model: String, tracker: String) -> Self {
+        let mut bg = None;
+        let mut bg_size = None;
+        if let Ok(bytes) = std::fs::read("assets/images/panel_bg.jpg") {
+            if let Ok(img) = image::load_from_memory(&bytes) {
+                let rgba = img.to_rgba8();
+                let width = rgba.width() as usize;
+                let height = rgba.height() as usize;
+                bg_size = Some((width, height));
+                let color_image = egui::ColorImage::from_rgba_unmultiplied([width, height], &rgba);
+                egui_macroquad::cfg(|egui_ctx| {
+                    let texture = egui_ctx.load_texture(
+                        "panel_bg",
+                        color_image,
+                        egui::TextureOptions::LINEAR,
+                    );
+
+                    bg = Some(texture);
+                });
+            }
+        }
+
         Self {
             detect_model_name: detect_model.clone(),
             tracker_name: tracker.clone(),
@@ -250,7 +196,8 @@ impl ControlPanel {
             detection_enabled: true,
             zoom_scale: 1.0,
             pan_offset: macroquad::prelude::Vec2::ZERO,
-            panel_bg_egui: None,
+            panel_bg_egui: bg,
+            panel_bg_size: bg_size,
             config_tx: None,
         }
     }
@@ -262,7 +209,7 @@ impl ControlPanel {
         }
     }
 
-    pub fn set_config_chan(&mut self, tx: Sender<ConfigMessage>) {
+    pub fn set_config_chan(&mut self, tx: Sender<ControlMessage>) {
         self.config_tx = Some(tx);
     }
     /// 添加 RTSP 地址到历史记录并保存
@@ -361,21 +308,35 @@ impl ControlPanel {
             return;
         }
         self.set_style(ctx);
+
+        // 根据背景图像尺寸确定窗口大小
+        let window_size = if let Some((width, height)) = self.panel_bg_size {
+            egui::vec2(width as f32, height as f32)
+        } else {
+            egui::vec2(350.0, 600.0) // 默认尺寸
+        };
+
         egui::Window::new("🎯 控制面板")
             .default_pos(egui::pos2(10.0, 10.0))
-            .default_size(egui::vec2(350.0, 600.0))
+            .default_size(window_size)
             .resizable(true)
             .frame(egui::Frame::NONE)
             .title_bar(false)
             .show(ctx, |ui| {
+                // 先绘制背景图像到最底层,完全填充窗口
                 if let Some(tex) = self.panel_bg_egui.as_ref() {
-                    let rect = ui.max_rect();
+                    let painter = ui.painter();
+                    let rect = ui.available_rect_before_wrap();
                     let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
-                    let tint = egui::Color32::WHITE;
-                    ui.painter().image(tex.id(), rect, uv, tint);
+                    let tint = egui::Color32::from_rgba_premultiplied(255, 255, 255, 180);
+                    painter.image(tex.id(), rect, uv, tint);
                 }
 
-                let actions = self.ui(ui);
+                // 使用ScrollArea包裹UI内容,允许窗口垂直调整大小
+                let actions = egui::ScrollArea::vertical()
+                    .auto_shrink([false; 2]) // 不自动收缩,允许手动调整窗口大小
+                    .show(ui, |ui| self.ui(ui))
+                    .inner;
 
                 // 处理控制面板的操作
                 if actions.reset_zoom {
@@ -627,7 +588,7 @@ impl ControlPanel {
                     self.detect_model_name = model_name.to_string();
                     let model_path = self.resolve_model_path(model_name);
                     if let Some(tx) = &self.config_tx {
-                        let _ = tx.try_send(ConfigMessage::SwitchModel(model_path));
+                        let _ = tx.try_send(ControlMessage::SwitchModel(model_path));
                     }
                 }
 
@@ -651,7 +612,8 @@ impl ControlPanel {
                     let tracker_name = TRACKERS[selected_tracker];
                     self.tracker_name = tracker_name.to_string();
                     if let Some(tx) = &self.config_tx {
-                        let _ = tx.try_send(ConfigMessage::SwitchTracker(tracker_name.to_string()));
+                        let _ =
+                            tx.try_send(ControlMessage::SwitchTracker(tracker_name.to_string()));
                     }
                 }
 
@@ -660,7 +622,7 @@ impl ControlPanel {
                     .changed()
                 {
                     if let Some(tx) = &self.config_tx {
-                        let _ = tx.try_send(ConfigMessage::TogglePose(self.pose_enabled));
+                        let _ = tx.try_send(ControlMessage::TogglePose(self.pose_enabled));
                     }
                 }
 
@@ -669,7 +631,8 @@ impl ControlPanel {
                     .changed()
                 {
                     if let Some(tx) = &self.config_tx {
-                        let _ = tx.try_send(ConfigMessage::ToggleDetection(self.detection_enabled));
+                        let _ =
+                            tx.try_send(ControlMessage::ToggleDetection(self.detection_enabled));
                     }
                 }
 
@@ -694,7 +657,7 @@ impl ControlPanel {
                 if params_changed {
                     if let Some(tx) = &self.config_tx {
                         // 使用 try_send 避免阻塞UI线程（当Detector忙碌时）
-                        let _ = tx.try_send(ConfigMessage::UpdateParams {
+                        let _ = tx.try_send(ControlMessage::UpdateParams {
                             conf_threshold: self.confidence_threshold,
                             iou_threshold: self.iou_threshold,
                         });
@@ -714,11 +677,6 @@ impl ControlPanel {
             });
 
         actions
-    }
-
-    /// 注册面板背景纹理到 egui
-    pub fn register_background_texture(&mut self, panel_bg_texture: TextureHandle) {
-        self.panel_bg_egui = Some(panel_bg_texture);
     }
 }
 

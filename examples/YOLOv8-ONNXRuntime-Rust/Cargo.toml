@@ -83,12 +83,12 @@ egui-macroquad = "0.17"
 crossbeam-channel = "0.5.15"
 crossbeam-skiplist = "0.1.3"
 
+# Windows 剪贴板支持
+[target.'cfg(windows)'.dependencies]
+clipboard-win = "5.4"
+
 # 高性能内存分配器 (替代系统默认分配器)
 mimalloc = { version = "0.1", default-features = false }
-
-# Windows 原生 API (剪贴板)
-[target.'cfg(windows)'.dependencies]
-windows = { version = "0.58", features = ["Win32_System_DataExchange", "Win32_System_Memory", "Win32_Foundation"] }
 
 # 全局静态变量支持
 once_cell = "1.20"
