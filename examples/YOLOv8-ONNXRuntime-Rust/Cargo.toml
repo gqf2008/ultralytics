@@ -83,6 +83,9 @@ egui-macroquad = "0.17"
 crossbeam-channel = "0.5.15"
 crossbeam-skiplist = "0.1.3"
 
+# 数据并行处理
+rayon = "1.10"
+
 # Windows 剪贴板支持
 [target.'cfg(windows)'.dependencies]
 clipboard-win = "5.4"

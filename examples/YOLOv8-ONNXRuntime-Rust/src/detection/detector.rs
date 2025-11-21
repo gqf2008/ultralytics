@@ -7,6 +7,7 @@ use std::time::Instant;
 use crossbeam_channel::{Receiver, Sender};
 use fast_image_resize as fr;
 use image::{DynamicImage, ImageBuffer, RgbImage, Rgba};
+use rayon::prelude::*;
 
 use super::types::DecodedFrame;
 use super::{ByteTracker, PersonTracker};
@@ -384,19 +385,23 @@ impl Detector {
         // 预分配输出 (RGBA → RGB直接转换)
         let mut rgb_data = vec![0u8; dst_size * dst_size * 3];
 
-        // 使用缓存的映射表 - 零计算开销
-        let mut out_idx = 0;
-        for &src_y in &self.resize_y_map {
-            let src_row = src_y * src_w * 4;
-            for &src_x in &self.resize_x_map {
-                let src_idx = src_row + src_x * 4;
-                // 直接写入RGB,跳过Alpha
-                rgb_data[out_idx] = src_buffer[src_idx];
-                rgb_data[out_idx + 1] = src_buffer[src_idx + 1];
-                rgb_data[out_idx + 2] = src_buffer[src_idx + 2];
-                out_idx += 3;
-            }
-        }
+        // 并行处理每一行 - 多核加速
+        rgb_data
+            .par_chunks_mut(dst_size * 3)
+            .enumerate()
+            .for_each(|(y, row_chunk)| {
+                let src_y = self.resize_y_map[y];
+                let src_row_base = src_y * src_w * 4;
+                
+                for (x, pixel) in row_chunk.chunks_exact_mut(3).enumerate() {
+                    let src_x = self.resize_x_map[x];
+                    let src_idx = src_row_base + src_x * 4;
+                    // RGBA → RGB
+                    pixel[0] = src_buffer[src_idx];
+                    pixel[1] = src_buffer[src_idx + 1];
+                    pixel[2] = src_buffer[src_idx + 2];
+                }
+            });
 
         let resize_ms = t2.elapsed().as_secs_f64() * 1000.0;
 

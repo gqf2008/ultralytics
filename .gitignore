@@ -195,3 +195,8 @@ calibration_*.npy
 /examples/YOLOv8-ONNXRuntime-Rust/models
 /examples/YOLOv8-ONNXRuntime-Rust/docs
 /examples/YOLOv8-ONNXRuntime-Rust/tensorrt_inference
+*.exe
+*.txt
+*.dll
+*.exe
+*.lock
