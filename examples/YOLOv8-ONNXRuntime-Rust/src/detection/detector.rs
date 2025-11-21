@@ -7,13 +7,17 @@ use std::time::Instant;
 use crossbeam_channel::{Receiver, Sender};
 use fast_image_resize as fr;
 use image::{DynamicImage, ImageBuffer, RgbImage, Rgba};
-use rayon::prelude::*;
 
 use super::types::DecodedFrame;
 use super::{ByteTracker, PersonTracker};
 use crate::detection::types::{self, ControlMessage};
 use crate::models::{FastestV2, Model, ModelType, NanoDet, YOLOv10, YOLOv11, YOLOv8, YOLOX};
 use crate::{xbus, Args, YOLOTask};
+
+#[cfg(feature = "gpu")]
+use crate::utils::affine_transform::{AffineMatrix, BorderMode, InterpolationMethod};
+#[cfg(feature = "gpu")]
+use crate::utils::affine_transform_wgpu::WgpuAffineTransform;
 
 /// 检测结果 (检测模块 → 渲染模块)
 #[derive(Clone, Debug)]
@@ -49,6 +53,10 @@ pub struct Detector {
     resize_y_map: Vec<usize>,
     src_width: usize,
     src_height: usize,
+
+    // GPU加速支持
+    #[cfg(feature = "gpu")]
+    gpu_transform: Option<WgpuAffineTransform>,
 
     // 统计
     count: u64,
@@ -95,6 +103,9 @@ impl Detector {
             resize_y_map: Vec::new(),
             src_width: 0,
             src_height: 0,
+            // 尝试初始化GPU加速
+            #[cfg(feature = "gpu")]
+            gpu_transform: WgpuAffineTransform::new().ok(),
             count: 0,
             last: Instant::now(),
             current_fps: 0.0,
@@ -102,6 +113,68 @@ impl Detector {
             tracker_last: Instant::now(),
             tracker_current_fps: 0.0,
         }
+    }
+
+    /// CPU并行resize (RGBA → RGB + 缩放)
+    fn cpu_resize_rgba_to_rgb(
+        src_buffer: &[u8],
+        src_w: usize,
+        src_h: usize,
+        dst_size: usize,
+        x_map: &mut Vec<usize>,
+        y_map: &mut Vec<usize>,
+        cached_w: &mut usize,
+        cached_h: &mut usize,
+    ) -> Vec<u8> {
+        use rayon::prelude::*;
+
+        // 仅在分辨率变化时重新计算映射表
+        if *cached_w != src_w || *cached_h != src_h {
+            let scale_x = src_w as f32 / dst_size as f32;
+            let scale_y = src_h as f32 / dst_size as f32;
+
+            *x_map = (0..dst_size)
+                .map(|x| ((x as f32 * scale_x) as usize).min(src_w - 1))
+                .collect();
+            *y_map = (0..dst_size)
+                .map(|y| ((y as f32 * scale_y) as usize).min(src_h - 1))
+                .collect();
+            *cached_w = src_w;
+            *cached_h = src_h;
+            eprintln!(
+                "📐 CPU Resize映射表已更新: {}x{} → {}",
+                src_w, src_h, dst_size
+            );
+        }
+
+        // 预分配输出
+        let mut rgb_data = vec![0u8; dst_size * dst_size * 3];
+
+        // 并行处理每一行 - 极致优化版本
+        rgb_data
+            .par_chunks_exact_mut(dst_size * 3)
+            .enumerate()
+            .for_each(|(y, row_chunk)| {
+                let src_y = y_map[y];
+                let src_row_base = src_y * src_w * 4;
+
+                // 手动展开循环 + 避免边界检查
+                let mut out_idx = 0;
+                for &src_x in x_map.iter() {
+                    let src_idx = src_row_base + src_x * 4;
+                    unsafe {
+                        // 使用unsafe避免边界检查 (映射表已保证安全)
+                        *row_chunk.get_unchecked_mut(out_idx) = *src_buffer.get_unchecked(src_idx);
+                        *row_chunk.get_unchecked_mut(out_idx + 1) =
+                            *src_buffer.get_unchecked(src_idx + 1);
+                        *row_chunk.get_unchecked_mut(out_idx + 2) =
+                            *src_buffer.get_unchecked(src_idx + 2);
+                    }
+                    out_idx += 3;
+                }
+            });
+
+        rgb_data
     }
 
     pub fn set_config_receiver(&mut self, rx: Receiver<ControlMessage>) {
@@ -358,7 +431,7 @@ impl Detector {
     ) {
         let start_total = Instant::now();
 
-        // 2. Resize: 动态分辨率 → 640x640 (查表法 - 极限优化)
+        // 2. Resize: 动态分辨率 → 640x640 (CPU并行优化)
         let t2 = Instant::now();
 
         let src_w = frame.width as usize;
@@ -366,42 +439,17 @@ impl Detector {
         let dst_size = inf_size as usize;
         let src_buffer = &frame.rgba_data;
 
-        // 仅在分辨率变化时重新计算映射表
-        if self.src_width != src_w || self.src_height != src_h {
-            let scale_x = src_w as f32 / dst_size as f32;
-            let scale_y = src_h as f32 / dst_size as f32;
-
-            self.resize_x_map = (0..dst_size)
-                .map(|x| ((x as f32 * scale_x) as usize).min(src_w - 1))
-                .collect();
-            self.resize_y_map = (0..dst_size)
-                .map(|y| ((y as f32 * scale_y) as usize).min(src_h - 1))
-                .collect();
-            self.src_width = src_w;
-            self.src_height = src_h;
-            eprintln!("📐 Resize映射表已更新: {}x{} → {}", src_w, src_h, dst_size);
-        }
-
-        // 预分配输出 (RGBA → RGB直接转换)
-        let mut rgb_data = vec![0u8; dst_size * dst_size * 3];
-
-        // 并行处理每一行 - 多核加速
-        rgb_data
-            .par_chunks_mut(dst_size * 3)
-            .enumerate()
-            .for_each(|(y, row_chunk)| {
-                let src_y = self.resize_y_map[y];
-                let src_row_base = src_y * src_w * 4;
-                
-                for (x, pixel) in row_chunk.chunks_exact_mut(3).enumerate() {
-                    let src_x = self.resize_x_map[x];
-                    let src_idx = src_row_base + src_x * 4;
-                    // RGBA → RGB
-                    pixel[0] = src_buffer[src_idx];
-                    pixel[1] = src_buffer[src_idx + 1];
-                    pixel[2] = src_buffer[src_idx + 2];
-                }
-            });
+        // 纯CPU优化 (避免GPU数据传输开销)
+        let rgb_data = Self::cpu_resize_rgba_to_rgb(
+            src_buffer,
+            src_w,
+            src_h,
+            dst_size,
+            &mut self.resize_x_map,
+            &mut self.resize_y_map,
+            &mut self.src_width,
+            &mut self.src_height,
+        );
 
         let resize_ms = t2.elapsed().as_secs_f64() * 1000.0;
 

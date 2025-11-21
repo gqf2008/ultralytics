@@ -94,7 +94,7 @@ fn software_decode(
     // 构建FFmpeg上下文
     let ctx = FfmpegContext::builder()
         .input(input)
-        // .filter_descs(["scale=1920x1080"].into()) // 让FFmpeg用sws_scale转换YUV→RGBA
+        .filter_descs(["scale=1920x1080"].into()) // 让FFmpeg用sws_scale转换YUV→RGBA
         .output(out)
         .build()
         .map_err(|e| format!("构建失败: {}", e))?;

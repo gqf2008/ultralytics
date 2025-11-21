@@ -5,13 +5,13 @@
 VCPKG_ROOT = "D:\\workspace\\vcpkg"
 VLC_LIB_DIR = "D:\\my\\Desktop\\vlc-3.0.21"
 # FFmpeg 路径 (如果 vcpkg 已安装 ffmpeg)
-# FFMPEG_DIR = "D:\\workspace\\vcpkg\\installed\\x64-windows"
+FFMPEG_DIR = "D:\\workspace\\vcpkg\\installed\\x64-windows-static-md"
 
 [build]
 # 使用所有 CPU 核心加速编译
 jobs = 8
 
-# 链接器参数: 添加 DirectShow 和 Media Foundation 库 (FFmpeg dshow/mf 需要)
+# 链接器参数: 添加 FFmpeg 依赖库 (仅用于可执行文件)
 [target.x86_64-pc-windows-msvc]
 rustflags = [
     "-C",
@@ -20,4 +20,12 @@ rustflags = [
     "link-arg=/DEFAULTLIB:mfuuid.lib",
     "-C",
     "link-arg=/DEFAULTLIB:mfplat.lib",
+    "-C",
+    "link-arg=/DEFAULTLIB:ole32.lib",
+    "-C",
+    "link-arg=/DEFAULTLIB:oleaut32.lib",
+    "-C",
+    "link-arg=/DEFAULTLIB:vfw32.lib",
+    "-C",
+    "link-arg=/DEFAULTLIB:secur32.lib",
 ]
