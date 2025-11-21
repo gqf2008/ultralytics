@@ -200,3 +200,4 @@ calibration_*.npy
 *.dll
 *.exe
 *.lock
+*.bat
