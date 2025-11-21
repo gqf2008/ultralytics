@@ -130,7 +130,7 @@ pub struct ControlPanel {
     pub pan_offset: macroquad::prelude::Vec2,
 
     // 背景纹理
-    pub panel_bg_egui: Option<egui::TextureHandle>,
+    pub panel_bg_egui: Option<TextureHandle>,
     pub panel_bg_size: Option<(usize, usize)>,
 }
 
@@ -321,7 +321,7 @@ impl ControlPanel {
             .default_size(window_size)
             .resizable(true)
             .frame(egui::Frame::NONE)
-            .title_bar(false)
+            .title_bar(true)
             .show(ctx, |ui| {
                 // 先绘制背景图像到最底层,完全填充窗口
                 if let Some(tex) = self.panel_bg_egui.as_ref() {
