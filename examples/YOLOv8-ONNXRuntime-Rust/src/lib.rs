@@ -4,10 +4,10 @@ pub mod config; // 模型配置参数
 pub mod detection; // 智能检测系统
 pub mod input; // 视频输入系统
 pub mod models; // 模型接口与具体实现
+pub mod ort_backend;
+pub mod renderer;
 pub mod ui_config; // UI配置面板
 pub mod utils; // 工具模块
-
-pub mod ort_backend;
 // pub mod renderer; // ggez 版本的 renderer (旧版)
 // macroquad 版本的 renderer 在 bin/sentinel_macroquad.rs 中直接引用
 pub mod xbus;

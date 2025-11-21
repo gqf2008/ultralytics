@@ -14,14 +14,9 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use clap::Parser;
 use egui_macroquad::egui;
-use macroquad::miniquad::window;
-use macroquad::{conf, prelude::*};
-use yolov8_rs::detection;
+use macroquad::prelude::*;
 use yolov8_rs::detection::INF_SIZE;
-
-#[path = "../renderer_macroquad.rs"]
-mod renderer_macroquad;
-use renderer_macroquad::Renderer;
+use yolov8_rs::renderer::Renderer;
 
 /// 数字卫兵参数
 #[derive(Parser, Debug)]
@@ -88,6 +83,7 @@ async fn main() {
                 .push("msyh".to_owned());
 
             ctx.set_fonts(fonts);
+            ctx.set_pixels_per_point(ctx.zoom_factor());
         });
     }
 
@@ -137,28 +133,23 @@ async fn main() {
     };
 
     println!("🚀 数字卫兵系统启动");
-    println!("📦 检测模型: {}", detect_model);
-    println!("🎯 跟踪算法: {}", args.tracker);
-    println!("🧍 姿态估计: {}", if args.pose { "启用" } else { "禁用" });
-    println!("\n💡 请在UI中配置输入源并点击'立即切换输入源'按钮启动视频流");
+    println!("📦 默认检测模型: {}", detect_model);
+    println!("🎯 默认跟踪算法: {}", args.tracker);
+    println!(
+        "🧍 默认姿态估计: {}",
+        if args.pose { "启用" } else { "禁用" }
+    );
+    println!("\n💡 请在UI中配置输入源,检测模块将在启动视频流时自动启动");
     println!();
 
     // 创建配置更新通道
     let (config_tx, config_rx) = crossbeam_channel::bounded(5);
 
-    // 不再自动启动解码器,等待用户在UI中配置
-    // 解码器将通过 switch_decoder_source() 函数启动
+    // 不再自动启动解码器和检测器,等待用户在UI中配置
+    // 解码器和检测器将通过 switch_decoder_source() 函数启动
 
-    // 启动检测线程
-    let detect_model_clone = detect_model.clone();
-    let tracker = args.tracker.clone();
-    let pose_enabled = args.pose;
-
-    std::thread::spawn(move || {
-        let mut det = detection::Detector::new(detect_model_clone, INF_SIZE, tracker, pose_enabled);
-        det.set_config_receiver(config_rx);
-        det.run();
-    });
+    // 不在这里启动检测线程,而是在首次启动解码器时启动
+    // 这样可以避免不必要的资源占用
 
     // 提取干净的模型名称
     let detect_model_name = detect_model.replace("models/", "").replace(".onnx", "");
@@ -166,13 +157,13 @@ async fn main() {
     let mut renderer = Renderer::new(detect_model_name, String::new(), args.tracker.clone());
     renderer.set_config_sender(config_tx.clone());
 
-    // 发送初始模型参数 (确保启动参数生效)
-    if let Err(e) = config_tx.try_send(yolov8_rs::detection::types::ConfigMessage::UpdateParams {
-        conf_threshold: renderer.confidence_threshold,
-        iou_threshold: renderer.iou_threshold,
-    }) {
-        eprintln!("⚠️ 发送初始参数失败: {}", e);
-    }
+    // 保存检测器启动参数,供后续使用
+    renderer.set_detector_params(
+        detect_model.clone(),
+        INF_SIZE,
+        args.tracker.clone(),
+        args.pose,
+    );
 
     println!("✅ 系统就绪,等待配置输入源...\n");
 

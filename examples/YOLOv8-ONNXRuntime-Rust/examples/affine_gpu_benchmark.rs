@@ -1,6 +1,5 @@
 /// GPU加速仿射变换性能测试
 /// 比较 CPU标准实现、SIMD优化、GPU加速的性能差异
-
 use std::time::Instant;
 use yolov8_rs::utils::affine_transform::*;
 
@@ -12,7 +11,7 @@ use yolov8_rs::utils::affine_transform_wgpu::WgpuAffineTransform;
 
 fn create_test_image(width: usize, height: usize) -> Vec<u8> {
     let mut img = vec![0u8; width * height * 3];
-    
+
     // 创建渐变图案
     for y in 0..height {
         for x in 0..width {
@@ -22,7 +21,7 @@ fn create_test_image(width: usize, height: usize) -> Vec<u8> {
             img[idx + 2] = (((x + y) * 255) / (width + height)) as u8;
         }
     }
-    
+
     // 添加图案
     for y in height / 4..3 * height / 4 {
         for x in width / 4..3 * width / 4 {
@@ -32,24 +31,16 @@ fn create_test_image(width: usize, height: usize) -> Vec<u8> {
             img[idx + 2] = 64;
         }
     }
-    
+
     img
 }
 
-fn benchmark_standard(
-    src: &[u8],
-    width: usize,
-    height: usize,
-    iterations: usize,
-) -> f64 {
-    let matrix = AffineMatrix::rotation_around_center(
-        (width / 2) as f32,
-        (height / 2) as f32,
-        30.0,
-    );
-    
+fn benchmark_standard(src: &[u8], width: usize, height: usize, iterations: usize) -> f64 {
+    let matrix =
+        AffineMatrix::rotation_around_center((width / 2) as f32, (height / 2) as f32, 30.0);
+
     let start = Instant::now();
-    
+
     for _ in 0..iterations {
         let _ = warp_affine_rgb(
             src,
@@ -61,25 +52,17 @@ fn benchmark_standard(
             BorderMode::Constant(0),
         );
     }
-    
+
     start.elapsed().as_secs_f64()
 }
 
 #[cfg(target_arch = "x86_64")]
-fn benchmark_simd(
-    src: &[u8],
-    width: usize,
-    height: usize,
-    iterations: usize,
-) -> f64 {
-    let matrix = AffineMatrix::rotation_around_center(
-        (width / 2) as f32,
-        (height / 2) as f32,
-        30.0,
-    );
-    
+fn benchmark_simd(src: &[u8], width: usize, height: usize, iterations: usize) -> f64 {
+    let matrix =
+        AffineMatrix::rotation_around_center((width / 2) as f32, (height / 2) as f32, 30.0);
+
     let start = Instant::now();
-    
+
     for _ in 0..iterations {
         let _ = warp_affine_rgb_simd(
             src,
@@ -91,7 +74,7 @@ fn benchmark_simd(
             BorderMode::Constant(0),
         );
     }
-    
+
     start.elapsed().as_secs_f64()
 }
 
@@ -103,14 +86,11 @@ fn benchmark_gpu(
     height: u32,
     iterations: usize,
 ) -> f64 {
-    let matrix = AffineMatrix::rotation_around_center(
-        (width / 2) as f32,
-        (height / 2) as f32,
-        30.0,
-    );
-    
+    let matrix =
+        AffineMatrix::rotation_around_center((width / 2) as f32, (height / 2) as f32, 30.0);
+
     let start = Instant::now();
-    
+
     for _ in 0..iterations {
         let _ = gpu_context.warp_affine_rgb(
             src,
@@ -122,7 +102,7 @@ fn benchmark_gpu(
             BorderMode::Constant(0),
         );
     }
-    
+
     start.elapsed().as_secs_f64()
 }
 
@@ -152,19 +132,22 @@ fn main() {
     ];
 
     for (width, height, name, iterations) in test_sizes {
-        println!("=" .repeat(60));
+        println!("=".repeat(60));
         println!("测试分辨率: {} ({}x{})", name, width, height);
         println!("迭代次数: {}", iterations);
         println!("-".repeat(60));
-        
+
         let img = create_test_image(width as usize, height as usize);
-        
+
         // CPU标准实现
         println!("\n📊 CPU标准实现:");
         let time_standard = benchmark_standard(&img, width as usize, height as usize, iterations);
         let fps_standard = iterations as f64 / time_standard;
         println!("  总时间: {:.3}s", time_standard);
-        println!("  平均每帧: {:.3}ms", time_standard * 1000.0 / iterations as f64);
+        println!(
+            "  平均每帧: {:.3}ms",
+            time_standard * 1000.0 / iterations as f64
+        );
         println!("  处理速度: {:.2} FPS", fps_standard);
 
         // SIMD优化
@@ -174,9 +157,12 @@ fn main() {
             let time_simd = benchmark_simd(&img, width as usize, height as usize, iterations);
             let fps_simd = iterations as f64 / time_simd;
             println!("  总时间: {:.3}s", time_simd);
-            println!("  平均每帧: {:.3}ms", time_simd * 1000.0 / iterations as f64);
+            println!(
+                "  平均每帧: {:.3}ms",
+                time_simd * 1000.0 / iterations as f64
+            );
             println!("  处理速度: {:.2} FPS", fps_simd);
-            
+
             let speedup_simd = time_standard / time_simd;
             println!("  vs CPU: {:.2}x 加速", speedup_simd);
         }
@@ -188,7 +174,7 @@ fn main() {
         println!("  总时间: {:.3}s", time_gpu);
         println!("  平均每帧: {:.3}ms", time_gpu * 1000.0 / iterations as f64);
         println!("  处理速度: {:.2} FPS", fps_gpu);
-        
+
         let speedup_gpu = time_standard / time_gpu;
         println!("  vs CPU: {:.2}x 加速", speedup_gpu);
 
@@ -202,7 +188,7 @@ fn main() {
         println!();
     }
 
-    println!("=" .repeat(60));
+    println!("=".repeat(60));
     println!("=== 测试完成 ===");
 }
 

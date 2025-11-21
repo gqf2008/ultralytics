@@ -190,21 +190,9 @@ impl Detector {
     pub fn run(&mut self) {
         println!("🔍 检测模块启动");
 
-        // 初始加载模型
-        let mut detect_model = self
-            .load_model(&self.detect_model_path)
-            .expect("Initial model load failed");
-
-        // 检查姿态估计支持
-        {
-            let m = detect_model.lock().unwrap();
-            if self.pose_enabled && !m.supports_task(YOLOTask::Pose) {
-                println!("⚠️ 姿态估计: 已请求但模型不支持,将禁用");
-                self.pose_enabled = false;
-            } else if self.pose_enabled {
-                println!("✅ 姿态估计: 已启用");
-            }
-        }
+        // 延迟加载模型 - 等待第一帧数据时才加载
+        let mut detect_model: Option<Arc<Mutex<Box<dyn Model>>>> = None;
+        let mut model_loaded = false;
 
         // 订阅解码帧 - 仅将任务放入队列
         let inf_size = self.inf_size;
@@ -220,7 +208,7 @@ impl Detector {
             }
         });
 
-        println!("✅ 检测模块已订阅DecodedFrame,等待数据...");
+        println!("✅ 检测模块已订阅DecodedFrame,等待视频流启动...");
 
         // 工作线程: 异步处理检测任务
         loop {
@@ -232,18 +220,21 @@ impl Detector {
                             conf_threshold,
                             iou_threshold,
                         } => {
-                            let mut model = detect_model.lock().unwrap();
-                            model.set_conf(conf_threshold);
-                            model.set_iou(iou_threshold);
+                            if let Some(ref model) = detect_model {
+                                let mut m = model.lock().unwrap();
+                                m.set_conf(conf_threshold);
+                                m.set_iou(iou_threshold);
+                            }
                         }
                         ConfigMessage::SwitchModel(model_path) => {
                             println!("🔄 正在切换模型: {}", model_path);
                             if let Some(new_model) = self.load_model(&model_path) {
-                                detect_model = new_model;
-                                self.detect_model_path = model_path;
+                                detect_model = Some(new_model);
+                                self.detect_model_path = model_path.clone();
+                                model_loaded = true;
 
                                 // 重新检查姿态估计支持
-                                let m = detect_model.lock().unwrap();
+                                let m = detect_model.as_ref().unwrap().lock().unwrap();
                                 if self.pose_enabled && !m.supports_task(YOLOTask::Pose) {
                                     println!("⚠️ 新模型不支持姿态估计,已自动禁用");
                                     self.pose_enabled = false;
@@ -261,12 +252,14 @@ impl Detector {
                         ConfigMessage::TogglePose(enabled) => {
                             self.pose_enabled = enabled;
                             if enabled {
-                                let m = detect_model.lock().unwrap();
-                                if !m.supports_task(YOLOTask::Pose) {
-                                    println!("⚠️ 当前模型不支持姿态估计,无法启用");
-                                    self.pose_enabled = false;
-                                } else {
-                                    println!("✅ 姿态估计已启用");
+                                if let Some(ref model) = detect_model {
+                                    let m = model.lock().unwrap();
+                                    if !m.supports_task(YOLOTask::Pose) {
+                                        println!("⚠️ 当前模型不支持姿态估计,无法启用");
+                                        self.pose_enabled = false;
+                                    } else {
+                                        println!("✅ 姿态估计已启用");
+                                    }
                                 }
                             } else {
                                 println!("🚫 姿态估计已禁用");
@@ -286,8 +279,36 @@ impl Detector {
 
             match rx.recv() {
                 Ok(frame) => {
+                    // 延迟加载: 收到第一帧时才加载模型
+                    if !model_loaded {
+                        println!("📥 收到第一帧数据,开始加载模型: {}", self.detect_model_path);
+                        match self.load_model(&self.detect_model_path) {
+                            Some(model) => {
+                                // 检查姿态估计支持
+                                {
+                                    let m = model.lock().unwrap();
+                                    if self.pose_enabled && !m.supports_task(YOLOTask::Pose) {
+                                        println!("⚠️ 姿态估计: 已请求但模型不支持,将禁用");
+                                        self.pose_enabled = false;
+                                    } else if self.pose_enabled {
+                                        println!("✅ 姿态估计: 已启用");
+                                    }
+                                }
+                                detect_model = Some(model);
+                                model_loaded = true;
+                                println!("✅ 模型加载完成,开始处理视频流");
+                            }
+                            None => {
+                                eprintln!("❌ 模型加载失败,跳过此帧");
+                                continue;
+                            }
+                        }
+                    }
+
                     if self.detection_enabled {
-                        self.process_frame(frame, &detect_model, inf_size);
+                        if let Some(ref model) = detect_model {
+                            self.process_frame(frame, model, inf_size);
+                        }
                     } else {
                         // 如果检测被禁用，仍然需要发送空结果以维持FPS统计和画面更新
                         // 或者直接跳过处理，取决于架构设计。

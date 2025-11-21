@@ -317,19 +317,17 @@ struct AffineParams {
 }
 
 @group(0) @binding(0) var<uniform> params: AffineParams;
-@group(0) @binding(1) var<storage, read> src: array<u32>;  // 打包为u32以提高性能
+@group(0) @binding(1) var<storage, read> src: array<u32>;
 @group(0) @binding(2) var<storage, read_write> dst: array<u32>;
 
-// 从打包的u32中提取RGB值
-fn get_pixel(buffer: ptr<storage, array<u32>, read>, idx: u32) -> vec3<f32> {
+// 从打包的u32数组中读取RGB像素
+fn get_pixel(idx: u32) -> vec3<f32> {
     let base_idx = idx * 3u;
-    let word_idx = base_idx / 4u;
-    let byte_offset = base_idx % 4u;
-    
     var rgb: vec3<f32>;
+    
     for (var c = 0u; c < 3u; c = c + 1u) {
         let pixel_byte_idx = base_idx + c;
-        let word = (*buffer)[pixel_byte_idx / 4u];
+        let word = src[pixel_byte_idx / 4u];
         let shift = (pixel_byte_idx % 4u) * 8u;
         rgb[c] = f32((word >> shift) & 0xFFu);
     }
@@ -337,8 +335,8 @@ fn get_pixel(buffer: ptr<storage, array<u32>, read>, idx: u32) -> vec3<f32> {
     return rgb;
 }
 
-// 将RGB值写入打包的u32
-fn set_pixel(buffer: ptr<storage, array<u32>, read_write>, idx: u32, rgb: vec3<f32>) {
+// 将RGB像素写入打包的u32数组
+fn set_pixel(idx: u32, rgb: vec3<f32>) {
     let base_idx = idx * 3u;
     
     for (var c = 0u; c < 3u; c = c + 1u) {
@@ -349,8 +347,8 @@ fn set_pixel(buffer: ptr<storage, array<u32>, read_write>, idx: u32, rgb: vec3<f
         
         let val = u32(clamp(rgb[c], 0.0, 255.0));
         let mask = 0xFFu << shift;
-        let old_word = (*buffer)[word_idx];
-        (*buffer)[word_idx] = (old_word & ~mask) | (val << shift);
+        let old_word = dst[word_idx];
+        dst[word_idx] = (old_word & ~mask) | (val << shift);
     }
 }
 
@@ -376,8 +374,8 @@ fn warp_affine_bilinear(@builtin(global_invocation_id) global_id: vec3<u32>) {
     // 边界检查
     if (src_x < 0.0 || src_x >= f32(params.src_width - 1u) ||
         src_y < 0.0 || src_y >= f32(params.src_height - 1u)) {
-        let border_rgb = vec3<f32>(params.border_value, params.border_value, params.border_value);
-        set_pixel(&dst, dst_idx, border_rgb);
+        let border_rgb = vec3<f32>(params.border_value);
+        set_pixel(dst_idx, border_rgb);
         return;
     }
     
@@ -392,16 +390,16 @@ fn warp_affine_bilinear(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let idx10 = y0 * params.src_width + x0 + 1u;
     let idx11 = (y0 + 1u) * params.src_width + x0 + 1u;
     
-    let p00 = get_pixel(&src, idx00);
-    let p01 = get_pixel(&src, idx01);
-    let p10 = get_pixel(&src, idx10);
-    let p11 = get_pixel(&src, idx11);
+    let p00 = get_pixel(idx00);
+    let p01 = get_pixel(idx01);
+    let p10 = get_pixel(idx10);
+    let p11 = get_pixel(idx11);
     
     let v0 = p00 + (p10 - p00) * fx;
     let v1 = p01 + (p11 - p01) * fx;
     let result = v0 + (v1 - v0) * fy;
     
-    set_pixel(&dst, dst_idx, result);
+    set_pixel(dst_idx, result);
 }
 
 // 最近邻插值
@@ -426,13 +424,13 @@ fn warp_affine_nearest(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let dst_idx = dst_y * params.dst_width + dst_x;
     
     if (ix < 0 || ix >= i32(params.src_width) || iy < 0 || iy >= i32(params.src_height)) {
-        let border_rgb = vec3<f32>(params.border_value, params.border_value, params.border_value);
-        set_pixel(&dst, dst_idx, border_rgb);
+        let border_rgb = vec3<f32>(params.border_value);
+        set_pixel(dst_idx, border_rgb);
         return;
     }
     
     let src_idx = u32(iy) * params.src_width + u32(ix);
-    let rgb = get_pixel(&src, src_idx);
-    set_pixel(&dst, dst_idx, rgb);
+    let rgb = get_pixel(src_idx);
+    set_pixel(dst_idx, rgb);
 }
 "#;
