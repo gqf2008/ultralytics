@@ -86,8 +86,8 @@ fn software_decode(
             ("rtsp_transport", "tcp"),
             ("buffer_size", "67108864"),
             ("rtsp_flags", "prefer_tcp"),
-            ("thread", "4"),
-            ("thread_queue_size", "1024"),
+            // ("thread", "4"),
+            // ("thread_queue_size", "1024"),
         ]
         .into(),
     );

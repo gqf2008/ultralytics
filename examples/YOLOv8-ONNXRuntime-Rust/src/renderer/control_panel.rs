@@ -324,13 +324,13 @@ impl ControlPanel {
             .title_bar(true)
             .show(ctx, |ui| {
                 // 先绘制背景图像到最底层,完全填充窗口
-                if let Some(tex) = self.panel_bg_egui.as_ref() {
-                    let painter = ui.painter();
-                    let rect = ui.available_rect_before_wrap();
-                    let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
-                    let tint = egui::Color32::from_rgba_premultiplied(255, 255, 255, 180);
-                    painter.image(tex.id(), rect, uv, tint);
-                }
+                // if let Some(tex) = self.panel_bg_egui.as_ref() {
+                //     let painter = ui.painter();
+                //     let rect = ui.available_rect_before_wrap();
+                //     let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+                //     let tint = egui::Color32::from_rgba_premultiplied(255, 255, 255, 180);
+                //     painter.image(tex.id(), rect, uv, tint);
+                // }
 
                 // 使用ScrollArea包裹UI内容,允许窗口垂直调整大小
                 let actions = egui::ScrollArea::vertical()
