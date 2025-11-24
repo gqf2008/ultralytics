@@ -21,6 +21,8 @@ futures-util = "0.3"
 ffmpeg-next = "7.0"                                  # 用于提取原始数据包
 parking_lot = "0.12"
 crossbeam-channel = "0.5"
+ratatui = "0.28"
+crossterm = "0.28"
 
 # 引用主项目的依赖
 yolov8-rs = { path = ".." }

@@ -91,6 +91,12 @@ async fn log_frontend(msg: String) {
     println!("🖥️ [Frontend]: {}", msg);
 }
 
+/// 读取文本文件
+#[tauri::command]
+async fn read_text_file(path: String) -> Result<String, String> {
+    std::fs::read_to_string(&path).map_err(|e| format!("Failed to read file: {}", e))
+}
+
 /// 启动 RTSP 流
 #[tauri::command]
 async fn start_rtsp_stream(
@@ -143,6 +149,7 @@ fn main() {
             mark_frame_processed,
             start_rtsp_stream,
             log_frontend,
+            read_text_file,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

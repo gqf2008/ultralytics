@@ -11,107 +11,291 @@
             box-sizing: border-box;
         }
         body {
-            background: #1a1a1a;
+            background: #000;
             overflow: hidden;
-            font-family: 'Microsoft YaHei', sans-serif;
+            font-family: 'Microsoft YaHei', 'Segoe UI', sans-serif;
             color: #fff;
         }
         #app {
             width: 100vw;
             height: 100vh;
-            display: flex;
-            flex-direction: column;
+            position: relative;
         }
-        /* 控制面板 */
-        #control-panel {
-            background: #2a2a2a;
-            border-bottom: 1px solid #fff;
-            padding: 12px 20px;
-            display: flex;
-            gap: 10px;
-            align-items: center;
-        }
-        #rtsp-url {
-            flex: 1;
-            padding: 8px 12px;
-            background: #333;
-            border: 1px solid #555;
-            border-radius: 4px;
-            color: #fff;
-            font-size: 14px;
-        }
-        #rtsp-url:focus {
-            outline: none;
-            border-color: #0078d4;
-        }
-        button {
-            padding: 8px 20px;
-            border: none;
-            border-radius: 4px;
-            cursor: pointer;
-            font-size: 14px;
-            font-weight: bold;
-            transition: all 0.2s;
-        }
-        #start-btn {
-            background: #0078d4;
-            color: white;
-        }
-        #start-btn:hover {
-            background: #005a9e;
-        }
-        #stop-btn {
-            background: #d13438;
-            color: white;
-            display: none;
-        }
-        #stop-btn:hover {
-            background: #a02629;
-        }
-        /* 视频区域 */
-        #container {
-            flex: 1;
-            position: relative; /* 关键：作为绝对定位的参考点 */
-            background: #000;
-            overflow: hidden;
-        }
+        
+        /* 视频画布 - 全屏铺满 */
         #canvas {
             position: absolute;
             top: 0;
             left: 0;
+            width: 100vw;
+            height: 100vh;
+            background: #000;
         }
-        #stats {
+        
+        /* 控制面板 - TUI 风格,半透明,可拖拽,可调整大小 */
+        #control-panel {
             position: absolute;
-            top: 10px;
-            left: 10px;
-            background: rgba(40, 40, 40, 0.9);
-            color: #fff;
-            padding: 15px;
-            border: 1px solid #fff;
-            font-size: 14px;
-            min-width: 200px;
-        }
-        .stat-row {
-            margin: 5px 0;
-        }
-        .stat-label {
-            color: #888;
-        }
-        .stat-value {
-            color: #0f0;
-            font-weight: bold;
-        }
-        #status {
-            position: absolute;
-            bottom: 20px;
+            top: 20px;
             left: 50%;
             transform: translateX(-50%);
-            background: rgba(0, 120, 212, 0.9);
-            padding: 8px 20px;
-            border-radius: 20px;
+            background: rgba(0, 0, 0, 0.75);
+            border: 2px solid #fff;
+            border-radius: 0;
+            padding: 0;
+            z-index: 100;
+            min-width: 600px;
+            resize: both;
+            overflow: hidden;
+            font-family: 'Courier New', monospace;
+        }
+        
+        #control-panel:hover {
+            background: rgba(0, 0, 0, 0.85);
+        }
+        
+        /* TUI 风格标题栏 */
+        #panel-header {
+            padding: 8px 16px;
+            cursor: move;
+            background: #000;
+            border-bottom: 2px solid #fff;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            user-select: none;
+        }
+        
+        #panel-title {
+            font-size: 14px;
+            font-weight: bold;
+            color: #fff;
+            letter-spacing: 2px;
+            text-transform: uppercase;
+        }
+        
+        #panel-body {
+            padding: 16px;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            max-height: 600px;
+            overflow: hidden;
+            transition: max-height 0.3s ease, padding 0.3s ease;
+        }
+        
+        #control-panel.collapsed #panel-body {
+            max-height: 0;
+            padding: 0 16px;
+        }
+        
+        /* 折叠按钮 */
+        #toggle-btn {
+            background: none;
+            border: none;
+            color: #fff;
+            cursor: pointer;
+            font-size: 16px;
+            padding: 0 8px;
+            transition: transform 0.3s ease;
+        }
+        
+        #toggle-btn:hover {
+            background: none;
+            color: #fff;
+            transform: scale(1.2);
+        }
+        
+        #control-panel.collapsed #toggle-btn {
+            transform: rotate(180deg);
+        }
+        
+        /* 统计信息区域 */
+        #stats-section {
+            border: 1px solid #fff;
+            padding: 12px;
+            background: rgba(0, 0, 0, 0.5);
+        }
+        
+        #stats-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 16px;
             font-size: 13px;
+        }
+        
+        .stat-item {
+            text-align: center;
+        }
+        
+        .stat-label {
+            color: #888;
+            font-size: 11px;
+            margin-bottom: 4px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+        
+        .stat-value {
+            color: #fff;
+            font-size: 18px;
+            font-weight: bold;
+            font-family: 'Courier New', monospace;
+        }
+        
+        .input-row {
+            display: flex;
+            gap: 12px;
+            align-items: center;
+        }
+        
+        .input-wrapper {
+            flex: 1;
+            position: relative;
+        }
+        
+        #rtsp-url {
+            width: 100%;
+            padding: 8px 12px;
+            padding-right: 40px;
+            background: #000;
+            border: 1px solid #fff;
+            border-radius: 0;
+            color: #fff;
+            font-size: 13px;
+            font-family: 'Courier New', monospace;
+        }
+        
+        #rtsp-url::placeholder {
+            color: #666;
+        }
+        
+        #rtsp-url:focus {
+            outline: none;
+            border-color: #fff;
+            box-shadow: 0 0 0 1px #fff;
+        }
+        
+        /* 下拉按钮 */
+        #history-toggle {
+            position: absolute;
+            right: 12px;
+            top: 50%;
+            transform: translateY(-50%);
+            background: none;
+            border: none;
+            color: rgba(255, 255, 255, 0.5);
+            cursor: pointer;
+            padding: 4px 8px;
+            font-size: 16px;
+            transition: all 0.2s;
+        }
+        
+        #history-toggle:hover {
+            color: rgba(255, 255, 255, 0.9);
+        }
+        
+        /* 历史记录下拉列表 - TUI 风格 */
+        #history-dropdown {
+            position: absolute;
+            top: calc(100% + 4px);
+            left: 0;
+            right: 0;
+            background: rgba(0, 0, 0, 0.95);
+            border: 1px solid #fff;
+            border-radius: 0;
+            max-height: 300px;
+            overflow-y: auto;
+            z-index: 1000;
             display: none;
         }
+        
+        #history-dropdown.show {
+            display: block;
+        }
+        
+        .history-item {
+            padding: 8px 12px;
+            cursor: pointer;
+            border-bottom: 1px solid #333;
+            color: #fff;
+            font-size: 12px;
+            font-family: 'Courier New', monospace;
+        }
+        
+        .history-item:last-child {
+            border-bottom: none;
+        }
+        
+        .history-item:hover {
+            background: #fff;
+            color: #000;
+        }
+        
+        /* 滚动条样式 */
+        #history-dropdown::-webkit-scrollbar {
+            width: 8px;
+        }
+        
+        #history-dropdown::-webkit-scrollbar-track {
+            background: rgba(0, 0, 0, 0.2);
+            border-radius: 4px;
+        }
+        
+        #history-dropdown::-webkit-scrollbar-thumb {
+            background: rgba(255, 255, 255, 0.3);
+            border-radius: 4px;
+        }
+        
+        #history-dropdown::-webkit-scrollbar-thumb:hover {
+            background: rgba(255, 255, 255, 0.5);
+        }
+        button {
+            padding: 8px 20px;
+            border: 2px solid #fff;
+            border-radius: 0;
+            cursor: pointer;
+            font-size: 13px;
+            font-weight: bold;
+            font-family: 'Courier New', monospace;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            background: #000;
+            color: #fff;
+            transition: all 0.15s;
+        }
+        
+        button:hover {
+            background: #fff;
+            color: #000;
+        }
+        
+        #start-btn {
+            flex: 1;
+        }
+        
+        #stop-btn {
+            flex: 1;
+            display: none;
+        }
+        
+        /* 状态提示 */
+        #status {
+            position: absolute;
+            bottom: 30px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: rgba(0, 0, 0, 0.9);
+            border: 2px solid #fff;
+            padding: 10px 24px;
+            font-size: 13px;
+            font-weight: bold;
+            display: none;
+            z-index: 100;
+            font-family: 'Courier New', monospace;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+        
         #status.show {
             display: block;
         }
@@ -119,39 +303,61 @@
 </head>
 <body>
     <div id="app">
-        <!-- 控制面板 -->
-        <div id="control-panel">
-            <input 
-                type="text" 
-                id="rtsp-url" 
-                placeholder="输入 RTSP 地址或本地视频路径 (如: assets/videos/test.mp4)"
-                value=""
-            />
-            <button id="start-btn">▶ 启动</button>
-            <button id="stop-btn">■ 停止</button>
-        </div>
+        <!-- 全屏视频画布 -->
+        <canvas id="canvas"></canvas>
         
-        <!-- 视频区域 -->
-        <div id="container">
-            <canvas id="canvas"></canvas>
-            
-            <div id="stats">
-                <div class="stat-row">
-                    <span class="stat-label">FPS:</span>
-                    <span class="stat-value" id="fps">0</span>
-                </div>
-                <div class="stat-row">
-                    <span class="stat-label">分辨率:</span>
-                    <span class="stat-value" id="resolution">0x0</span>
-                </div>
-                <div class="stat-row">
-                    <span class="stat-label">延迟:</span>
-                    <span class="stat-value" id="latency">0ms</span>
+        <!-- 控制面板浮层 - TUI 风格 -->
+        <div id="control-panel">
+            <div id="panel-header">
+                <div id="panel-title">┊ RTSP Stream Control ┊</div>
+                <div style="display: flex; align-items: center; gap: 12px;">
+                    <div style="color: #666; font-size: 10px; font-family: 'Courier New', monospace;">DRAG TO MOVE</div>
+                    <button id="toggle-btn" title="折叠/展开">▲</button>
                 </div>
             </div>
-            
-            <div id="status"></div>
+            <div id="panel-body">
+                <!-- 统计信息 -->
+                <div id="stats-section">
+                    <div id="stats-grid">
+                        <div class="stat-item">
+                            <div class="stat-label">FPS</div>
+                            <div class="stat-value" id="fps">0</div>
+                        </div>
+                        <div class="stat-item">
+                            <div class="stat-label">Resolution</div>
+                            <div class="stat-value" id="resolution">0x0</div>
+                        </div>
+                        <div class="stat-item">
+                            <div class="stat-label">Latency</div>
+                            <div class="stat-value" id="latency">0ms</div>
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- 输入框 -->
+                <div class="input-row">
+                    <div class="input-wrapper">
+                        <input 
+                            type="text" 
+                            id="rtsp-url" 
+                            placeholder="ENTER RTSP URL OR LOCAL VIDEO PATH"
+                            value=""
+                        />
+                        <button id="history-toggle" title="历史记录">▼</button>
+                        <div id="history-dropdown"></div>
+                    </div>
+                </div>
+                
+                <!-- 按钮 -->
+                <div class="input-row">
+                    <button id="start-btn">► Start</button>
+                    <button id="stop-btn">■ Stop</button>
+                </div>
+            </div>
         </div>
+        
+        <!-- 状态提示 -->
+        <div id="status"></div>
     </div>
 
     <script type="module" src="/main.js"></script>
