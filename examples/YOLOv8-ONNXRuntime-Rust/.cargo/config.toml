@@ -28,4 +28,6 @@ rustflags = [
     "link-arg=/DEFAULTLIB:vfw32.lib",
     "-C",
     "link-arg=/DEFAULTLIB:secur32.lib",
+    "-C",
+    "link-arg=/DEFAULTLIB:bcrypt.lib",
 ]

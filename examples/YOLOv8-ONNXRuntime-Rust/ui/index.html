@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>YOLOv8 实时监控</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            background: #1a1a1a;
+            overflow: hidden;
+            font-family: 'Microsoft YaHei', sans-serif;
+            color: #fff;
+        }
+        #app {
+            width: 100vw;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+        /* 控制面板 */
+        #control-panel {
+            background: #2a2a2a;
+            border-bottom: 1px solid #fff;
+            padding: 12px 20px;
+            display: flex;
+            gap: 10px;
+            align-items: center;
+        }
+        #rtsp-url {
+            flex: 1;
+            padding: 8px 12px;
+            background: #333;
+            border: 1px solid #555;
+            border-radius: 4px;
+            color: #fff;
+            font-size: 14px;
+        }
+        #rtsp-url:focus {
+            outline: none;
+            border-color: #0078d4;
+        }
+        button {
+            padding: 8px 20px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: bold;
+            transition: all 0.2s;
+        }
+        #start-btn {
+            background: #0078d4;
+            color: white;
+        }
+        #start-btn:hover {
+            background: #005a9e;
+        }
+        #stop-btn {
+            background: #d13438;
+            color: white;
+            display: none;
+        }
+        #stop-btn:hover {
+            background: #a02629;
+        }
+        /* 视频区域 */
+        #container {
+            flex: 1;
+            position: relative; /* 关键：作为绝对定位的参考点 */
+            background: #000;
+            overflow: hidden;
+        }
+        #canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+        }
+        #stats {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: rgba(40, 40, 40, 0.9);
+            color: #fff;
+            padding: 15px;
+            border: 1px solid #fff;
+            font-size: 14px;
+            min-width: 200px;
+        }
+        .stat-row {
+            margin: 5px 0;
+        }
+        .stat-label {
+            color: #888;
+        }
+        .stat-value {
+            color: #0f0;
+            font-weight: bold;
+        }
+        #status {
+            position: absolute;
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: rgba(0, 120, 212, 0.9);
+            padding: 8px 20px;
+            border-radius: 20px;
+            font-size: 13px;
+            display: none;
+        }
+        #status.show {
+            display: block;
+        }
+    </style>
+</head>
+<body>
+    <div id="app">
+        <!-- 控制面板 -->
+        <div id="control-panel">
+            <input 
+                type="text" 
+                id="rtsp-url" 
+                placeholder="输入 RTSP 地址或本地视频路径 (如: assets/videos/test.mp4)"
+                value=""
+            />
+            <button id="start-btn">▶ 启动</button>
+            <button id="stop-btn">■ 停止</button>
+        </div>
+        
+        <!-- 视频区域 -->
+        <div id="container">
+            <canvas id="canvas"></canvas>
+            
+            <div id="stats">
+                <div class="stat-row">
+                    <span class="stat-label">FPS:</span>
+                    <span class="stat-value" id="fps">0</span>
+                </div>
+                <div class="stat-row">
+                    <span class="stat-label">分辨率:</span>
+                    <span class="stat-value" id="resolution">0x0</span>
+                </div>
+                <div class="stat-row">
+                    <span class="stat-label">延迟:</span>
+                    <span class="stat-value" id="latency">0ms</span>
+                </div>
+            </div>
+            
+            <div id="status"></div>
+        </div>
+    </div>
+
+    <script type="module" src="/main.js"></script>
+</body>
+</html>

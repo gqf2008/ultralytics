@@ -94,13 +94,32 @@ fn software_decode(
     // 构建FFmpeg上下文
     let ctx = FfmpegContext::builder()
         .input(input)
-        .filter_descs(["scale=1920x1080"].into()) // 让FFmpeg用sws_scale转换YUV→RGBA
+        .filter_descs(["scale=1920x1080"].into()) // 移除固定缩放,使用原始分辨率
         .output(out)
-        .build()
-        .map_err(|e| format!("构建失败: {}", e))?;
+        .build();
 
-    let sch = ctx.start().map_err(|e| format!("启动失败: {}", e))?;
-    println!("✅ CPU软件解码启动成功");
+    let ctx = match ctx {
+        Ok(c) => {
+            println!("✅ FFmpeg上下文构建成功");
+            c
+        }
+        Err(e) => {
+            eprintln!("❌ FFmpeg上下文构建失败: {:?}", e);
+            return Err(format!("构建失败: {:?}", e).into());
+        }
+    };
+
+    let sch = match ctx.start() {
+        Ok(s) => {
+            println!("✅ FFmpeg调度器启动成功");
+            s
+        }
+        Err(e) => {
+            eprintln!("❌ FFmpeg调度器启动失败: {:?}", e);
+            return Err(format!("启动失败: {:?}", e).into());
+        }
+    };
+    println!("✅ CPU软件解码启动成功,开始接收帧...");
 
     let _ = sch.wait();
     Ok(())
