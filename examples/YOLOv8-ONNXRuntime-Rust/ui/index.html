@@ -13,7 +13,7 @@
         body {
             background: #000;
             overflow: hidden;
-            font-family: 'Microsoft YaHei', 'Segoe UI', sans-serif;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif;
             color: #fff;
         }
         #app {
@@ -32,114 +32,156 @@
             background: #000;
         }
         
-        /* 控制面板 - TUI 风格,半透明,可拖拽,可调整大小 */
+        /* 控制面板 - 玻璃态风格 */
         #control-panel {
             position: absolute;
-            top: 20px;
+            top: 24px;
             left: 50%;
             transform: translateX(-50%);
-            background: rgba(0, 0, 0, 0.75);
-            border: 2px solid #fff;
-            border-radius: 0;
+            background: linear-gradient(135deg, rgba(255, 255, 255, 0.08) 0%, rgba(255, 255, 255, 0.05) 100%);
+            backdrop-filter: blur(20px) saturate(180%);
+            -webkit-backdrop-filter: blur(20px) saturate(180%);
+            border: 1px solid rgba(255, 255, 255, 0.18);
+            border-radius: 16px;
+            box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.4), 
+                        0 0 0 1px rgba(255, 255, 255, 0.05) inset;
             padding: 0;
             z-index: 100;
-            min-width: 600px;
-            resize: both;
+            min-width: 660px;
             overflow: hidden;
-            font-family: 'Courier New', monospace;
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
         }
         
         #control-panel:hover {
-            background: rgba(0, 0, 0, 0.85);
+            background: linear-gradient(135deg, rgba(255, 255, 255, 0.12) 0%, rgba(255, 255, 255, 0.08) 100%);
+            box-shadow: 0 12px 48px 0 rgba(0, 0, 0, 0.5),
+                        0 0 0 1px rgba(255, 255, 255, 0.1) inset;
         }
         
-        /* TUI 风格标题栏 */
+        /* 现代化标题栏 */
         #panel-header {
-            padding: 8px 16px;
+            padding: 16px 24px;
             cursor: move;
-            background: #000;
-            border-bottom: 2px solid #fff;
+            background: linear-gradient(to right, rgba(99, 102, 241, 0.15), rgba(139, 92, 246, 0.15));
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
             display: flex;
             justify-content: space-between;
             align-items: center;
             user-select: none;
+            transition: background 0.3s ease;
+        }
+        
+        #panel-header:hover {
+            background: linear-gradient(to right, rgba(99, 102, 241, 0.2), rgba(139, 92, 246, 0.2));
         }
         
         #panel-title {
-            font-size: 14px;
-            font-weight: bold;
-            color: #fff;
-            letter-spacing: 2px;
-            text-transform: uppercase;
+            font-size: 16px;
+            font-weight: 600;
+            background: linear-gradient(to right, #818cf8, #a78bfa);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            letter-spacing: 0.5px;
         }
         
         #panel-body {
-            padding: 16px;
+            padding: 24px;
             display: flex;
             flex-direction: column;
-            gap: 12px;
-            max-height: 600px;
+            gap: 20px;
+            max-height: 800px;
             overflow: hidden;
-            transition: max-height 0.3s ease, padding 0.3s ease;
+            transition: max-height 0.4s cubic-bezier(0.4, 0, 0.2, 1), 
+                        padding 0.4s cubic-bezier(0.4, 0, 0.2, 1),
+                        opacity 0.3s ease;
+            opacity: 1;
         }
         
         #control-panel.collapsed #panel-body {
             max-height: 0;
-            padding: 0 16px;
+            padding: 0 24px;
+            opacity: 0;
         }
         
         /* 折叠按钮 */
         #toggle-btn {
-            background: none;
-            border: none;
+            width: 32px;
+            height: 32px;
+            background: rgba(255, 255, 255, 0.1);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            border-radius: 8px;
             color: #fff;
             cursor: pointer;
-            font-size: 16px;
-            padding: 0 8px;
-            transition: transform 0.3s ease;
+            font-size: 14px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
         }
         
         #toggle-btn:hover {
-            background: none;
-            color: #fff;
-            transform: scale(1.2);
+            background: rgba(255, 255, 255, 0.2);
+            transform: scale(1.1);
         }
         
         #control-panel.collapsed #toggle-btn {
             transform: rotate(180deg);
         }
         
+        #control-panel.collapsed #toggle-btn:hover {
+            transform: rotate(180deg) scale(1.1);
+        }
+        
         /* 统计信息区域 */
         #stats-section {
-            border: 1px solid #fff;
-            padding: 12px;
-            background: rgba(0, 0, 0, 0.5);
+            background: linear-gradient(135deg, rgba(99, 102, 241, 0.1) 0%, rgba(139, 92, 246, 0.1) 100%);
+            border: 1px solid rgba(255, 255, 255, 0.15);
+            border-radius: 12px;
+            padding: 20px;
+            transition: all 0.3s ease;
+        }
+        
+        #stats-section:hover {
+            border-color: rgba(255, 255, 255, 0.25);
+            box-shadow: 0 4px 16px rgba(99, 102, 241, 0.15);
         }
         
         #stats-grid {
             display: grid;
             grid-template-columns: repeat(3, 1fr);
-            gap: 16px;
-            font-size: 13px;
+            gap: 24px;
         }
         
         .stat-item {
             text-align: center;
+            padding: 12px;
+            border-radius: 8px;
+            background: rgba(255, 255, 255, 0.03);
+            transition: all 0.3s ease;
+        }
+        
+        .stat-item:hover {
+            background: rgba(255, 255, 255, 0.06);
+            transform: translateY(-2px);
         }
         
         .stat-label {
-            color: #888;
-            font-size: 11px;
-            margin-bottom: 4px;
-            text-transform: uppercase;
-            letter-spacing: 1px;
+            color: rgba(255, 255, 255, 0.6);
+            font-size: 12px;
+            margin-bottom: 8px;
+            font-weight: 500;
+            letter-spacing: 0.5px;
         }
         
         .stat-value {
-            color: #fff;
-            font-size: 18px;
-            font-weight: bold;
-            font-family: 'Courier New', monospace;
+            background: linear-gradient(to right, #60a5fa, #a78bfa);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            font-size: 24px;
+            font-weight: 700;
+            letter-spacing: -0.5px;
         }
         
         .input-row {
@@ -155,71 +197,98 @@
         
         #rtsp-url {
             width: 100%;
-            padding: 8px 12px;
-            padding-right: 40px;
-            background: #000;
-            border: 1px solid #fff;
-            border-radius: 0;
+            padding: 14px 80px 14px 16px;
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid rgba(255, 255, 255, 0.15);
+            border-radius: 10px;
             color: #fff;
-            font-size: 13px;
-            font-family: 'Courier New', monospace;
+            font-size: 14px;
+            transition: all 0.3s ease;
+            font-family: 'SF Mono', Monaco, 'Cascadia Code', monospace;
         }
         
         #rtsp-url::placeholder {
-            color: #666;
+            color: rgba(255, 255, 255, 0.3);
         }
         
         #rtsp-url:focus {
             outline: none;
-            border-color: #fff;
-            box-shadow: 0 0 0 1px #fff;
+            background: rgba(255, 255, 255, 0.08);
+            border-color: rgba(139, 92, 246, 0.5);
+            box-shadow: 0 0 0 3px rgba(139, 92, 246, 0.1);
         }
         
-        /* 下拉按钮 */
-        #history-toggle {
+        /* 下拉按钮组 */
+        #history-toggle, #clear-history {
             position: absolute;
-            right: 12px;
             top: 50%;
             transform: translateY(-50%);
-            background: none;
-            border: none;
-            color: rgba(255, 255, 255, 0.5);
+            background: rgba(255, 255, 255, 0.08);
+            border: 1px solid rgba(255, 255, 255, 0.15);
+            border-radius: 6px;
+            color: rgba(255, 255, 255, 0.7);
             cursor: pointer;
-            padding: 4px 8px;
-            font-size: 16px;
-            transition: all 0.2s;
+            padding: 6px 10px;
+            font-size: 14px;
+            transition: all 0.2s ease;
         }
         
-        #history-toggle:hover {
-            color: rgba(255, 255, 255, 0.9);
+        #history-toggle {
+            right: 44px;
         }
         
-        /* 历史记录下拉列表 - TUI 风格 */
+        #clear-history {
+            right: 10px;
+            padding: 6px 8px;
+        }
+        
+        #history-toggle:hover, #clear-history:hover {
+            background: rgba(255, 255, 255, 0.15);
+            border-color: rgba(255, 255, 255, 0.3);
+            color: #fff;
+        }
+        
+        /* 历史记录下拉列表 */
         #history-dropdown {
             position: absolute;
-            top: calc(100% + 4px);
+            top: calc(100% + 8px);
             left: 0;
             right: 0;
-            background: rgba(0, 0, 0, 0.95);
-            border: 1px solid #fff;
-            border-radius: 0;
-            max-height: 300px;
+            background: linear-gradient(135deg, rgba(30, 30, 40, 0.95) 0%, rgba(20, 20, 30, 0.95) 100%);
+            backdrop-filter: blur(20px);
+            border: 1px solid rgba(255, 255, 255, 0.15);
+            border-radius: 10px;
+            max-height: 320px;
             overflow-y: auto;
             z-index: 1000;
             display: none;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
         }
         
         #history-dropdown.show {
             display: block;
+            animation: slideDown 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+        
+        @keyframes slideDown {
+            from {
+                opacity: 0;
+                transform: translateY(-10px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
         }
         
         .history-item {
-            padding: 8px 12px;
+            padding: 12px 16px;
             cursor: pointer;
-            border-bottom: 1px solid #333;
-            color: #fff;
-            font-size: 12px;
-            font-family: 'Courier New', monospace;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+            color: rgba(255, 255, 255, 0.8);
+            font-size: 13px;
+            font-family: 'SF Mono', Monaco, monospace;
+            transition: all 0.2s ease;
         }
         
         .history-item:last-child {
@@ -227,73 +296,177 @@
         }
         
         .history-item:hover {
-            background: #fff;
-            color: #000;
+            background: linear-gradient(to right, rgba(99, 102, 241, 0.2), rgba(139, 92, 246, 0.2));
+            color: #fff;
+            padding-left: 20px;
         }
         
         /* 滚动条样式 */
         #history-dropdown::-webkit-scrollbar {
-            width: 8px;
+            width: 6px;
         }
         
         #history-dropdown::-webkit-scrollbar-track {
-            background: rgba(0, 0, 0, 0.2);
-            border-radius: 4px;
+            background: transparent;
         }
         
         #history-dropdown::-webkit-scrollbar-thumb {
-            background: rgba(255, 255, 255, 0.3);
-            border-radius: 4px;
+            background: rgba(255, 255, 255, 0.2);
+            border-radius: 3px;
         }
         
         #history-dropdown::-webkit-scrollbar-thumb:hover {
-            background: rgba(255, 255, 255, 0.5);
+            background: rgba(255, 255, 255, 0.3);
         }
-        button {
-            padding: 8px 20px;
-            border: 2px solid #fff;
-            border-radius: 0;
-            cursor: pointer;
+        
+        /* 音量控制 */
+        .volume-control {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+            padding: 16px;
+            background: rgba(255, 255, 255, 0.03);
+            border-radius: 10px;
+            border: 1px solid rgba(255, 255, 255, 0.08);
+        }
+        
+        .volume-control label {
+            color: rgba(255, 255, 255, 0.7);
             font-size: 13px;
-            font-weight: bold;
-            font-family: 'Courier New', monospace;
-            text-transform: uppercase;
-            letter-spacing: 1px;
-            background: #000;
+            font-weight: 500;
+            min-width: 80px;
+        }
+        
+        #volume-slider {
+            flex: 1;
+            height: 6px;
+            background: linear-gradient(to right, rgba(99, 102, 241, 0.2), rgba(139, 92, 246, 0.2));
+            border-radius: 3px;
+            outline: none;
+            -webkit-appearance: none;
+            appearance: none;
+        }
+        
+        #volume-slider::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            appearance: none;
+            width: 18px;
+            height: 18px;
+            border-radius: 50%;
+            background: linear-gradient(135deg, #818cf8, #a78bfa);
+            cursor: pointer;
+            box-shadow: 0 2px 8px rgba(139, 92, 246, 0.4);
+            transition: all 0.2s ease;
+        }
+        
+        #volume-slider::-webkit-slider-thumb:hover {
+            transform: scale(1.2);
+            box-shadow: 0 4px 12px rgba(139, 92, 246, 0.6);
+        }
+        
+        #volume-value {
+            color: rgba(255, 255, 255, 0.9);
+            font-size: 14px;
+            font-weight: 600;
+            min-width: 50px;
+            text-align: right;
+        }
+        
+        /* 按钮样式 */
+        button {
+            padding: 14px 28px;
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            border-radius: 10px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 600;
+            letter-spacing: 0.3px;
+            background: linear-gradient(135deg, rgba(99, 102, 241, 0.2), rgba(139, 92, 246, 0.2));
             color: #fff;
-            transition: all 0.15s;
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            position: relative;
+            overflow: hidden;
+        }
+        
+        button::before {
+            content: '';
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            width: 0;
+            height: 0;
+            border-radius: 50%;
+            background: rgba(255, 255, 255, 0.2);
+            transform: translate(-50%, -50%);
+            transition: width 0.6s, height 0.6s;
+        }
+        
+        button:hover::before {
+            width: 300px;
+            height: 300px;
         }
         
         button:hover {
-            background: #fff;
-            color: #000;
+            background: linear-gradient(135deg, rgba(99, 102, 241, 0.3), rgba(139, 92, 246, 0.3));
+            border-color: rgba(255, 255, 255, 0.3);
+            transform: translateY(-2px);
+            box-shadow: 0 8px 24px rgba(139, 92, 246, 0.3);
+        }
+        
+        button:active {
+            transform: translateY(0);
         }
         
         #start-btn {
             flex: 1;
+            background: linear-gradient(135deg, rgba(34, 197, 94, 0.2), rgba(22, 163, 74, 0.2));
+        }
+        
+        #start-btn:hover {
+            background: linear-gradient(135deg, rgba(34, 197, 94, 0.3), rgba(22, 163, 74, 0.3));
+            box-shadow: 0 8px 24px rgba(34, 197, 94, 0.3);
         }
         
         #stop-btn {
             flex: 1;
             display: none;
+            background: linear-gradient(135deg, rgba(239, 68, 68, 0.2), rgba(220, 38, 38, 0.2));
+        }
+        
+        #stop-btn:hover {
+            background: linear-gradient(135deg, rgba(239, 68, 68, 0.3), rgba(220, 38, 38, 0.3));
+            box-shadow: 0 8px 24px rgba(239, 68, 68, 0.3);
         }
         
         /* 状态提示 */
         #status {
             position: absolute;
-            bottom: 30px;
+            bottom: 32px;
             left: 50%;
             transform: translateX(-50%);
-            background: rgba(0, 0, 0, 0.9);
-            border: 2px solid #fff;
-            padding: 10px 24px;
-            font-size: 13px;
-            font-weight: bold;
+            background: linear-gradient(135deg, rgba(99, 102, 241, 0.9), rgba(139, 92, 246, 0.9));
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            border-radius: 12px;
+            padding: 12px 28px;
+            font-size: 14px;
+            font-weight: 600;
             display: none;
             z-index: 100;
-            font-family: 'Courier New', monospace;
-            text-transform: uppercase;
-            letter-spacing: 1px;
+            letter-spacing: 0.3px;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+            animation: statusSlideUp 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+        
+        @keyframes statusSlideUp {
+            from {
+                opacity: 0;
+                transform: translateX(-50%) translateY(20px);
+            }
+            to {
+                opacity: 1;
+                transform: translateX(-50%) translateY(0);
+            }
         }
         
         #status.show {
@@ -306,14 +479,11 @@
         <!-- 全屏视频画布 -->
         <canvas id="canvas"></canvas>
         
-        <!-- 控制面板浮层 - TUI 风格 -->
+        <!-- 控制面板浮层 - 玻璃态风格 -->
         <div id="control-panel">
             <div id="panel-header">
-                <div id="panel-title">┊ RTSP Stream Control ┊</div>
-                <div style="display: flex; align-items: center; gap: 12px;">
-                    <div style="color: #666; font-size: 10px; font-family: 'Courier New', monospace;">DRAG TO MOVE</div>
-                    <button id="toggle-btn" title="折叠/展开">▲</button>
-                </div>
+                <div id="panel-title">🎥 RTSP Stream Control</div>
+                <button id="toggle-btn" title="折叠/展开">▲</button>
             </div>
             <div id="panel-body">
                 <!-- 统计信息 -->
@@ -325,7 +495,7 @@
                         </div>
                         <div class="stat-item">
                             <div class="stat-label">Resolution</div>
-                            <div class="stat-value" id="resolution">0x0</div>
+                            <div class="stat-value" id="resolution">0×0</div>
                         </div>
                         <div class="stat-item">
                             <div class="stat-label">Latency</div>
@@ -335,11 +505,10 @@
                 </div>
                 
                 <!-- 音量控制 -->
-                <div class="input-row" style="align-items: center; gap: 8px;">
-                    <label style="color: #fff; font-size: 12px; min-width: 80px;">🔊 Volume:</label>
-                    <input type="range" id="volume-slider" min="0" max="5" step="0.1" value="1.5" 
-                           style="flex: 1; height: 4px; background: #333; outline: none; border: 1px solid #666;">
-                    <span id="volume-value" style="color: #fff; font-size: 12px; min-width: 40px;">1.5x</span>
+                <div class="volume-control">
+                    <label>🔊 Volume</label>
+                    <input type="range" id="volume-slider" min="0" max="5" step="0.1" value="1.5">
+                    <span id="volume-value">1.5×</span>
                 </div>
                 
                 <!-- 输入框 -->
@@ -348,19 +517,19 @@
                         <input 
                             type="text" 
                             id="rtsp-url" 
-                            placeholder="ENTER RTSP URL OR LOCAL VIDEO PATH"
+                            placeholder="Enter RTSP URL or video path..."
                             value=""
                         />
                         <button id="history-toggle" title="历史记录">▼</button>
-                        <button id="clear-history" title="清空历史" style="font-size: 12px;">🗑️</button>
+                        <button id="clear-history" title="清空历史">🗑️</button>
                         <div id="history-dropdown"></div>
                     </div>
                 </div>
                 
                 <!-- 按钮 -->
                 <div class="input-row">
-                    <button id="start-btn">► Start</button>
-                    <button id="stop-btn">■ Stop</button>
+                    <button id="start-btn">▶ Start Stream</button>
+                    <button id="stop-btn">⏹ Stop Stream</button>
                 </div>
             </div>
         </div>
