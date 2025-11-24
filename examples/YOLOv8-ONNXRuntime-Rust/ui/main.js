@@ -56,6 +56,10 @@ class WebGLVideoRenderer {
         this.audioContext = null;
         this.audioQueue = [];
         this.nextAudioTime = 0;
+        this.audioCodec = null; // 记录音频编码格式
+        this.audioSampleRate = 8000;
+        this.audioChannels = 1;
+        this.audioGain = 1.5; // 音频增益降低到1.5倍,避免削波
         
         // 初始化 Canvas 尺寸为容器大小
         this.resizeCanvas();
@@ -72,6 +76,37 @@ class WebGLVideoRenderer {
     initAudioContext() {
         this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
         console.log('🔊 Audio Context initialized:', this.audioContext.sampleRate, 'Hz');
+        
+        // 添加测试音按钮
+        this.addTestAudioButton();
+    }
+    
+    addTestAudioButton() {
+        const testBtn = document.createElement('button');
+        testBtn.textContent = '🔊 测试音频';
+        testBtn.style.cssText = 'position: fixed; top: 10px; right: 10px; z-index: 10000; padding: 10px; background: #4CAF50; color: white; border: none; border-radius: 4px; cursor: pointer; font-family: monospace;';
+        testBtn.onclick = () => this.playTestTone();
+        document.body.appendChild(testBtn);
+    }
+    
+    playTestTone() {
+        console.log('🔔 Playing test tone...');
+        const oscillator = this.audioContext.createOscillator();
+        const gainNode = this.audioContext.createGain();
+        
+        oscillator.type = 'sine';
+        oscillator.frequency.setValueAtTime(440, this.audioContext.currentTime); // A4 音符
+        
+        gainNode.gain.setValueAtTime(0.3, this.audioContext.currentTime);
+        gainNode.gain.exponentialRampToValueAtTime(0.01, this.audioContext.currentTime + 0.5);
+        
+        oscillator.connect(gainNode);
+        gainNode.connect(this.audioContext.destination);
+        
+        oscillator.start(this.audioContext.currentTime);
+        oscillator.stop(this.audioContext.currentTime + 0.5);
+        
+        console.log('✅ Test tone played');
     }
     
     resizeCanvas() {
@@ -153,6 +188,16 @@ class WebGLVideoRenderer {
     }
     
     initAudioDecoder(codec = 'aac', sampleRate = 48000, channels = 2) {
+        this.audioCodec = codec;
+        this.audioSampleRate = sampleRate;
+        this.audioChannels = channels;
+        
+        // 如果是 PCM 格式,不需要 WebCodecs 解码器
+        if (codec === 'pcm_alaw' || codec === 'pcm_mulaw') {
+            console.log(`🎵 PCM audio detected: ${codec.toUpperCase()} ${sampleRate}Hz ${channels}ch - 直接播放`);
+            return;
+        }
+        
         if (!('AudioDecoder' in window)) {
             console.error('WebCodecs AudioDecoder not supported');
             return;
@@ -259,8 +304,112 @@ class WebGLVideoRenderer {
     }
     
     handleAudioChunk(data) {
-        // 音频处理 - 暂时跳过 (PCM_ALAW WebCodecs 可能不支持)
-        // 可以在这里实现 Web Audio API 播放
+        // PCM 格式 - Rust后端已解码为PCM16,直接播放
+        if (this.audioCodec === 'pcm_alaw' || this.audioCodec === 'pcm_mulaw') {
+            this.playPCM16(data);
+            return;
+        }
+        
+        // 其他格式使用 WebCodecs 解码
+        if (!this.audioDecoder || this.audioDecoder.state !== 'configured') {
+            console.warn('⚠️ Audio decoder not ready:', this.audioDecoder?.state);
+            return; // 音频解码器未就绪,静默跳过
+        }
+        
+        const chunk = new EncodedAudioChunk({
+            type: 'key', // 音频帧通常都是关键帧
+            timestamp: performance.now() * 1000,
+            data: data
+        });
+        
+        try {
+            this.audioDecoder.decode(chunk);
+        } catch(e) {
+            console.error('Audio decode error:', e);
+        }
+    }
+    
+    // PCM A-law 解码 (已废弃 - 后端处理)
+    playPCM_ALAW(compressedData) {
+        // 后端已解码,直接播放 PCM16
+        this.playPCM16(compressedData);
+    }
+    
+    // PCM μ-law 解码 (已废弃 - 后端处理)
+    playPCM_MULAW(compressedData) {
+        // 后端已解码,直接播放 PCM16
+        this.playPCM16(compressedData);
+    }
+    
+    // 播放后端已解码的 PCM16 数据 (Little Endian)
+    playPCM16(data) {
+        // 将 Uint8Array 转换为 Int16Array (Little Endian)
+        const pcmData = new Int16Array(data.buffer, data.byteOffset, data.byteLength / 2);
+        this.playPCMData(pcmData);
+    }
+    
+    // 播放 PCM 数据
+    playPCMData(pcmData) {
+        const sampleRate = this.audioSampleRate;
+        const channels = this.audioChannels;
+        const frameCount = pcmData.length / channels;
+        
+        // 检查采样值范围 (调试用)
+        let minVal = 32767, maxVal = -32768;
+        for (let i = 0; i < pcmData.length; i++) {
+            if (pcmData[i] < minVal) minVal = pcmData[i];
+            if (pcmData[i] > maxVal) maxVal = pcmData[i];
+        }
+        
+        if (Math.random() < 0.02) { // 2% 采样率打印范围信息
+            console.log(`🔊 [PCM] Min: ${minVal}, Max: ${maxVal}, Gain: ${this.audioGain}x`);
+        }
+        
+        // 如果 AudioContext 被挂起,尝试恢复
+        if (this.audioContext.state === 'suspended') {
+            console.warn('⚠️ AudioContext suspended, resuming...');
+            this.audioContext.resume();
+        }
+        
+        // 创建 AudioBuffer
+        const buffer = this.audioContext.createBuffer(channels, frameCount, sampleRate);
+        
+        // 转换 Int16 PCM 到 Float32 (-1.0 到 1.0),并应用增益
+        let clippedSamples = 0;
+        for (let ch = 0; ch < channels; ch++) {
+            const channelData = buffer.getChannelData(ch);
+            for (let i = 0; i < frameCount; i++) {
+                const sampleIndex = channels === 1 ? i : i * channels + ch;
+                let sample = pcmData[sampleIndex] / 32768.0; // 归一化到 -1.0~1.0
+                sample *= this.audioGain; // 应用增益
+                
+                // 软限幅防止削波 (使用 tanh 函数平滑限制)
+                if (Math.abs(sample) > 0.95) {
+                    sample = Math.tanh(sample * 0.8); // 平滑削波
+                    clippedSamples++;
+                }
+                
+                channelData[i] = sample;
+            }
+        }
+        
+        if (clippedSamples > 0 && Math.random() < 0.05) {
+            console.warn(`⚠️ [Audio] ${clippedSamples} samples clipped, consider reducing gain`);
+        }
+        
+        // 创建音频源并播放
+        const source = this.audioContext.createBufferSource();
+        source.buffer = buffer;
+        source.connect(this.audioContext.destination);
+        
+        // 计算播放时间,避免断续
+        const currentTime = this.audioContext.currentTime;
+        if (this.nextAudioTime < currentTime) {
+            this.nextAudioTime = currentTime;
+        }
+        
+        source.start(this.nextAudioTime);
+        this.nextAudioTime += buffer.duration;
     }
     
     // 保留旧的 handleChunk 方法用于 WebSocket (如果还在使用)
@@ -407,10 +556,23 @@ const startBtn = document.getElementById('start-btn');
 const stopBtn = document.getElementById('stop-btn');
 const statusDiv = document.getElementById('status');
 const historyToggle = document.getElementById('history-toggle');
+const clearHistory = document.getElementById('clear-history');
 const historyDropdown = document.getElementById('history-dropdown');
 const controlPanel = document.getElementById('control-panel');
 const panelHeader = document.getElementById('panel-header');
 const toggleBtn = document.getElementById('toggle-btn');
+const volumeSlider = document.getElementById('volume-slider');
+const volumeValue = document.getElementById('volume-value');
+
+// 音量控制
+volumeSlider.addEventListener('input', (e) => {
+    const gain = parseFloat(e.target.value);
+    if (renderer) {
+        renderer.audioGain = gain;
+    }
+    volumeValue.textContent = gain.toFixed(1) + 'x';
+    console.log(`🔊 [Volume] Gain set to ${gain.toFixed(1)}x`);
+});
 
 // 折叠/展开控制面板
 let isPanelCollapsed = false;
@@ -470,11 +632,7 @@ function dragEnd(e) {
 // 加载历史记录
 async function loadHistory() {
     try {
-        const history = await invoke('read_text_file', { 
-            path: 'rtsp_history.txt' 
-        });
-        
-        const urls = history.split('\n').filter(line => line.trim());
+        const urls = await invoke('get_rtsp_history');
         
         historyDropdown.innerHTML = '';
         
@@ -509,6 +667,21 @@ historyToggle.addEventListener('click', (e) => {
     }
 });
 
+// 清空历史记录
+clearHistory.addEventListener('click', async (e) => {
+    e.stopPropagation();
+    if (confirm('确定要清空所有历史记录吗?')) {
+        try {
+            await invoke('clear_rtsp_history');
+            showStatus('✅ 历史记录已清空');
+            historyDropdown.innerHTML = '<div class="history-item" style="color: rgba(255,255,255,0.4); cursor: default;">暂无历史记录</div>';
+        } catch (err) {
+            console.error('清空历史记录失败:', err);
+            showStatus('❌ 清空失败');
+        }
+    }
+});
+
 // 点击外部关闭下拉列表
 document.addEventListener('click', (e) => {
     if (!e.target.closest('.input-wrapper')) {
@@ -535,13 +708,12 @@ startBtn.addEventListener('click', async () => {
         startBtn.disabled = true;
         showStatus('🚀 正在启动...');
         
-        // 创建单个 Channel 只接收视频
-        const channel = new Channel();
+        // 创建两个独立的 Channel:视频和音频
+        const videoChannel = new Channel();
+        const audioChannel = new Channel();
         
-        channel.onmessage = (data) => {
-            console.log('[DEBUG] Channel received:', typeof data, data);
-            
-            // 尝试多种方式解析
+        // 视频 Channel 处理器
+        videoChannel.onmessage = (data) => {
             let binaryData = null;
             
             if (data instanceof Uint8Array) {
@@ -549,35 +721,36 @@ startBtn.addEventListener('click', async () => {
             } else if (data instanceof ArrayBuffer) {
                 binaryData = new Uint8Array(data);
             } else if (typeof data === 'object' && data !== null) {
-                console.log('[DEBUG] Object keys:', Object.keys(data));
-                console.log('[DEBUG] Object values:', Object.values(data));
-                // 尝试提取各种可能的字段
                 if (data.data) binaryData = data.data;
                 else if (data.payload) binaryData = data.payload;
                 else if (data.buffer) binaryData = data.buffer;
             }
             
             if (!binaryData) {
-                console.warn('⚠️ Cannot extract binary data from:', data);
+                console.warn('⚠️ 视频数据提取失败');
                 return;
             }
             
-            // 确保是 Uint8Array
             if (!(binaryData instanceof Uint8Array)) {
                 binaryData = new Uint8Array(binaryData);
             }
-            
-            console.log('[DEBUG] Binary data length:', binaryData.length, 'first bytes:', Array.from(binaryData.slice(0, 10)));
             
             // 检查是否为元数据(0xFF 0xFE)
             if (binaryData.length > 2 && binaryData[0] === 0xFF && binaryData[1] === 0xFE) {
                 const metadataStr = new TextDecoder().decode(binaryData.slice(2));
                 try {
                     const metadata = JSON.parse(metadataStr);
-                    console.log('📥 Metadata:', metadata);
+                    console.log('📥 收到元数据:', metadata);
+                    
+                    // 配置视频解码器
                     renderer.initDecoder(metadata.video_codec, metadata.width, metadata.height);
+                    
+                    // 配置音频解码器(如果有)
+                    if (metadata.audio_codec && metadata.audio_codec !== 'none') {
+                        renderer.initAudioDecoder(metadata.audio_codec, metadata.sample_rate, metadata.channels);
+                    }
                 } catch (e) {
-                    console.error('Metadata parse error:', e);
+                    console.error('元数据解析错误:', e);
                 }
             } else {
                 // 纯视频数据
@@ -585,8 +758,50 @@ startBtn.addEventListener('click', async () => {
             }
         };
         
-        const result = await invoke('start_rtsp_stream', { url, channel });
+        // 音频 Channel 处理器
+        let audioPacketCount = 0;
+        audioChannel.onmessage = (data) => {
+            audioPacketCount++;
+            
+            let binaryData = null;
+            
+            if (data instanceof Uint8Array) {
+                binaryData = data;
+            } else if (data instanceof ArrayBuffer) {
+                binaryData = new Uint8Array(data);
+            } else if (typeof data === 'object' && data !== null) {
+                if (data.data) binaryData = data.data;
+                else if (data.payload) binaryData = data.payload;
+                else if (data.buffer) binaryData = data.buffer;
+            }
+            
+            if (!binaryData) {
+                console.warn('⚠️ [Audio Channel] Cannot extract binary data');
+                return;
+            }
+            
+            if (!(binaryData instanceof Uint8Array)) {
+                binaryData = new Uint8Array(binaryData);
+            }
+            
+            // 处理音频数据
+            renderer.handleAudioChunk(binaryData);
+        };
+        
+        const result = await invoke('start_rtsp_stream', { 
+            url, 
+            videoChannel,
+            audioChannel 
+        });
         console.log(result);
+        
+        // 保存到历史记录
+        try {
+            await invoke('add_rtsp_history', { url });
+            console.log('✅ 已保存到历史记录');
+        } catch (e) {
+            console.warn('保存历史记录失败:', e);
+        }
         
         renderer.start();
         startBtn.style.display = 'none';

@@ -334,6 +334,14 @@
                     </div>
                 </div>
                 
+                <!-- 音量控制 -->
+                <div class="input-row" style="align-items: center; gap: 8px;">
+                    <label style="color: #fff; font-size: 12px; min-width: 80px;">🔊 Volume:</label>
+                    <input type="range" id="volume-slider" min="0" max="5" step="0.1" value="1.5" 
+                           style="flex: 1; height: 4px; background: #333; outline: none; border: 1px solid #666;">
+                    <span id="volume-value" style="color: #fff; font-size: 12px; min-width: 40px;">1.5x</span>
+                </div>
+                
                 <!-- 输入框 -->
                 <div class="input-row">
                     <div class="input-wrapper">
@@ -344,6 +352,7 @@
                             value=""
                         />
                         <button id="history-toggle" title="历史记录">▼</button>
+                        <button id="clear-history" title="清空历史" style="font-size: 12px;">🗑️</button>
                         <div id="history-dropdown"></div>
                     </div>
                 </div>

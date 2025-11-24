@@ -2,7 +2,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod rtsp_proxy;
-mod video_bridge;
 
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -97,12 +96,70 @@ async fn read_text_file(path: String) -> Result<String, String> {
     std::fs::read_to_string(&path).map_err(|e| format!("Failed to read file: {}", e))
 }
 
+/// 读取 RTSP 历史记录
+#[tauri::command]
+async fn get_rtsp_history() -> Result<Vec<String>, String> {
+    let path = "rtsp_history.txt";
+    match std::fs::read_to_string(path) {
+        Ok(content) => {
+            let urls: Vec<String> = content
+                .lines()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .collect();
+            Ok(urls)
+        }
+        Err(_) => Ok(Vec::new()), // 文件不存在返回空数组
+    }
+}
+
+/// 添加 RTSP 历史记录
+#[tauri::command]
+async fn add_rtsp_history(url: String) -> Result<(), String> {
+    let path = "rtsp_history.txt";
+
+    // 读取现有记录
+    let mut urls = match std::fs::read_to_string(path) {
+        Ok(content) => content
+            .lines()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect::<Vec<String>>(),
+        Err(_) => Vec::new(),
+    };
+
+    // 如果 URL已存在,先移除(保证最新的在最前面)
+    urls.retain(|u| u != &url);
+
+    // 添加到最前面
+    urls.insert(0, url);
+
+    // 限制最多保留 20 条记录
+    if urls.len() > 20 {
+        urls.truncate(20);
+    }
+
+    // 写回文件
+    let content = urls.join("\n");
+    std::fs::write(path, content).map_err(|e| format!("Failed to write history: {}", e))
+}
+
+/// 清空 RTSP 历史记录
+#[tauri::command]
+async fn clear_rtsp_history() -> Result<(), String> {
+    let path = "rtsp_history.txt";
+    std::fs::write(path, "").map_err(|e| format!("Failed to clear history: {}", e))
+}
+
 /// 启动 RTSP 流
 #[tauri::command]
 async fn start_rtsp_stream(
     app: AppHandle,
     url: String,
-    channel: tauri::ipc::Channel,
+    video_channel: tauri::ipc::Channel,
+    audio_channel: tauri::ipc::Channel,
 ) -> Result<String, String> {
     println!("🚀 启动 RTSP 流: {}", url);
 
@@ -116,7 +173,9 @@ async fn start_rtsp_stream(
 
     // 启动 RTSP 代理 (用于前端显示)
     let proxy_state = app.state::<ProxyState>();
-    proxy_state.proxy.start(url.clone(), Some(channel));
+    proxy_state
+        .proxy
+        .start(url.clone(), Some(video_channel), Some(audio_channel));
 
     Ok(format!("RTSP 流已启动 (Gen: {})", generation))
 }
@@ -150,6 +209,9 @@ fn main() {
             start_rtsp_stream,
             log_frontend,
             read_text_file,
+            get_rtsp_history,
+            add_rtsp_history,
+            clear_rtsp_history,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
