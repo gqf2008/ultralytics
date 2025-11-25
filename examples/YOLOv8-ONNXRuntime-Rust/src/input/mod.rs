@@ -1,3 +1,4 @@
+pub mod camera;
 /// 视频输入系统 (Video Input System)
 ///
 /// 独立工作线程,负责视频流解码与预处理
@@ -7,12 +8,13 @@
 /// - DecoderManager: 解码器管理器 (支持动态热切换)
 pub mod decode_filter;
 pub mod decoder;
-pub mod camera;
-pub mod desktop;
 pub mod decoder_manager;
+pub mod desktop;
 
+pub use camera::{get_camera_devices, CameraDecoder};
 pub use decode_filter::DecodeFilter;
-pub use decoder::{adaptive_decode, Decoder};
-pub use camera::{CameraDecoder, get_camera_devices};
+pub use decoder::Decoder;
+pub use decoder_manager::{
+    get_video_devices, should_stop, switch_decoder_source, DecoderManager, InputSource, VideoDevice,
+};
 pub use desktop::DesktopDecoder;
-pub use decoder_manager::{get_video_devices, switch_decoder_source, should_stop, DecoderManager, VideoDevice, InputSource};

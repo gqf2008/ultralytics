@@ -68,7 +68,7 @@ ureq = { version = "2.9.1" }
 ab_glyph = "0.2.29"
 
 # RTSP 视频流处理 (使用 vcpkg 静态库)
-ez-ffmpeg = { version = "0.5.6", features = ["static"] }
+ez-ffmpeg = { version = "0.6.0", features = ["static"] }
 
 # 高性能图像缩放
 fast_image_resize = { version = "5.3.0" }
@@ -89,6 +89,12 @@ rayon = "1.10"
 # Windows 剪贴板支持
 [target.'cfg(windows)'.dependencies]
 clipboard-win = "5.4"
+windows = { version = "0.58", features = [
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Direct3D_Fxc",
+    "Win32_Graphics_Dxgi_Common",
+] }
 
 # 高性能内存分配器 (替代系统默认分配器)
 mimalloc = { version = "0.1", default-features = false }

@@ -79,6 +79,8 @@ impl FrameFilter for DecodeFilter {
                 return Ok(None);
             }
 
+            // 检查帧格式
+            let format = (*frame.as_ptr()).format;
             let w = (*frame.as_ptr()).width as u32;
             let h = (*frame.as_ptr()).height as u32;
 
@@ -105,68 +107,106 @@ impl FrameFilter for DecodeFilter {
                 return Ok(None);
             }
 
-            // YUV420P数据指针
-            let y_plane = (*frame.as_ptr()).data[0];
-            let u_plane = (*frame.as_ptr()).data[1];
-            let v_plane = (*frame.as_ptr()).data[2];
-            let y_stride = (*frame.as_ptr()).linesize[0] as usize;
-            let uv_stride = (*frame.as_ptr()).linesize[1] as usize;
-
-            if y_plane.is_null() || u_plane.is_null() || v_plane.is_null() {
-                self.dropped_frames += 1;
-                if self.total_frames <= 10 {
-                    println!("⚠️ 丢弃帧 #{}: YUV指针为空", self.total_frames);
-                }
-                return Ok(None);
-            }
-
-            if y_stride < w as usize || uv_stride < (w as usize / 2) {
-                self.dropped_frames += 1;
-                if self.total_frames <= 10 {
-                    println!(
-                        "⚠️ 丢弃帧 #{}: 步长异常 y_stride={} uv_stride={}",
-                        self.total_frames, y_stride, uv_stride
-                    );
-                }
-                return Ok(None);
-            }
-
             self.count += 1;
 
-            // YUV420P → RGBA (SIMD优化版 - AVX2加速)
-            let pixel_count = (w * h) as usize;
-            let required_size = pixel_count * 4;
+            // 检测格式: 26=RGBA, 0=YUV420P
+            let rgba_data = if format == 26 {
+                // RGBA格式(vpp_qsv已完成GPU转换,零拷贝)
+                let rgba_plane = (*frame.as_ptr()).data[0];
+                let stride = (*frame.as_ptr()).linesize[0] as usize;
 
-            // 只在尺寸变化时重新分配Arc
-            if Arc::strong_count(&self.buffer) > 1 || self.buffer.len() != required_size {
-                self.buffer = Arc::new(vec![255; required_size]);
-            }
+                if rgba_plane.is_null() {
+                    self.dropped_frames += 1;
+                    return Ok(None);
+                }
 
-            let w_usize = w as usize;
-            let h_usize = h as usize;
+                let pixel_count = (w * h) as usize;
+                let required_size = pixel_count * 4;
+                let mut rgba_vec = vec![0u8; required_size];
 
-            // 获取可变引用并使用SIMD优化的YUV转换
-            let buffer = Arc::get_mut(&mut self.buffer).unwrap();
+                // 直接复制RGBA数据(已经是GPU转换好的)
+                for y in 0..(h as usize) {
+                    let src =
+                        std::slice::from_raw_parts(rgba_plane.add(y * stride), (w as usize) * 4);
+                    let dst_offset = y * (w as usize) * 4;
+                    rgba_vec[dst_offset..dst_offset + src.len()].copy_from_slice(src);
+                }
 
-            #[cfg(target_arch = "x86_64")]
-            {
-                if is_x86_feature_detected!("avx2") {
-                    yuv420p_to_rgba_avx2(
-                        y_plane, u_plane, v_plane, y_stride, uv_stride, buffer, w_usize, h_usize,
-                    );
-                } else {
+                if self.count == 1 {
+                    println!("🎨 检测到RGBA格式,使用GPU色彩转换(零CPU消耗)");
+                }
+
+                Arc::new(rgba_vec)
+            } else {
+                // YUV420P格式,使用CPU SIMD转换
+                if self.count == 1 {
+                    println!("🎨 检测到YUV格式,使用CPU AVX2转换");
+                }
+
+                let y_plane = (*frame.as_ptr()).data[0];
+                let u_plane = (*frame.as_ptr()).data[1];
+                let v_plane = (*frame.as_ptr()).data[2];
+                let y_stride = (*frame.as_ptr()).linesize[0] as usize;
+                let uv_stride = (*frame.as_ptr()).linesize[1] as usize;
+
+                if y_plane.is_null() || u_plane.is_null() || v_plane.is_null() {
+                    self.dropped_frames += 1;
+                    if self.total_frames <= 10 {
+                        println!("⚠️ 丢弃帧 #{}: YUV指针为空", self.total_frames);
+                    }
+                    return Ok(None);
+                }
+
+                if y_stride < w as usize || uv_stride < (w as usize / 2) {
+                    self.dropped_frames += 1;
+                    if self.total_frames <= 10 {
+                        println!(
+                            "⚠️ 丢弃帧 #{}: 步长异常 y_stride={} uv_stride={}",
+                            self.total_frames, y_stride, uv_stride
+                        );
+                    }
+                    return Ok(None);
+                }
+
+                // YUV420P → RGBA (SIMD优化版 - AVX2加速)
+                let pixel_count = (w * h) as usize;
+                let required_size = pixel_count * 4;
+
+                // 只在尺寸变化时重新分配Arc
+                if Arc::strong_count(&self.buffer) > 1 || self.buffer.len() != required_size {
+                    self.buffer = Arc::new(vec![255; required_size]);
+                }
+
+                let w_usize = w as usize;
+                let h_usize = h as usize;
+
+                // 获取可变引用并使用SIMD优化的YUV转换
+                let buffer = Arc::get_mut(&mut self.buffer).unwrap();
+
+                #[cfg(target_arch = "x86_64")]
+                {
+                    if is_x86_feature_detected!("avx2") {
+                        yuv420p_to_rgba_avx2(
+                            y_plane, u_plane, v_plane, y_stride, uv_stride, buffer, w_usize,
+                            h_usize,
+                        );
+                    } else {
+                        yuv420p_to_rgba_scalar(
+                            y_plane, u_plane, v_plane, y_stride, uv_stride, buffer, w_usize,
+                            h_usize,
+                        );
+                    }
+                }
+
+                #[cfg(not(target_arch = "x86_64"))]
+                {
                     yuv420p_to_rgba_scalar(
                         y_plane, u_plane, v_plane, y_stride, uv_stride, buffer, w_usize, h_usize,
                     );
                 }
-            }
 
-            #[cfg(not(target_arch = "x86_64"))]
-            {
-                yuv420p_to_rgba_scalar(
-                    y_plane, u_plane, v_plane, y_stride, uv_stride, buffer, w_usize, h_usize,
-                );
-            }
+                Arc::clone(&self.buffer)
+            };
 
             // 计算FPS
             if self.last.elapsed().as_secs_f64() >= 1.0 {
@@ -185,7 +225,7 @@ impl FrameFilter for DecodeFilter {
             }
 
             let decoded = DecodedFrame {
-                rgba_data: Arc::clone(&self.buffer), // 零拷贝共享
+                rgba_data, // GPU RGBA或CPU SIMD转换结果
                 width: w,
                 height: h,
                 decode_fps: self.current_fps,

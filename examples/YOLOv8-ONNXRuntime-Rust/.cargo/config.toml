@@ -30,4 +30,12 @@ rustflags = [
     "link-arg=/DEFAULTLIB:secur32.lib",
     "-C",
     "link-arg=/DEFAULTLIB:bcrypt.lib",
+    "-C",
+    "link-arg=/DEFAULTLIB:gdi32.lib",
+    "-C",
+    "link-arg=/DEFAULTLIB:user32.lib",
+    "-C",
+    "link-arg=/DEFAULTLIB:shell32.lib",
+    "-C",
+    "link-arg=/DEFAULTLIB:shlwapi.lib",
 ]

@@ -29,21 +29,69 @@ impl Decoder {
         println!("⚙️ 解码偏好: {:?}", self.preference);
 
         let filter = DecodeFilter::new(self.generation);
-        adaptive_decode(&self.rtsp_url, filter, &self.preference);
+
+        // 根据偏好选择解码方式
+        let result = match self.preference {
+            DecoderPreference::Qsv | DecoderPreference::Auto => qsv_decode(&self.rtsp_url, filter),
+            _ => software_decode(&self.rtsp_url, filter),
+        };
+
+        if let Err(e) = result {
+            eprintln!("❌ 解码出错: {}", e);
+        }
 
         println!("❌ RTSP解码器退出");
     }
 }
 
-/// 解码器偏好设置 (仅CPU软件解码)
+/// 解码器偏好设置
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum DecoderPreference {
-    Software,
+    Software, // CPU软件解码
+    Nvdec,    // NVIDIA硬件解码
+    Cuvid,    // CUDA视频解码
+    Qsv,      // Intel Quick Sync
+    Auto,     // 自动选择最优解码器
 }
 
 impl DecoderPreference {
     pub fn name(&self) -> &str {
-        "CPU软件解码"
+        match self {
+            Self::Software => "CPU软件解码",
+            Self::Nvdec => "NVDEC硬件解码",
+            Self::Cuvid => "CUVID硬件解码",
+            Self::Qsv => "Intel QSV硬件解码",
+            Self::Auto => "自动检测",
+        }
+    }
+
+    pub fn decoder_name(&self, codec: &str) -> &str {
+        match self {
+            Self::Software => match codec {
+                "hevc" | "h265" => "hevc",
+                _ => "h264",
+            },
+            Self::Nvdec => match codec {
+                "hevc" | "h265" => "hevc_cuvid",
+                _ => "h264_cuvid",
+            },
+            Self::Cuvid => match codec {
+                "hevc" | "h265" => "hevc_cuvid",
+                _ => "h264_cuvid",
+            },
+            Self::Qsv | Self::Auto => match codec {
+                "hevc" | "h265" => "hevc_qsv", // Intel QSV HEVC硬解码
+                _ => "h264_qsv",
+            },
+        }
+    }
+
+    pub fn hwaccel_filter(&self) -> &'static str {
+        match self {
+            Self::Nvdec | Self::Cuvid => "hwdownload,format=nv12",
+            Self::Qsv | Self::Auto => "hwdownload,format=nv12", // QSV先下载为NV12,CPU转换
+            Self::Software => "",
+        }
     }
 }
 
@@ -56,27 +104,6 @@ fn software_decode(
 
     filter.decoder_name = "CPU软件解码".to_string();
 
-    // 清除可能存在的硬件加速环境变量
-    std::env::remove_var("FFMPEG_HWACCEL");
-
-    // RTSP传输优化
-    std::env::set_var("FFMPEG_RTSP_TRANSPORT", "tcp");
-    std::env::set_var("FFMPEG_RTSP_FLAGS", "prefer_tcp");
-    std::env::set_var("FFMPEG_BUFFER_SIZE", "8192000");
-
-    // 低延迟参数
-    std::env::set_var("FFMPEG_FLAGS", "low_delay");
-    std::env::set_var("FFMPEG_FFLAGS", "nobuffer");
-
-    // 解码质量优化
-    std::env::set_var("FFMPEG_SKIP_FRAME", "noref");
-    std::env::set_var("FFMPEG_SKIP_LOOP_FILTER", "noref");
-    std::env::set_var("FFMPEG_ERR_DETECT", "careful");
-
-    // 多线程解码
-    std::env::set_var("FFMPEG_THREADS", "auto");
-    std::env::set_var("FFMPEG_THREAD_TYPE", "frame+slice");
-
     let pipe: FramePipelineBuilder = AVMediaType::AVMEDIA_TYPE_VIDEO.into();
     let pipe = pipe.filter("decode", Box::new(filter));
     let out = create_null_output().add_frame_pipeline(pipe);
@@ -86,18 +113,11 @@ fn software_decode(
             ("rtsp_transport", "tcp"),
             ("buffer_size", "67108864"),
             ("rtsp_flags", "prefer_tcp"),
-            // ("thread", "4"),
-            // ("thread_queue_size", "1024"),
         ]
         .into(),
     );
-    // 构建FFmpeg上下文
-    let ctx = FfmpegContext::builder()
-        .input(input)
-        .filter_descs(["scale=1920x1080"].into()) // 移除固定缩放,使用原始分辨率
-        .output(out)
-        .build();
 
+    let ctx = FfmpegContext::builder().input(input).output(out).build();
     let ctx = match ctx {
         Ok(c) => {
             println!("✅ FFmpeg上下文构建成功");
@@ -125,16 +145,53 @@ fn software_decode(
     Ok(())
 }
 
-/// CPU软件解码(简化版)
-pub fn adaptive_decode(rtsp_url: &str, filter: DecodeFilter, _preference: &DecoderPreference) {
-    println!("🔄 解码策略: CPU软件解码");
+/// Intel QSV硬件解码
+fn qsv_decode(rtsp_url: &str, mut filter: DecodeFilter) -> Result<(), Box<dyn std::error::Error>> {
+    println!("🔍 使用Intel QSV硬件解码");
 
-    match software_decode(rtsp_url, filter) {
-        Ok(_) => {
-            println!("✅ 解码线程正常退出");
+    filter.decoder_name = "Intel QSV".to_string();
+
+    let pipe: FramePipelineBuilder = AVMediaType::AVMEDIA_TYPE_VIDEO.into();
+    let pipe = pipe.filter("decode", Box::new(filter));
+    let out = create_null_output().add_frame_pipeline(pipe);
+
+    let input = Input::new(rtsp_url)
+        .set_hwaccel("qsv")
+        .set_hwaccel_output_format("yuv420p") // GPU解码后转为YUV420P
+        .set_video_codec("hevc_qsv")
+        .set_input_opts(
+            [
+                ("rtsp_transport", "tcp"),
+                ("buffer_size", "67108864"),
+                ("rtsp_flags", "prefer_tcp"),
+            ]
+            .into(),
+        );
+
+    let ctx = FfmpegContext::builder().input(input).output(out).build();
+    let ctx = match ctx {
+        Ok(c) => {
+            println!("✅ FFmpeg上下文构建成功");
+            c
         }
         Err(e) => {
-            eprintln!("❌ CPU软件解码失败: {}", e);
+            eprintln!("❌ FFmpeg上下文构建失败: {:?}", e);
+            return Err(format!("构建失败: {:?}", e).into());
         }
-    }
+    };
+
+    let sch = match ctx.start() {
+        Ok(s) => {
+            println!("✅ FFmpeg调度器启动成功");
+            s
+        }
+        Err(e) => {
+            eprintln!("❌ FFmpeg调度器启动失败: {:?}", e);
+            return Err(format!("启动失败: {:?}", e).into());
+        }
+    };
+    println!("✅ QSV硬件解码启动成功,开始接收帧...");
+
+    let _ = sch.wait();
+    Ok(())
 }
