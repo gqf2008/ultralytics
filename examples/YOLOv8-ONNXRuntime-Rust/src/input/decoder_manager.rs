@@ -1,4 +1,4 @@
-/// 解码器管理器 - 支持动态切换输入源
+/// 解码器管理器 - 支持所有输入源 (使用 ffmpeg-next)
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// 全局活跃解码器代数ID (用于平滑切换)
@@ -12,13 +12,6 @@ pub enum InputSource {
     Desktop,               // 桌面捕获
 }
 
-/// 视频设备信息
-#[derive(Debug, Clone)]
-pub struct VideoDevice {
-    pub name: String,
-    pub index: usize,
-}
-
 /// 解码器管理器（简化版）
 pub struct DecoderManager;
 
@@ -29,10 +22,10 @@ impl DecoderManager {
 }
 
 /// 切换输入源 - 在新线程中启动解码器
-pub fn switch_decoder_source(source: InputSource, preference: super::decoder::DecoderPreference) {
+pub fn switch_decoder_source(source: InputSource) {
     println!("\n🔄 ============ 切换输入源 ============");
 
-    use super::{CameraDecoder, Decoder, DesktopDecoder};
+    use super::{CameraInput, DesktopInput, QsvRtspDecoder};
     use std::thread;
 
     // 1. 增加代数ID，使旧解码器失效
@@ -43,11 +36,11 @@ pub fn switch_decoder_source(source: InputSource, preference: super::decoder::De
         InputSource::Rtsp(url) => {
             println!("📹 新输入源: RTSP流");
             println!("   地址: {}", url);
+            println!("⚡ 使用 QSV RTSP 解码器 (ffmpeg-next 封装,双线程)");
 
             thread::spawn(move || {
-                // 等待旧解码器退出
                 std::thread::sleep(std::time::Duration::from_millis(500));
-                let mut decoder = Decoder::new(url, new_gen, preference);
+                let mut decoder = QsvRtspDecoder::new(url, new_gen);
                 decoder.run();
             });
         }
@@ -57,9 +50,8 @@ pub fn switch_decoder_source(source: InputSource, preference: super::decoder::De
             println!("   设备名称: {}", name);
 
             thread::spawn(move || {
-                // 等待旧解码器退出 (摄像头释放需要更多时间)
                 std::thread::sleep(std::time::Duration::from_millis(1000));
-                let mut camera = CameraDecoder::new(index, name, new_gen);
+                let mut camera = CameraInput::new(index, name, new_gen);
                 camera.run();
             });
         }
@@ -67,9 +59,8 @@ pub fn switch_decoder_source(source: InputSource, preference: super::decoder::De
             println!("🖥️ 新输入源: 桌面捕获");
 
             thread::spawn(move || {
-                // 等待旧解码器退出
                 std::thread::sleep(std::time::Duration::from_millis(500));
-                let mut desktop = DesktopDecoder::new(new_gen);
+                let mut desktop = DesktopInput::new(new_gen);
                 desktop.run();
             });
         }
@@ -81,31 +72,4 @@ pub fn switch_decoder_source(source: InputSource, preference: super::decoder::De
 
 pub fn should_stop() -> bool {
     false // 占位函数
-}
-
-/// 获取可用的视频设备列表
-pub fn get_video_devices() -> Vec<VideoDevice> {
-    println!("🔍 正在扫描视频设备...");
-
-    match ez_ffmpeg::device::get_input_video_devices() {
-        Ok(devices) => {
-            println!("✅ 找到 {} 个视频设备", devices.len());
-            devices
-                .into_iter()
-                .enumerate()
-                .map(|(index, name)| {
-                    println!("   [{}] {}", index, name);
-                    VideoDevice { name, index }
-                })
-                .collect()
-        }
-        Err(e) => {
-            println!("⚠️  获取设备列表失败: {}", e);
-            // 返回默认设备
-            vec![VideoDevice {
-                name: "默认摄像头".to_string(),
-                index: 0,
-            }]
-        }
-    }
 }

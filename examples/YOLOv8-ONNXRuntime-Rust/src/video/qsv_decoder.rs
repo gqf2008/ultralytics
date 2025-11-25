@@ -5,6 +5,7 @@
 use ffmpeg_next as ffmpeg;
 use ffmpeg_next::ffi;
 use std::ptr;
+use std::sync::Arc;
 
 /// 硬件加速类型
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,13 +52,13 @@ impl Default for DecoderConfig {
     }
 }
 
-/// 解码后的视频帧
-#[derive(Debug)]
+/// 解码后的视频帧 (使用 Arc 共享数据,避免克隆)
+#[derive(Debug, Clone)]
 pub struct VideoFrame {
-    /// NV12 格式的 Y 平面数据
-    pub y_data: Vec<u8>,
-    /// NV12 格式的 UV 平面数据
-    pub uv_data: Vec<u8>,
+    /// NV12 格式的 Y 平面数据 (共享)
+    pub y_data: Arc<Vec<u8>>,
+    /// NV12 格式的 UV 平面数据 (共享)
+    pub uv_data: Arc<Vec<u8>>,
     /// 帧宽度
     pub width: u32,
     /// 帧高度
@@ -76,6 +77,9 @@ pub struct QsvDecoder {
     hw_frame: ffmpeg::frame::Video,
     cpu_frame: ffmpeg::frame::Video,
     first_frame: bool,
+    // 缓冲区复用 (避免每帧分配)
+    y_buffer: Vec<u8>,
+    uv_buffer: Vec<u8>,
 }
 
 impl QsvDecoder {
@@ -152,6 +156,8 @@ impl QsvDecoder {
             hw_frame,
             cpu_frame,
             first_frame: true,
+            y_buffer: vec![0u8; 1920 * 1080],
+            uv_buffer: vec![0u8; 1920 * 1080 / 2],
         })
     }
 
@@ -269,15 +275,26 @@ impl QsvDecoder {
         let y_size = (height as usize) * (y_stride as usize);
         let uv_size = ((height / 2) as usize) * (uv_stride as usize);
 
-        let y_data =
-            unsafe { std::slice::from_raw_parts(final_frame.data(0).as_ptr(), y_size) }.to_vec();
+        // 复用缓冲区而不是每次分配
+        self.y_buffer.resize(y_size, 0);
+        self.uv_buffer.resize(uv_size, 0);
 
-        let uv_data =
-            unsafe { std::slice::from_raw_parts(final_frame.data(1).as_ptr(), uv_size) }.to_vec();
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                final_frame.data(0).as_ptr(),
+                self.y_buffer.as_mut_ptr(),
+                y_size,
+            );
+            std::ptr::copy_nonoverlapping(
+                final_frame.data(1).as_ptr(),
+                self.uv_buffer.as_mut_ptr(),
+                uv_size,
+            );
+        }
 
         Ok(Some(VideoFrame {
-            y_data,
-            uv_data,
+            y_data: Arc::new(self.y_buffer.clone()),
+            uv_data: Arc::new(self.uv_buffer.clone()),
             width,
             height,
             y_stride: y_stride as usize,

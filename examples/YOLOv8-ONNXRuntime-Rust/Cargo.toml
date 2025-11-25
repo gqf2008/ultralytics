@@ -67,10 +67,7 @@ dirs = { version = "5.0.1" }
 ureq = { version = "2.9.1" }
 ab_glyph = "0.2.29"
 
-# RTSP 视频流处理 (使用 vcpkg 静态库)
-ez-ffmpeg = { version = "0.6.0", features = ["static"] }
-
-# FFmpeg 原生 API - 零拷贝解码
+# FFmpeg 原生 API - 零拷贝解码 (统一使用 Rust 风格封装)
 ffmpeg-next = "7.0"
 
 # 高性能图像缩放

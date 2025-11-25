@@ -143,7 +143,7 @@ async fn main() {
     println!();
 
     // 创建配置更新通道
-    let (config_tx, config_rx) = crossbeam_channel::bounded(5);
+    let (config_tx, _config_rx) = crossbeam_channel::bounded(5);
 
     // 不再自动启动解码器和检测器,等待用户在UI中配置
     // 解码器和检测器将通过 switch_decoder_source() 函数启动

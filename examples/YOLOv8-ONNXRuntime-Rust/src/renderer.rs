@@ -2,13 +2,10 @@ mod control_panel;
 
 use crate::detection::detector::DetectionResult;
 use crate::detection::types::{ControlMessage, DecodedFrame};
-use crate::input::decoder::DecoderPreference;
-use crate::input::switch_decoder_source;
 use crate::xbus::{self, Subscription};
 use crate::SKELETON;
 use control_panel::ControlPanel;
 use crossbeam_channel::{Receiver, Sender};
-use egui_macroquad::egui;
 use macroquad::prelude::*;
 use std::time::Instant;
 

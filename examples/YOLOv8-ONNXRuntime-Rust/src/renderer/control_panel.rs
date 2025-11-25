@@ -1,6 +1,5 @@
 use crate::detection::types::ControlMessage;
-use crate::input::decoder::DecoderPreference;
-use crate::input::{get_video_devices, switch_decoder_source, InputSource, VideoDevice};
+use crate::input::{switch_decoder_source, InputSource};
 use crossbeam_channel::Sender;
 use egui_macroquad::egui::{self, TextureHandle};
 use macroquad::math::Vec2;
@@ -110,14 +109,9 @@ pub struct ControlPanel {
     pub iou_threshold: f32,
 
     // 输入源配置界面
-    pub input_source_type: usize, // 0=RTSP, 1=摄像头, 2=桌面捕获
+    pub input_source_type: usize, // 0=RTSP (摄像头/桌面功能已移除)
     pub rtsp_url: String,
     pub rtsp_history: Vec<String>, // RTSP 历史记录
-
-    // 设备列表
-    pub video_devices: Vec<VideoDevice>,
-    pub selected_device_index: usize,
-    pub devices_loaded: bool,
 
     // 模型配置
     pub selected_model_index: usize,
@@ -185,9 +179,6 @@ impl ControlPanel {
                 }
                 history
             },
-            video_devices: Vec::new(),
-            selected_device_index: 0,
-            devices_loaded: false,
             selected_model_index: *MODEL_INDICES.get(detect_model.as_str()).unwrap_or(&0),
             selected_tracker_index: *TRACKER_INDICES
                 .get(tracker.to_lowercase().as_str())
@@ -347,7 +338,7 @@ impl ControlPanel {
                 // 处理启动解码器的操作
                 if let Some(input_source) = actions.start_decoder {
                     println!("🚀 从控制面板启动解码器: {:?}", input_source);
-                    switch_decoder_source(input_source, DecoderPreference::Software);
+                    switch_decoder_source(input_source);
                 }
             });
     }
@@ -399,21 +390,7 @@ impl ControlPanel {
                         .radio_value(&mut self.input_source_type, 1, "摄像头")
                         .changed()
                     {
-                        if !self.devices_loaded {
-                            self.video_devices = get_video_devices();
-                            self.devices_loaded = true;
-                            if !self.video_devices.is_empty() {
-                                self.selected_device_index = 0;
-                            }
-                        }
-                        // 立即启动摄像头解码
-                        if !self.video_devices.is_empty() {
-                            if let Some(device) = self.video_devices.get(self.selected_device_index)
-                            {
-                                actions.start_decoder =
-                                    Some(InputSource::Camera(device.index, device.name.clone()));
-                            }
-                        }
+                        actions.start_decoder = Some(InputSource::Camera(0, "默认摄像头".to_string()));
                     }
 
                     // 切换到桌面捕获
@@ -421,7 +398,6 @@ impl ControlPanel {
                         .radio_value(&mut self.input_source_type, 2, "桌面")
                         .changed()
                     {
-                        // 立即启动桌面捕获
                         actions.start_decoder = Some(InputSource::Desktop);
                     }
                 });
@@ -456,7 +432,6 @@ impl ControlPanel {
                                     // 自动启动播放
                                     switch_decoder_source(
                                         InputSource::Rtsp(self.rtsp_url.clone()),
-                                        DecoderPreference::Software,
                                     );
 
                                     // 移到历史记录最前面(更新访问时间)
@@ -507,57 +482,13 @@ impl ControlPanel {
                         self.rtsp_url = url.clone();
 
                         // 触发播放
-                        switch_decoder_source(
-                            InputSource::Rtsp(url.clone()),
-                            DecoderPreference::Software,
-                        );
+                        actions.start_decoder = Some(InputSource::Rtsp(url.clone()));
                         println!("🚀 回车触发播放: {}", url);
                     }
                 } else if self.input_source_type == 1 {
-                    if !self.devices_loaded {
-                        if ui.button("🔄 刷新设备列表").clicked() {
-                            self.video_devices = get_video_devices();
-                            self.devices_loaded = true;
-                            if !self.video_devices.is_empty() {
-                                self.selected_device_index = 0;
-                            }
-                        }
-                    } else {
-                        if self.video_devices.is_empty() {
-                            ui.label("未找到设备");
-                            if ui.button("🔄 重试").clicked() {
-                                self.video_devices = get_video_devices();
-                            }
-                        } else {
-                            egui::ComboBox::from_label("选择设备")
-                                .selected_text(
-                                    self.video_devices
-                                        .get(self.selected_device_index)
-                                        .map(|d| d.name.as_str())
-                                        .unwrap_or("未知"),
-                                )
-                                .show_ui(ui, |ui| {
-                                    for (idx, device) in self.video_devices.iter().enumerate() {
-                                        if ui
-                                            .selectable_value(
-                                                &mut self.selected_device_index,
-                                                idx,
-                                                &device.name,
-                                            )
-                                            .clicked()
-                                        {
-                                            // 选择设备后立即启动解码
-                                            actions.start_decoder = Some(InputSource::Camera(
-                                                device.index,
-                                                device.name.clone(),
-                                            ));
-                                        }
-                                    }
-                                });
-                        }
-                    }
-                } else {
-                    ui.label("桌面捕获 (gdigrab)");
+                    ui.label("摄像头功能 (使用 ffmpeg-next dshow)");
+                } else if self.input_source_type == 2 {
+                    ui.label("桌面捕获 (使用 ffmpeg-next gdigrab)");
                 }
             });
 
