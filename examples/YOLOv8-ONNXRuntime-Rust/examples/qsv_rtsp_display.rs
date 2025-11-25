@@ -5,19 +5,24 @@ use ez_ffmpeg::filter::frame_pipeline_builder::FramePipelineBuilder;
 use ez_ffmpeg::Frame;
 use ez_ffmpeg::{AVMediaType, FfmpegContext, Input};
 use macroquad::prelude::*;
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{sync_channel, SyncSender, TryRecvError};
 use std::thread;
+use yolov8_rs::utils::color_convert::nv12_to_rgba_simd;
 
-/// 帧数据过滤器 - 提取RGBA数据并存入共享缓冲区
+/// 帧数据过滤器
 struct FrameCapture {
-    frame_buffer: Arc<Mutex<Option<(Vec<u8>, u32, u32)>>>,
+    sender: SyncSender<Vec<u8>>,
+    width: u32,
+    height: u32,
     frame_count: usize,
 }
 
 impl FrameCapture {
-    fn new(frame_buffer: Arc<Mutex<Option<(Vec<u8>, u32, u32)>>>) -> Self {
+    fn new(sender: SyncSender<Vec<u8>>) -> Self {
         Self {
-            frame_buffer,
+            sender,
+            width: 0,
+            height: 0,
             frame_count: 0,
         }
     }
@@ -47,125 +52,32 @@ impl FrameFilter for FrameCapture {
             let w = (*frame.as_ptr()).width as u32;
             let h = (*frame.as_ptr()).height as u32;
 
-            // NV12格式 (format=23) - QSV硬件解码输出,CPU转RGBA
+            // 记录首帧分辨率
+            if self.frame_count == 0 {
+                self.width = w;
+                self.height = h;
+            }
+
+            // NV12格式 (format=23) - QSV硬件解码输出,SIMD转RGBA
             if format == 23 {
                 let y_plane = (*frame.as_ptr()).data[0];
-                let uv_plane = (*frame.as_ptr()).data[1]; // NV12: UV交错存储
+                let uv_plane = (*frame.as_ptr()).data[1];
                 let y_stride = (*frame.as_ptr()).linesize[0] as usize;
                 let uv_stride = (*frame.as_ptr()).linesize[1] as usize;
 
                 if !y_plane.is_null() && !uv_plane.is_null() {
-                    let pixel_count = (w * h) as usize;
-                    let mut rgba_vec = vec![255u8; pixel_count * 4];
+                    // 使用 AVX2 优化的 NV12->RGBA 转换
+                    let rgba_vec = nv12_to_rgba_simd(y_plane, uv_plane, w, h, y_stride, uv_stride);
 
-                    // NV12->RGBA转换 (UV交错格式)
-                    for y in 0..(h as usize) {
-                        for x in 0..(w as usize) {
-                            let y_val = *y_plane.add(y * y_stride + x) as i32;
-
-                            // NV12: UV平面交错存储 [U0,V0,U1,V1,...]
-                            let uv_idx = (y >> 1) * uv_stride + (x & !1);
-                            let u_val = *uv_plane.add(uv_idx) as i32 - 128;
-                            let v_val = *uv_plane.add(uv_idx + 1) as i32 - 128;
-
-                            let r = (y_val + ((v_val * 179) >> 7)).clamp(0, 255) as u8;
-                            let g = (y_val - ((u_val * 44) >> 7) - ((v_val * 91) >> 7))
-                                .clamp(0, 255) as u8;
-                            let b = (y_val + ((u_val * 227) >> 7)).clamp(0, 255) as u8;
-
-                            let idx = (y * w as usize + x) * 4;
-                            rgba_vec[idx] = r;
-                            rgba_vec[idx + 1] = g;
-                            rgba_vec[idx + 2] = b;
-                        }
-                    }
-
-                    // 更新共享缓冲区
-                    if let Ok(mut buffer) = self.frame_buffer.lock() {
-                        *buffer = Some((rgba_vec, w, h));
-                    }
+                    // 非阻塞发送
+                    let _ = self.sender.try_send(rgba_vec);
 
                     self.frame_count += 1;
                     if self.frame_count == 1 {
-                        println!("🎨 检测到NV12格式 - QSV硬件解码,CPU色彩转换");
+                        println!("🎨 NV12格式 - AVX2 SIMD色彩转换");
                     }
                     if self.frame_count % 60 == 0 {
-                        println!("📺 已解码 {} 帧 ({}x{})", self.frame_count, w, h);
-                    }
-                }
-            }
-            // RGBA格式 (format=26) - GPU已转换好,直接复制
-            else if format == 26 {
-                let rgba_plane = (*frame.as_ptr()).data[0];
-                let stride = (*frame.as_ptr()).linesize[0] as usize;
-
-                if !rgba_plane.is_null() {
-                    let pixel_count = (w * h) as usize;
-                    let mut rgba_vec = vec![255u8; pixel_count * 4];
-
-                    // 直接复制RGBA数据(GPU VPP已转换好)
-                    for y in 0..(h as usize) {
-                        let src = std::slice::from_raw_parts(
-                            rgba_plane.add(y * stride),
-                            (w as usize) * 4,
-                        );
-                        let dst_offset = y * (w as usize) * 4;
-                        rgba_vec[dst_offset..dst_offset + src.len()].copy_from_slice(src);
-                    }
-
-                    // 更新共享缓冲区
-                    if let Ok(mut buffer) = self.frame_buffer.lock() {
-                        *buffer = Some((rgba_vec, w, h));
-                    }
-
-                    self.frame_count += 1;
-                    if self.frame_count == 1 {
-                        println!("🎨 检测到RGBA格式 - GPU VPP色彩转换");
-                    }
-                    if self.frame_count % 60 == 0 {
-                        println!("📺 已解码 {} 帧 ({}x{}) - GPU转换", self.frame_count, w, h);
-                    }
-                }
-            }
-            // YUV420P格式 (format=0) - CPU转换(备用)
-            else if format == 0 {
-                let y_plane = (*frame.as_ptr()).data[0];
-                let u_plane = (*frame.as_ptr()).data[1];
-                let v_plane = (*frame.as_ptr()).data[2];
-                let y_stride = (*frame.as_ptr()).linesize[0] as usize;
-                let uv_stride = (*frame.as_ptr()).linesize[1] as usize;
-
-                if !y_plane.is_null() && !u_plane.is_null() && !v_plane.is_null() {
-                    let pixel_count = (w * h) as usize;
-                    let mut rgba_vec = vec![255u8; pixel_count * 4];
-
-                    // 简单的YUV->RGBA转换
-                    for y in 0..(h as usize) {
-                        for x in 0..(w as usize) {
-                            let y_val = *y_plane.add(y * y_stride + x) as i32;
-                            let u_val = *u_plane.add((y >> 1) * uv_stride + (x >> 1)) as i32 - 128;
-                            let v_val = *v_plane.add((y >> 1) * uv_stride + (x >> 1)) as i32 - 128;
-
-                            let r = (y_val + ((v_val * 179) >> 7)).clamp(0, 255) as u8;
-                            let g = (y_val - ((u_val * 44) >> 7) - ((v_val * 91) >> 7))
-                                .clamp(0, 255) as u8;
-                            let b = (y_val + ((u_val * 227) >> 7)).clamp(0, 255) as u8;
-
-                            let idx = (y * w as usize + x) * 4;
-                            rgba_vec[idx] = r;
-                            rgba_vec[idx + 1] = g;
-                            rgba_vec[idx + 2] = b;
-                        }
-                    }
-
-                    // 更新共享缓冲区
-                    if let Ok(mut buffer) = self.frame_buffer.lock() {
-                        *buffer = Some((rgba_vec, w, h));
-                    }
-
-                    self.frame_count += 1;
-                    if self.frame_count % 60 == 0 {
-                        println!("📺 已解码 {} 帧 ({}x{})", self.frame_count, w, h);
+                        println!("📺 已解码 {} 帧", self.frame_count);
                     }
                 }
             }
@@ -188,50 +100,96 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     println!("📹 RTSP地址: {}", rtsp_url);
-    println!("🎨 QSV Pipeline: HEVC解码(GPU) -> NV12 -> RGBA (CPU转换)");
-    println!("📝 注: 真正的GPU色彩转换需要保持QSV surface不下载到CPU");
+    println!("🎨 QSV Pipeline: HEVC解码(GPU) → NV12 → RGBA (AVX2加速)");
+    println!("📝 优化: 无锁通道 + 双缓冲");
 
-    // 共享帧缓冲区
-    let frame_buffer: Arc<Mutex<Option<(Vec<u8>, u32, u32)>>> = Arc::new(Mutex::new(None));
-    let frame_buffer_clone = frame_buffer.clone();
+    // 创建有界通道 (容量=2,实现双缓冲)
+    let (tx, rx) = sync_channel::<Vec<u8>>(2);
 
     // 启动解码线程
     thread::spawn(move || {
-        decode_thread(rtsp_url, frame_buffer_clone);
+        decode_thread(rtsp_url, tx);
     });
 
     // 纹理对象
     let mut texture: Option<Texture2D> = None;
     let mut frame_count = 0u64;
     let mut last_fps_time = get_time();
+    let mut dropped_frames = 0u64;
+    let mut width = 0u32; // 移到外层,保持状态
+    let mut height = 0u32;
 
     println!("✅ 解码线程已启动,等待第一帧...");
 
     loop {
-        // 尝试获取新帧
-        if let Ok(mut buffer) = frame_buffer.lock() {
-            if let Some((rgba_data, width, height)) = buffer.take() {
+        // 非阻塞接收最新帧 (丢弃中间帧)
+        let mut latest_frame: Option<Vec<u8>> = None;
+
+        loop {
+            match rx.try_recv() {
+                Ok(rgba_data) => {
+                    // 首帧获取分辨率
+                    if texture.is_none() {
+                        let pixels = rgba_data.len() / 4;
+                        // 假设是 4K (3840x2160) 或 1080p (1920x1080)
+                        if pixels == 3840 * 2160 {
+                            width = 3840;
+                            height = 2160;
+                        } else if pixels == 1920 * 1080 {
+                            width = 1920;
+                            height = 1080;
+                        } else {
+                            // 其他分辨率,尝试推断
+                            width = (pixels as f64).sqrt() as u32 * 16 / 9;
+                            height = pixels as u32 / width;
+                        }
+                    }
+                    latest_frame = Some(rgba_data);
+                    dropped_frames += 1;
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    println!("⚠️ 解码线程已退出");
+                    return Ok(());
+                }
+            }
+        }
+
+        // 有新帧时更新纹理
+        if let Some(rgba_data) = latest_frame {
+            dropped_frames = dropped_frames.saturating_sub(1);
+
+            if texture.is_none() {
+                texture = Some(Texture2D::from_rgba8(
+                    width as u16,
+                    height as u16,
+                    &rgba_data,
+                ));
+                println!("✅ 创建纹理: {}x{}", width, height);
+            } else {
                 let image = Image {
                     bytes: rgba_data,
                     width: width as u16,
                     height: height as u16,
                 };
+                texture.as_ref().unwrap().update(&image);
+            }
 
-                texture = Some(Texture2D::from_image(&image));
-                frame_count += 1;
+            frame_count += 1;
 
-                let now = get_time();
-                if now - last_fps_time >= 1.0 {
-                    let fps = frame_count as f64 / (now - last_fps_time);
-                    println!("🎬 渲染FPS: {:.1}", fps);
-                    frame_count = 0;
-                    last_fps_time = now;
-                }
+            let now = get_time();
+            if now - last_fps_time >= 1.0 {
+                let fps = frame_count as f64 / (now - last_fps_time);
+                println!("🎬 渲染FPS: {:.1} | 丢帧: {}", fps, dropped_frames);
+                frame_count = 0;
+                dropped_frames = 0;
+                last_fps_time = now;
             }
         }
 
         clear_background(BLACK);
 
+        // 只有在纹理创建后才渲染
         if let Some(ref tex) = texture {
             let screen_w = screen_width();
             let screen_h = screen_height();
@@ -264,8 +222,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
             draw_text("QSV硬件解码", 10.0, 60.0, 30.0, GREEN);
             draw_text("按ESC退出", 10.0, 90.0, 30.0, GREEN);
-        } else {
-            draw_text("等待视频流...", 100.0, 100.0, 40.0, WHITE);
         }
 
         if is_key_pressed(KeyCode::Escape) {
@@ -279,8 +235,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// 解码线程 - 直接使用FFmpeg API(参考qsv_rtsp_to_mp4.rs)
-fn decode_thread(rtsp_url: String, frame_buffer: Arc<Mutex<Option<(Vec<u8>, u32, u32)>>>) {
+/// 解码线程
+fn decode_thread(rtsp_url: String, sender: SyncSender<Vec<u8>>) {
     println!("🔧 初始化QSV解码器...");
 
     // 构建输入 - QSV硬件解码
@@ -297,22 +253,15 @@ fn decode_thread(rtsp_url: String, frame_buffer: Arc<Mutex<Option<(Vec<u8>, u32,
             .into(),
         );
 
-    // 构建过滤器管道 - 接收RGBA帧
-    let filter = FrameCapture::new(frame_buffer);
+    // 构建过滤器管道
+    let filter = FrameCapture::new(sender);
 
     let pipe: FramePipelineBuilder = AVMediaType::AVMEDIA_TYPE_VIDEO.into();
     let pipe = pipe.filter("capture", Box::new(filter));
     let output = create_null_output().add_frame_pipeline(pipe);
 
-    println!("🔍 使用Intel QSV硬件解码(GPU) + CPU色彩转换(NV12→RGBA)");
-    println!("📌 注: QSV VPP不支持RGBA输出,CPU转换不可避免");
-    println!("📌 已测试的滤镜:");
-    println!("   ❌ hwaccel_output_format(\"rgba\") - 解码器崩溃");
-    println!("   ❌ filter_desc(\"scale_qsv=format=rgba\") - 不支持RGBA");
-    println!("   ❌ filter_desc(\"hwdownload,format=rgba\") - 卡死");
-    println!("   ❌ filter_desc(\"colorspace=range=pc:format=rgb24\") - 语法错误");
-    println!("   ❌ filter_desc(\"format=pix_fmts=rgb24\") - 卡死无输出");
-    println!("   ✅ hwaccel_output_format(\"nv12\") + CPU转换 - 正常工作");
+    println!("🔍 QSV硬件解码(GPU) + AVX2色彩转换");
+    println!("📌 双缓冲机制,简化内存管理");
 
     // 构建并运行FFmpeg上下文
     match FfmpegContext::builder()

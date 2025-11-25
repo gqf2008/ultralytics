@@ -8,6 +8,7 @@ pub mod ort_backend;
 pub mod renderer;
 pub mod ui_config; // UI配置面板
 pub mod utils; // 工具模块
+pub mod video; // 视频解码模块
 // pub mod renderer; // ggez 版本的 renderer (旧版)
 // macroquad 版本的 renderer 在 bin/sentinel_macroquad.rs 中直接引用
 pub mod xbus;

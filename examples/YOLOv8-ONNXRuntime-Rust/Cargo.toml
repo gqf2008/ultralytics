@@ -70,6 +70,9 @@ ab_glyph = "0.2.29"
 # RTSP 视频流处理 (使用 vcpkg 静态库)
 ez-ffmpeg = { version = "0.6.0", features = ["static"] }
 
+# FFmpeg 原生 API - 零拷贝解码
+ffmpeg-next = "7.0"
+
 # 高性能图像缩放
 fast_image_resize = { version = "5.3.0" }
 
@@ -79,12 +82,16 @@ macroquad = "0.4"
 # egui UI框架集成
 egui-macroquad = "0.17"
 
+# SDL2 原生 YUV 纹理支持 (对标 ffplay)
+sdl2 = { version = "0.37", features = ["bundled", "static-link"] }
+
 # 线程间通信
 crossbeam-channel = "0.5.15"
 crossbeam-skiplist = "0.1.3"
 
 # 数据并行处理
 rayon = "1.10"
+crossbeam = "0.8.4"
 
 # Windows 剪贴板支持
 [target.'cfg(windows)'.dependencies]
