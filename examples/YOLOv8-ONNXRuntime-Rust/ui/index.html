@@ -32,6 +32,16 @@
             background: #000;
         }
         
+        /* 检测框叠加层 - 覆盖在视频上 */
+        #detection-overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100vw;
+            height: 100vh;
+            pointer-events: none;
+        }
+        
         /* 控制面板 - 玻璃态风格 */
         #control-panel {
             position: absolute;
@@ -149,8 +159,8 @@
         
         #stats-grid {
             display: grid;
-            grid-template-columns: repeat(3, 1fr);
-            gap: 24px;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 16px;
         }
         
         .stat-item {
@@ -478,6 +488,8 @@
     <div id="app">
         <!-- 全屏视频画布 -->
         <canvas id="canvas"></canvas>
+        <!-- 检测框叠加层 -->
+        <canvas id="detection-overlay"></canvas>
         
         <!-- 控制面板浮层 - 玻璃态风格 -->
         <div id="control-panel">
@@ -490,12 +502,16 @@
                 <div id="stats-section">
                     <div id="stats-grid">
                         <div class="stat-item">
-                            <div class="stat-label">FPS</div>
+                            <div class="stat-label">Video FPS</div>
                             <div class="stat-value" id="fps">0</div>
                         </div>
                         <div class="stat-item">
-                            <div class="stat-label">Resolution</div>
-                            <div class="stat-value" id="resolution">0×0</div>
+                            <div class="stat-label">Detect FPS</div>
+                            <div class="stat-value" id="detect-fps">0</div>
+                        </div>
+                        <div class="stat-item">
+                            <div class="stat-label">Objects</div>
+                            <div class="stat-value" id="detect-count">0</div>
                         </div>
                         <div class="stat-item">
                             <div class="stat-label">Latency</div>

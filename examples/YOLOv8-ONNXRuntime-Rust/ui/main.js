@@ -512,8 +512,6 @@ class WebGLVideoRenderer {
             console.log(`[Video Source] ${this.videoWidth}x${this.videoHeight}`);
             console.log(`[Canvas Size] ${this.canvas.width}x${this.canvas.height}`);
             console.log(`[Draw Command] drawImage(frame, 0, 0, ${this.canvas.width}, ${this.canvas.height})`);
-            document.getElementById('resolution').textContent = 
-                `${this.videoWidth}x${this.videoHeight} -> ${this.canvas.width}x${this.canvas.height}`;
         }
 
         // 清空画布并绘制整个帧（拉伸填充）
@@ -557,7 +555,19 @@ const frameDetector = new FrameDetector(renderer);
 // 监听检测结果并在 Canvas 上绘制
 window.addEventListener('yolo-detection', (event) => {
     const result = event.detail;
+    
+    // 调试：检查是否收到检测结果
+    if (result.boxes && result.boxes.length > 0) {
+        console.log(`🎯 绘制 ${result.boxes.length} 个检测框`);
+    }
+    
     drawDetections(result.boxes);
+    
+    // 更新检测统计
+    const detectFpsEl = document.getElementById('detect-fps');
+    const detectCountEl = document.getElementById('detect-count');
+    if (detectFpsEl) detectFpsEl.textContent = result.detect_fps?.toFixed(1) || '0';
+    if (detectCountEl) detectCountEl.textContent = result.boxes?.length || '0';
 });
 
 // UI 控制
@@ -577,33 +587,74 @@ const volumeValue = document.getElementById('volume-value');
 // 检测控制按钮
 let detectionFpsSlider;
 
-// 在 Canvas 上绘制检测框
-function drawDetections(boxes) {
-    if (!boxes || boxes.length === 0) return;
+// 检测框 overlay canvas (2D context，独立于 WebGL)
+const detectionOverlay = document.getElementById('detection-overlay');
+const detectionCtx = detectionOverlay.getContext('2d');
+
+// 检测框缓存 - 用于平滑绘制
+let cachedBoxes = [];
+let drawScheduled = false;
+
+// 同步 overlay canvas 尺寸
+function syncOverlaySize() {
+    detectionOverlay.width = window.innerWidth;
+    detectionOverlay.height = window.innerHeight;
+    // 重绘当前检测框
+    if (cachedBoxes.length > 0) {
+        renderBoxes();
+    }
+}
+syncOverlaySize();
+window.addEventListener('resize', syncOverlaySize);
+
+// 实际渲染检测框 (在 RAF 中调用)
+function renderBoxes() {
+    const ctx = detectionCtx;
+    const w = detectionOverlay.width;
+    const h = detectionOverlay.height;
     
-    const ctx = canvas.getContext('2d');
-    const scaleX = canvas.width / 640;  // 640 是检测器输入尺寸
-    const scaleY = canvas.height / 640;
+    // 清除
+    ctx.clearRect(0, 0, w, h);
     
+    if (cachedBoxes.length === 0) return;
+    
+    // 预设样式 (减少状态切换)
     ctx.strokeStyle = '#00ff00';
-    ctx.lineWidth = 3;
-    ctx.font = '16px monospace';
-    ctx.fillStyle = '#00ff00';
+    ctx.lineWidth = 2;
+    ctx.font = 'bold 14px monospace';
     
-    boxes.forEach(box => {
-        // 缩放坐标到显示尺寸
-        const x1 = box.x1 * scaleX;
-        const y1 = box.y1 * scaleY;
-        const x2 = box.x2 * scaleX;
-        const y2 = box.y2 * scaleY;
+    cachedBoxes.forEach(box => {
+        // 归一化坐标 (0-1) → 屏幕坐标
+        const x1 = box.x1 * w;
+        const y1 = box.y1 * h;
+        const x2 = box.x2 * w;
+        const y2 = box.y2 * h;
+        const bw = x2 - x1;
+        const bh = y2 - y1;
         
         // 绘制矩形框
-        ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+        ctx.strokeRect(x1, y1, bw, bh);
         
         // 绘制标签
         const label = `${box.class_name} ${(box.confidence * 100).toFixed(0)}%`;
-        ctx.fillText(label, x1, y1 - 5);
+        const textWidth = ctx.measureText(label).width;
+        ctx.fillStyle = 'rgba(0, 255, 0, 0.8)';
+        ctx.fillRect(x1, y1 - 20, textWidth + 6, 20);
+        ctx.fillStyle = '#000';
+        ctx.fillText(label, x1 + 3, y1 - 5);
     });
+    
+    drawScheduled = false;
+}
+
+// 更新检测框 (使用 RAF 合并绘制)
+function drawDetections(boxes) {
+    cachedBoxes = boxes || [];
+    
+    if (!drawScheduled) {
+        drawScheduled = true;
+        requestAnimationFrame(renderBoxes);
+    }
 }
 
 // 音量控制
@@ -890,14 +941,21 @@ startDetectorBtn.addEventListener('click', async () => {
         startDetectorBtn.disabled = true;
         startDetectorBtn.textContent = '🔄 加载中...';
         
-        await frameDetector.startDetector('yolov8n', 'bytetrack');
+        const result = await frameDetector.startDetector('yolov8n', 'bytetrack');
         
-        startDetectorBtn.style.display = 'none';
-        stopDetectorBtn.style.display = 'block';
-        showStatus('✅ 检测器已启动');
+        if (result) {
+            // 更新检测输入尺寸用于坐标缩放
+            if (result.input_width) {
+                console.log(`📐 检测输入尺寸: ${result.input_width}x${result.input_width}`);
+            }
+            
+            startDetectorBtn.style.display = 'none';
+            stopDetectorBtn.style.display = 'block';
+            showStatus('✅ 检测器已启动');
+        }
     } catch (err) {
         console.error('启动检测器失败:', err);
-        showStatus('❌ 检测器启动失败: ' + err);
+        showStatus('❌ 检测器启动失败: ' + (err.message || err));
         startDetectorBtn.disabled = false;
         startDetectorBtn.textContent = '▶ 开启检测';
     }
@@ -906,6 +964,9 @@ startDetectorBtn.addEventListener('click', async () => {
 stopDetectorBtn.addEventListener('click', async () => {
     try {
         await frameDetector.stopDetector();
+        
+        // 清除检测框
+        detectionCtx.clearRect(0, 0, detectionOverlay.width, detectionOverlay.height);
         
         stopDetectorBtn.style.display = 'none';
         startDetectorBtn.style.display = 'block';

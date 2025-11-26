@@ -5,8 +5,8 @@ use clap::ValueEnum;
 use half::f16;
 use ndarray::{Array, CowArray, IxDyn};
 use ort::execution_providers::{
-    CPUExecutionProvider, CUDAExecutionProvider, ExecutionProvider, ExecutionProviderDispatch,
-    TensorRTExecutionProvider,
+    CPUExecutionProvider, CUDAExecutionProvider, DirectMLExecutionProvider, ExecutionProvider,
+    ExecutionProviderDispatch, TensorRTExecutionProvider, WebGPUExecutionProvider,
 };
 use ort::session::builder::SessionBuilder;
 use ort::session::Session;

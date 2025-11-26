@@ -2,9 +2,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod detector;
+mod detector_async;
 mod rtsp_proxy;
 
-use detector::DetectorState;
+use detector_async::AsyncDetectorState;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::panic;
@@ -193,17 +194,16 @@ pub struct StartDetectorResult {
 async fn start_detector(
     app: AppHandle,
     model: String,
-    tracker: String,
+    _tracker: String,
 ) -> Result<StartDetectorResult, String> {
-    println!("🚀 启动检测器: model={}, tracker={}", model, tracker);
+    println!("🚀 启动检测器: model={}", model);
 
-    let detector_state = app.state::<DetectorState>();
+    let detector_state = app.state::<AsyncDetectorState>();
 
-    // 获取模型路径 - 使用项目根目录下的 models 文件夹
-    // 开发模式下，工作目录是 src-tauri，需要向上一级
+    // 获取模型路径 - 使用当前exe所在目录下的 models 文件夹
     let model_filename = format!("{}.onnx", model);
-    let model_path = std::env::current_dir()
-        .map_err(|e| format!("获取当前目录失败: {}", e))?
+    let model_path = std::env::current_exe()
+        .map_err(|e| format!("获取当前exe路径失败: {}", e))?
         .parent()
         .map(|p| p.join("models").join(&model_filename))
         .unwrap_or_else(|| std::path::PathBuf::from("models").join(&model_filename));
@@ -211,16 +211,13 @@ async fn start_detector(
     let model_path_str = model_path.to_string_lossy().to_string();
     println!("📁 模型路径: {}", model_path_str);
 
-    // 加载模型，获取输入尺寸
-    let (input_width, input_height) = detector_state.load_model(&model_path_str)?;
-
-    // 初始化追踪器
-    detector_state.init_tracker(&tracker);
+    // 启动异步检测器
+    let (input_width, input_height) = detector_state.start(&model_path_str, app.clone())?;
 
     Ok(StartDetectorResult {
         message: format!(
-            "检测器已启动: {} + {} (输入: {}x{})",
-            model, tracker, input_width, input_height
+            "检测器已启动: {} (输入: {}x{})",
+            model, input_width, input_height
         ),
         input_width,
         input_height,
@@ -230,21 +227,21 @@ async fn start_detector(
 /// 停止检测器
 #[tauri::command]
 async fn stop_detector(app: AppHandle) -> Result<String, String> {
-    let detector_state = app.state::<DetectorState>();
+    let detector_state = app.state::<AsyncDetectorState>();
     detector_state.stop();
     Ok("检测器已停止".to_string())
 }
 
-/// 检测帧 (接收前端已 resize 的 640x640 RGBA 数据)
+/// 发送帧到检测线程 (非阻塞，立即返回)
 #[tauri::command]
 async fn detect_frame(
     app: AppHandle,
     rgba_data: Vec<u8>,
     width: u32,
     height: u32,
-) -> Result<detector::DetectionResult, String> {
-    let detector_state = app.state::<DetectorState>();
-    detector_state.detect(&rgba_data, width, height)
+) -> Result<(), String> {
+    let detector_state = app.state::<AsyncDetectorState>();
+    detector_state.send_frame(rgba_data, width, height)
 }
 
 fn main() {
@@ -269,7 +266,7 @@ fn main() {
         .plugin(tauri_plugin_shell::init())
         .manage(VideoFrameState::default())
         .manage(ProxyState { proxy })
-        .manage(DetectorState::default())
+        .manage(AsyncDetectorState::default())
         .invoke_handler(tauri::generate_handler![
             get_latest_frame,
             has_new_frame,

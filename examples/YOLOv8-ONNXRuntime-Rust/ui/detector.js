@@ -14,9 +14,10 @@ export class FrameDetector {
             willReadFrequently: true // 优化性能
         });
         
-        // YOLO 输入尺寸 (可配置)
-        this.targetWidth = 640;
-        this.targetHeight = 640;
+        // YOLO 输入尺寸 - 使用较小尺寸减少 IPC 传输量
+        // 640x640x4 = 1.6MB, 320x320x4 = 400KB
+        this.targetWidth = 320;
+        this.targetHeight = 320;
         
         // 设置离屏 Canvas 尺寸
         this.detectionCanvas.width = this.targetWidth;
@@ -24,10 +25,14 @@ export class FrameDetector {
         
         // 检测状态
         this.isDetecting = false;
-        this.detectionFps = 30; // 检测帧率 (可调低降低 CPU 占用)
+        this.detectionFps = 5; // 目标检测帧率 (CPU 推理约 10-12 FPS)
         this.lastDetectTime = 0;
         this.detectFrameCount = 0;
         this.detectInterval = null;
+        this.rafId = null; // requestAnimationFrame ID
+        this.isProcessing = false; // 防止重叠请求
+        this.resultUnlisten = null; // 事件监听取消函数
+        this.pendingSend = false; // 是否有待发送的帧
         
         // 检测结果缓存
         this.lastDetections = [];
@@ -45,7 +50,7 @@ export class FrameDetector {
     async startDetector(modelName = 'yolov8n', trackerName = 'bytetrack') {
         if (this.isDetecting) {
             console.warn('⚠️ 检测器已在运行');
-            return;
+            return { message: '检测器已在运行', input_width: this.targetWidth, input_height: this.targetHeight };
         }
         
         this.modelName = modelName;
@@ -57,13 +62,16 @@ export class FrameDetector {
                 model: modelName,
                 tracker: trackerName 
             });
-            console.log('✅', result.message);
+            console.log('✅ 检测器已启动:', result);
             
             // 使用后端返回的输入尺寸
             if (result.input_width && result.input_height) {
                 this.setTargetSize(result.input_width, result.input_height);
                 console.log(`📐 [Detector] 使用模型输入尺寸: ${result.input_width}x${result.input_height}`);
             }
+            
+            // 监听后端检测结果事件 (先设置监听再开始检测)
+            await this.setupResultListener();
             
             this.isDetecting = true;
             this.startFrameExtraction();
@@ -73,6 +81,41 @@ export class FrameDetector {
             console.error('❌ [Detector] 启动失败:', err);
             throw err;
         }
+    }
+    
+    /**
+     * 设置检测结果监听
+     */
+    async setupResultListener() {
+        if (this.resultUnlisten) return; // 已经在监听
+        
+        console.log('🎧 [Detector] 设置 detection-result 事件监听...');
+        
+        this.resultUnlisten = await listen('detection-result', (event) => {
+            const result = event.payload;
+            this.lastDetections = result.boxes;
+            
+            // 调试日志
+            if (result.boxes && result.boxes.length > 0) {
+                console.log(`📦 [Detector] 收到 ${result.boxes.length} 个检测结果`);
+            }
+            
+            // 触发自定义事件通知 UI 更新
+            window.dispatchEvent(new CustomEvent('yolo-detection', { 
+                detail: result 
+            }));
+            
+            this.detectFrameCount++;
+            const now = performance.now();
+            if (now - this.lastDetectTime >= 2000) {
+                const actualFps = this.detectFrameCount / 2;
+                this.detectFrameCount = 0;
+                this.lastDetectTime = now;
+                console.log(`📊 [Detector] 检测FPS: ${actualFps.toFixed(1)} | 推理: ${result.inference_time_ms.toFixed(1)}ms`);
+            }
+        });
+        
+        console.log('✅ [Detector] 事件监听已设置');
     }
     
     /**
@@ -93,6 +136,16 @@ export class FrameDetector {
                 clearInterval(this.detectInterval);
                 this.detectInterval = null;
             }
+            if (this.rafId) {
+                cancelAnimationFrame(this.rafId);
+                this.rafId = null;
+            }
+            
+            // 取消事件监听
+            if (this.resultUnlisten) {
+                this.resultUnlisten();
+                this.resultUnlisten = null;
+            }
             
             const result = await invoke('stop_detector');
             console.log('✅', result);
@@ -106,23 +159,34 @@ export class FrameDetector {
     }
     
     /**
-     * 启动帧提取定时器
+     * 启动帧提取循环 (使用 RAF 跟随视频帧率)
      */
     startFrameExtraction() {
-        const intervalMs = 1000 / this.detectionFps;
+        const minInterval = 1000 / this.detectionFps; // 最小间隔
         
-        console.log(`⏱️ [Detector] 启动帧提取 - 目标FPS: ${this.detectionFps} (间隔: ${intervalMs.toFixed(1)}ms)`);
+        console.log(`⏱️ [Detector] 启动帧提取 - 目标FPS: ${this.detectionFps}`);
         
-        this.detectInterval = setInterval(() => {
-            this.extractAndDetectFrame();
-        }, intervalMs);
+        const loop = () => {
+            if (!this.isDetecting) return;
+            
+            const now = performance.now();
+            // 控制最大检测频率
+            if (now - this.lastDetectTime >= minInterval) {
+                this.extractAndDetectFrame();
+                this.lastDetectTime = now;
+            }
+            
+            this.rafId = requestAnimationFrame(loop);
+        };
+        
+        this.rafId = requestAnimationFrame(loop);
     }
     
     /**
      * 从渲染器的 Canvas 提取帧并发送检测
      */
-    async extractAndDetectFrame() {
-        if (!this.isDetecting) return;
+    extractAndDetectFrame() {
+        if (!this.isDetecting || this.isProcessing) return;
         
         const sourceCanvas = this.videoRenderer.canvas;
         
@@ -131,14 +195,14 @@ export class FrameDetector {
             return;
         }
         
+        this.isProcessing = true;
+        
         try {
-            const now = performance.now();
-            
-            // 1. 将源 Canvas 缩放绘制到检测 Canvas (640x640)
+            // 1. 将源 Canvas 缩放绘制到检测 Canvas
             this.detectionCtx.drawImage(
                 sourceCanvas,
-                0, 0, sourceCanvas.width, sourceCanvas.height,  // 源区域
-                0, 0, this.targetWidth, this.targetHeight        // 目标区域(缩放)
+                0, 0, sourceCanvas.width, sourceCanvas.height,
+                0, 0, this.targetWidth, this.targetHeight
             );
             
             // 2. 提取 RGBA 像素数据
@@ -148,51 +212,20 @@ export class FrameDetector {
                 this.targetHeight
             );
             
-            const rgbaData = imageData.data; // Uint8ClampedArray
+            // 3. 使用 Uint8Array 直接传输 (Tauri 2.0 支持)
+            const rgbaData = new Uint8Array(imageData.data.buffer);
             
-            // 3. 转换为普通 Uint8Array (Tauri 需要)
-            const uint8Array = new Uint8Array(rgbaData);
-            
-            // 4. 发送到 Rust 后端检测并获取结果
-            const result = await invoke('detect_frame', {
-                rgbaData: Array.from(uint8Array), // Tauri 需要 Array
+            // 4. 非阻塞发送到后端 - Tauri 2.0 可以直接传 Uint8Array
+            invoke('detect_frame', {
+                rgbaData: rgbaData,
                 width: this.targetWidth,
                 height: this.targetHeight
-            });
-            
-            // 5. 处理检测结果
-            if (result && result.boxes) {
-                this.lastDetections = result.boxes;
-                
-                // 触发自定义事件通知 UI 更新
-                window.dispatchEvent(new CustomEvent('yolo-detection', { 
-                    detail: result 
-                }));
-                
-                // 打印检测摘要 (有检测结果时打印)
-                if (result.boxes.length > 0) {
-                    console.log(
-                        `🎯 [Detection] 检测到 ${result.boxes.length} 个目标 | ` +
-                        `推理耗时: ${result.inference_time_ms.toFixed(1)}ms | ` +
-                        `FPS: ${result.detect_fps.toFixed(1)}`
-                    );
-                }
-            }
-            
-            this.detectFrameCount++;
-            
-            // 统计检测FPS
-            if (now - this.lastDetectTime >= 1000) {
-                const actualFps = this.detectFrameCount;
-                this.detectFrameCount = 0;
-                this.lastDetectTime = now;
-                
-                // 每秒打印一次统计
-                console.log(`📊 [Detector] 检测FPS: ${actualFps} | 数据量: ${(uint8Array.length / 1024).toFixed(1)}KB`);
-            }
+            }).catch(() => {});
             
         } catch (err) {
-            console.error('❌ [Detector] 帧检测失败:', err);
+            console.error('❌ [Detector] 帧提取失败:', err);
+        } finally {
+            this.isProcessing = false;
         }
     }
     
