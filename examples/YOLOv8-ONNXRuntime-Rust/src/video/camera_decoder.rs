@@ -1,11 +1,11 @@
 /// 摄像头解码器 (Rust风格封装,基于 ffmpeg-next)
 use super::{DecoderError, VideoFrame};
-use std::sync::Arc;
 use ffmpeg::format::{input, Pixel};
 use ffmpeg::media::Type;
 use ffmpeg::software::scaling::{context::Context as ScalerContext, flag::Flags};
 use ffmpeg::util::frame::video::Video;
 use ffmpeg_next as ffmpeg;
+use std::sync::Arc;
 
 /// 摄像头配置
 #[derive(Clone)]

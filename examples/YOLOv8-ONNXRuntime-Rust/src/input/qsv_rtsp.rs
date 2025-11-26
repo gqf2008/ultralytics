@@ -112,7 +112,7 @@ fn process_thread(receiver: Receiver<VideoFrame>, generation: usize) {
     use std::sync::Arc;
 
     let mut frame_count = 0u64;
-    let mut rgba_buffer = Vec::new();
+    let mut rgba_buffer = Vec::with_capacity(1920 * 1080 * 4);
     let mut last_fps_time = std::time::Instant::now();
     let mut fps_counter = 0u64;
     let mut current_fps = 0.0;
@@ -150,9 +150,15 @@ fn process_thread(receiver: Receiver<VideoFrame>, generation: usize) {
                     last_fps_time = std::time::Instant::now();
                 }
 
-                // 通过 xbus 发送解码帧
+                // 通过 xbus 发送解码帧 (使用 Arc 包装交换缓冲区)
+                let capacity = rgba_buffer.capacity();
+                let rgba_arc = Arc::new(std::mem::replace(
+                    &mut rgba_buffer,
+                    Vec::with_capacity(capacity),
+                ));
+                
                 let decoded = DecodedFrame {
-                    rgba_data: Arc::new(rgba_buffer.clone()),
+                    rgba_data: rgba_arc,
                     width: video_frame.width,
                     height: video_frame.height,
                     decode_fps: current_fps,

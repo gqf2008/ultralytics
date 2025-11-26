@@ -18,11 +18,10 @@ serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = "0.20"
 futures-util = "0.3"
-ffmpeg-next = "7.0"                                  # 用于提取原始数据包
+retina = "0.4"                                       # 纯 Rust RTSP 客户端 (无 FFmpeg 依赖!)
+url = "2"                                            # URL 解析
 parking_lot = "0.12"
 crossbeam-channel = "0.5"
-ratatui = "0.28"
-crossterm = "0.28"
 
-# 引用主项目的依赖
-yolov8-rs = { path = ".." }
+# 不依赖主项目! Tauri 版本独立运行,WebView 负责解码
+# 用 retina 替代 ffmpeg-next,避免 QSV/x264 链接错误

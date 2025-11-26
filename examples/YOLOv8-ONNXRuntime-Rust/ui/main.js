@@ -1,5 +1,6 @@
 import { invoke, Channel } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
+import { FrameDetector } from './detector.js';
 
 // 重写 console.log 以发送到后端
 const originalLog = console.log;
@@ -546,9 +547,18 @@ class WebGLVideoRenderer {
     }
 }
 
-// 初始化
+// 初始化渲染器
 const canvas = document.getElementById('canvas');
 const renderer = new WebGLVideoRenderer(canvas);
+
+// 初始化检测器
+const frameDetector = new FrameDetector(renderer);
+
+// 监听检测结果并在 Canvas 上绘制
+window.addEventListener('yolo-detection', (event) => {
+    const result = event.detail;
+    drawDetections(result.boxes);
+});
 
 // UI 控制
 const rtspInput = document.getElementById('rtsp-url');
@@ -563,6 +573,38 @@ const panelHeader = document.getElementById('panel-header');
 const toggleBtn = document.getElementById('toggle-btn');
 const volumeSlider = document.getElementById('volume-slider');
 const volumeValue = document.getElementById('volume-value');
+
+// 检测控制按钮 (稍后添加)
+let startDetectorBtn, stopDetectorBtn, detectionFpsSlider;
+
+// 在 Canvas 上绘制检测框
+function drawDetections(boxes) {
+    if (!boxes || boxes.length === 0) return;
+    
+    const ctx = canvas.getContext('2d');
+    const scaleX = canvas.width / 640;  // 640 是检测器输入尺寸
+    const scaleY = canvas.height / 640;
+    
+    ctx.strokeStyle = '#00ff00';
+    ctx.lineWidth = 3;
+    ctx.font = '16px monospace';
+    ctx.fillStyle = '#00ff00';
+    
+    boxes.forEach(box => {
+        // 缩放坐标到显示尺寸
+        const x1 = box.x1 * scaleX;
+        const y1 = box.y1 * scaleY;
+        const x2 = box.x2 * scaleX;
+        const y2 = box.y2 * scaleY;
+        
+        // 绘制矩形框
+        ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+        
+        // 绘制标签
+        const label = `${box.class_name} ${(box.confidence * 100).toFixed(0)}%`;
+        ctx.fillText(label, x1, y1 - 5);
+    });
+}
 
 // 音量控制
 volumeSlider.addEventListener('input', (e) => {
@@ -809,6 +851,11 @@ startBtn.addEventListener('click', async () => {
         rtspInput.disabled = true;
         
         showStatus('✅ 监控已启动');
+        
+        // 自动启动检测器(可选)
+        // setTimeout(() => {
+        //     frameDetector.startDetector('yolov8n', 'bytetrack');
+        // }, 2000);
     } catch (err) {
         console.error('启动失败:', err);
         showStatus('❌ 启动失败: ' + err);
@@ -816,7 +863,12 @@ startBtn.addEventListener('click', async () => {
     }
 });
 
-stopBtn.addEventListener('click', () => {
+stopBtn.addEventListener('click', async () => {
+    // 先停止检测器
+    if (frameDetector.isDetecting) {
+        await frameDetector.stopDetector();
+    }
+    
     renderer.stop();
     stopBtn.style.display = 'none';
     startBtn.style.display = 'block';
@@ -825,4 +877,12 @@ stopBtn.addEventListener('click', () => {
     showStatus('⏹ 监控已停止');
 });
 
+// 暴露到全局方便调试
+window.renderer = renderer;
+window.frameDetector = frameDetector;
+
 console.log('WebGL renderer initialized');
+console.log('使用方法:');
+console.log('  启动检测: frameDetector.startDetector("yolov8n", "bytetrack")');
+console.log('  停止检测: frameDetector.stopDetector()');
+console.log('  调整FPS:  frameDetector.setDetectionFps(15)');

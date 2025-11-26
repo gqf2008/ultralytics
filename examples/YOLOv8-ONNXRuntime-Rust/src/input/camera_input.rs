@@ -33,7 +33,7 @@ impl CameraInput {
         };
 
         let (width, height) = decoder.video_info();
-        let mut rgba_buffer = Vec::new();
+        let mut rgba_buffer = Vec::with_capacity(1280 * 720 * 4);
         let mut frame_count = 0u64;
         let mut last_fps_time = std::time::Instant::now();
         let mut fps_counter = 0u64;
@@ -70,9 +70,15 @@ impl CameraInput {
                         last_fps_time = std::time::Instant::now();
                     }
 
-                    // 通过 xbus 发送
+                    // 通过 xbus 发送 (使用 Arc 包装交换缓冲区)
+                    let capacity = rgba_buffer.capacity();
+                    let rgba_arc = Arc::new(std::mem::replace(
+                        &mut rgba_buffer,
+                        Vec::with_capacity(capacity),
+                    ));
+
                     let decoded = DecodedFrame {
-                        rgba_data: Arc::new(rgba_buffer.clone()),
+                        rgba_data: rgba_arc,
                         width,
                         height,
                         decode_fps: current_fps,

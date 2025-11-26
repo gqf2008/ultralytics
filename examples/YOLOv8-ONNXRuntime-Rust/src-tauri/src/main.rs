@@ -167,10 +167,6 @@ async fn start_rtsp_stream(
     let generation = DECODER_GENERATION.fetch_add(1, Ordering::SeqCst);
     println!("📌 新解码器代数: {}", generation);
 
-    // 更新主项目的全局代数计数器
-    yolov8_rs::input::decoder_manager::ACTIVE_DECODER_GENERATION
-        .store(generation, Ordering::Relaxed);
-
     // 启动 RTSP 代理 (用于前端显示)
     let proxy_state = app.state::<ProxyState>();
     proxy_state
