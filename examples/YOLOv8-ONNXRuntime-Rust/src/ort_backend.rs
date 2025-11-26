@@ -6,7 +6,7 @@ use half::f16;
 use ndarray::{Array, CowArray, IxDyn};
 use ort::execution_providers::{
     CPUExecutionProvider, CUDAExecutionProvider, DirectMLExecutionProvider, ExecutionProvider,
-    ExecutionProviderDispatch, TensorRTExecutionProvider, WebGPUExecutionProvider,
+    ExecutionProviderDispatch, TensorRTExecutionProvider,
 };
 use ort::session::builder::SessionBuilder;
 use ort::session::Session;
@@ -28,6 +28,8 @@ pub enum OrtEP {
     CPU,
     CUDA(i32),
     Trt(i32),
+    DirectML(i32),
+    Auto, // 自动选择最佳 EP: CUDA > DirectML > CPU
 }
 
 #[derive(Debug)]
@@ -165,10 +167,8 @@ impl OrtBackend {
         let (ep, provider) = match args.ep {
             OrtEP::CUDA(device_id) => Self::set_ep_cuda(device_id),
             OrtEP::Trt(device_id) => Self::set_ep_trt(device_id, args.trt_fp16, &batch, &inputs),
-            _ => (
-                OrtEP::CPU,
-                ExecutionProviderDispatch::from(CPUExecutionProvider::default()),
-            ),
+            OrtEP::DirectML(device_id) => Self::set_ep_directml(device_id),
+            _ => Self::set_ep_auto(), // 自动选择最佳 EP
         };
 
         // build session again with the new provider
@@ -236,17 +236,63 @@ impl OrtBackend {
     pub fn set_ep_cuda(device_id: i32) -> (OrtEP, ExecutionProviderDispatch) {
         let cuda_provider = CUDAExecutionProvider::default().with_device_id(device_id);
         if let Ok(true) = cuda_provider.is_available() {
+            println!("> Using CUDA (device: {})", device_id);
             (
                 OrtEP::CUDA(device_id),
                 ExecutionProviderDispatch::from(cuda_provider), //PlantForm::CUDA(cuda_provider)
             )
         } else {
-            println!("> CUDA is not available! Using CPU.");
+            println!("> CUDA is not available! Trying DirectML...");
+            Self::set_ep_directml(0)
+        }
+    }
+
+    pub fn set_ep_directml(device_id: i32) -> (OrtEP, ExecutionProviderDispatch) {
+        let dml_provider = DirectMLExecutionProvider::default().with_device_id(device_id);
+        if let Ok(true) = dml_provider.is_available() {
+            println!("> Using DirectML (device: {})", device_id);
+            (
+                OrtEP::DirectML(device_id),
+                ExecutionProviderDispatch::from(dml_provider),
+            )
+        } else {
+            println!("> DirectML is not available! Using CPU.");
             (
                 OrtEP::CPU,
-                ExecutionProviderDispatch::from(CPUExecutionProvider::default()), //PlantForm::CPU(CPUExecutionProvider::default())
+                ExecutionProviderDispatch::from(CPUExecutionProvider::default()),
             )
         }
+    }
+
+    /// 自动选择最佳执行提供程序: DirectML > CUDA > CPU
+    /// DirectML 在 Windows 上更通用 (支持 AMD/Intel/NVIDIA)
+    pub fn set_ep_auto() -> (OrtEP, ExecutionProviderDispatch) {
+        // 1. 优先尝试 DirectML (Windows GPU 通用)
+        let dml_provider = DirectMLExecutionProvider::default();
+        if let Ok(true) = dml_provider.is_available() {
+            println!("> Auto-selected: DirectML (Windows GPU)");
+            return (
+                OrtEP::DirectML(0),
+                ExecutionProviderDispatch::from(dml_provider),
+            );
+        }
+
+        // 2. 尝试 CUDA
+        let cuda_provider = CUDAExecutionProvider::default();
+        if let Ok(true) = cuda_provider.is_available() {
+            println!("> Auto-selected: CUDA");
+            return (
+                OrtEP::CUDA(0),
+                ExecutionProviderDispatch::from(cuda_provider),
+            );
+        }
+
+        // 3. 回退到 CPU
+        println!("> Auto-selected: CPU (no GPU acceleration available)");
+        (
+            OrtEP::CPU,
+            ExecutionProviderDispatch::from(CPUExecutionProvider::default()),
+        )
     }
 
     pub fn set_ep_trt(

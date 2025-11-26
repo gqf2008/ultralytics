@@ -53,6 +53,7 @@ ndarray = { version = "0.16" }
 ort = { version = "2.0.0-rc.5", features = [
     "cuda",
     "tensorrt",
+    "directml",
     "download-binaries",
     "copy-dylibs",
     "half",

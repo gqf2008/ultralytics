@@ -548,6 +548,18 @@
                     <button id="stop-btn">⏹ Stop Stream</button>
                 </div>
                 
+                <!-- 检测器设置 -->
+                <div class="detector-settings" style="display: flex; gap: 12px; align-items: center; padding: 16px; background: rgba(255, 255, 255, 0.03); border-radius: 10px; border: 1px solid rgba(255, 255, 255, 0.08);">
+                    <label style="color: rgba(255, 255, 255, 0.7); font-size: 13px; font-weight: 500; min-width: 50px;">🧠 Model</label>
+                    <select id="model-select" style="flex: 1; padding: 10px 14px; background: rgba(255, 255, 255, 0.05); border: 1px solid rgba(255, 255, 255, 0.15); border-radius: 8px; color: #fff; font-size: 13px; cursor: pointer;">
+                        <option value="">加载中...</option>
+                    </select>
+                    <label style="color: rgba(255, 255, 255, 0.7); font-size: 13px; font-weight: 500; min-width: 50px;">⚡ Device</label>
+                    <select id="device-select" style="flex: 1; padding: 10px 14px; background: rgba(255, 255, 255, 0.05); border: 1px solid rgba(255, 255, 255, 0.15); border-radius: 8px; color: #fff; font-size: 13px; cursor: pointer;">
+                        <option value="auto">Auto</option>
+                    </select>
+                </div>
+                
                 <!-- 检测器控制 -->
                 <div class="detector-control" style="display: flex; gap: 12px; align-items: center; padding: 16px; background: rgba(255, 255, 255, 0.03); border-radius: 10px; border: 1px solid rgba(255, 255, 255, 0.08);">
                     <label style="color: rgba(255, 255, 255, 0.7); font-size: 13px; font-weight: 500; min-width: 80px;">🎯 Detection</label>

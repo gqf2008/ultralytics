@@ -62,6 +62,11 @@ class WebGLVideoRenderer {
         this.audioChannels = 1;
         this.audioGain = 1.5; // 音频增益降低到1.5倍,避免削波
         
+        // 🚀 实时性优化：帧队列管理
+        this.pendingFrames = []; // 待处理帧队列
+        this.maxPendingFrames = 2; // 最大缓存帧数
+        this.lastFrameTime = 0;
+        
         // 初始化 Canvas 尺寸为容器大小
         this.resizeCanvas();
         
@@ -147,11 +152,22 @@ class WebGLVideoRenderer {
         if (this.decoder && this.decoder.state !== 'closed') {
             this.decoder.close();
         }
+        
+        // 🚀 清空帧队列
+        this.pendingFrames = [];
 
         this.decoder = new VideoDecoder({
             output: (frame) => {
-                this.renderFrame(frame);
-                frame.close();
+                // 🚀 实时性优化：帧队列管理
+                // 如果队列已满，丢弃旧帧
+                while (this.pendingFrames.length >= this.maxPendingFrames) {
+                    const oldFrame = this.pendingFrames.shift();
+                    oldFrame.close();
+                }
+                this.pendingFrames.push(frame);
+                
+                // 立即处理最新帧
+                this.processLatestFrame();
             },
             error: (e) => console.error("Decoder error:", e),
         });
@@ -355,28 +371,29 @@ class WebGLVideoRenderer {
         const channels = this.audioChannels;
         const frameCount = pcmData.length / channels;
         
-        // 检查采样值范围 (调试用)
-        let minVal = 32767, maxVal = -32768;
-        for (let i = 0; i < pcmData.length; i++) {
-            if (pcmData[i] < minVal) minVal = pcmData[i];
-            if (pcmData[i] > maxVal) maxVal = pcmData[i];
-        }
-        
-        if (Math.random() < 0.02) { // 2% 采样率打印范围信息
-            console.log(`🔊 [PCM] Min: ${minVal}, Max: ${maxVal}, Gain: ${this.audioGain}x`);
-        }
-        
         // 如果 AudioContext 被挂起,尝试恢复
         if (this.audioContext.state === 'suspended') {
             console.warn('⚠️ AudioContext suspended, resuming...');
             this.audioContext.resume();
         }
         
+        // 🚀 实时性优化：检测音频延迟，如果延迟超过 500ms 则重置
+        const currentTime = this.audioContext.currentTime;
+        const audioDelay = this.nextAudioTime - currentTime;
+        
+        if (audioDelay > 0.5) {
+            // 音频缓冲超过 500ms，重置到当前时间以恢复实时
+            console.warn(`⚠️ [Audio] 缓冲过大 ${(audioDelay * 1000).toFixed(0)}ms, 重置音频同步`);
+            this.nextAudioTime = currentTime;
+        } else if (audioDelay < -0.1) {
+            // 音频已落后，跳到当前时间
+            this.nextAudioTime = currentTime;
+        }
+        
         // 创建 AudioBuffer
         const buffer = this.audioContext.createBuffer(channels, frameCount, sampleRate);
         
         // 转换 Int16 PCM 到 Float32 (-1.0 到 1.0),并应用增益
-        let clippedSamples = 0;
         for (let ch = 0; ch < channels; ch++) {
             const channelData = buffer.getChannelData(ch);
             for (let i = 0; i < frameCount; i++) {
@@ -387,27 +404,16 @@ class WebGLVideoRenderer {
                 // 软限幅防止削波 (使用 tanh 函数平滑限制)
                 if (Math.abs(sample) > 0.95) {
                     sample = Math.tanh(sample * 0.8); // 平滑削波
-                    clippedSamples++;
                 }
                 
                 channelData[i] = sample;
             }
         }
         
-        if (clippedSamples > 0 && Math.random() < 0.05) {
-            console.warn(`⚠️ [Audio] ${clippedSamples} samples clipped, consider reducing gain`);
-        }
-        
         // 创建音频源并播放
         const source = this.audioContext.createBufferSource();
         source.buffer = buffer;
         source.connect(this.audioContext.destination);
-        
-        // 计算播放时间,避免断续
-        const currentTime = this.audioContext.currentTime;
-        if (this.nextAudioTime < currentTime) {
-            this.nextAudioTime = currentTime;
-        }
         
         source.start(this.nextAudioTime);
         this.nextAudioTime += buffer.duration;
@@ -502,8 +508,38 @@ class WebGLVideoRenderer {
         }
     }
     
+    /**
+     * 🚀 实时性优化：处理最新帧，丢弃所有旧帧
+     */
+    processLatestFrame() {
+        if (!this.isRunning || this.pendingFrames.length === 0) return;
+        
+        // 只保留最新帧，关闭并丢弃其他帧
+        while (this.pendingFrames.length > 1) {
+            const oldFrame = this.pendingFrames.shift();
+            oldFrame.close();
+        }
+        
+        const frame = this.pendingFrames.shift();
+        if (frame) {
+            this.renderFrame(frame);
+            frame.close();
+        }
+    }
+    
     renderFrame(frame) {
         if (!this.isRunning) return;
+        
+        // 🚀 实时性：记录帧时间，用于延迟监控
+        const now = performance.now();
+        if (this.lastFrameTime > 0) {
+            const delta = now - this.lastFrameTime;
+            // 如果帧间隔超过 100ms，说明可能有延迟
+            if (delta > 100 && !this.warnedOnce) {
+                console.warn(`⚠️ 帧间隔过大: ${delta.toFixed(0)}ms`);
+            }
+        }
+        this.lastFrameTime = now;
         
         // 更新视频源分辨率信息
         if (this.videoWidth !== frame.displayWidth || this.videoHeight !== frame.displayHeight) {
@@ -527,7 +563,6 @@ class WebGLVideoRenderer {
 
         // Update FPS
         this.frameCount++;
-        const now = performance.now();
         if (now - this.lastTime >= 1000) {
             this.fps = this.frameCount;
             this.frameCount = 0;
@@ -594,34 +629,44 @@ const detectionCtx = detectionOverlay.getContext('2d');
 // 检测框缓存 - 用于平滑绘制
 let cachedBoxes = [];
 let drawScheduled = false;
+let overlayWidth = window.innerWidth;
+let overlayHeight = window.innerHeight;
 
 // 同步 overlay canvas 尺寸
 function syncOverlaySize() {
-    detectionOverlay.width = window.innerWidth;
-    detectionOverlay.height = window.innerHeight;
-    // 重绘当前检测框
-    if (cachedBoxes.length > 0) {
-        renderBoxes();
+    const newW = window.innerWidth;
+    const newH = window.innerHeight;
+    
+    // 只有尺寸真正改变时才更新
+    if (detectionOverlay.width !== newW || detectionOverlay.height !== newH) {
+        detectionOverlay.width = newW;
+        detectionOverlay.height = newH;
+        overlayWidth = newW;
+        overlayHeight = newH;
+        console.log(`🔄 [Overlay] 尺寸更新: ${newW}x${newH}`);
+        
+        // 立即重绘（不使用 RAF 调度，避免被跳过）
+        renderBoxesImmediate();
     }
 }
 syncOverlaySize();
 window.addEventListener('resize', syncOverlaySize);
 
-// 实际渲染检测框 (在 RAF 中调用)
-function renderBoxes() {
+// 立即渲染检测框（不依赖 RAF 调度）
+function renderBoxesImmediate() {
     const ctx = detectionCtx;
-    const w = detectionOverlay.width;
-    const h = detectionOverlay.height;
+    const w = overlayWidth;
+    const h = overlayHeight;
     
     // 清除
     ctx.clearRect(0, 0, w, h);
     
     if (cachedBoxes.length === 0) return;
     
-    // 预设样式 (减少状态切换)
+    // 预设样式 (每次绘制都要设置，因为 resize 会重置 context)
     ctx.strokeStyle = '#00ff00';
-    ctx.lineWidth = 2;
-    ctx.font = 'bold 14px monospace';
+    ctx.lineWidth = 3;
+    ctx.font = 'bold 16px monospace';
     
     cachedBoxes.forEach(box => {
         // 归一化坐标 (0-1) → 屏幕坐标
@@ -635,15 +680,21 @@ function renderBoxes() {
         // 绘制矩形框
         ctx.strokeRect(x1, y1, bw, bh);
         
-        // 绘制标签
+        // 绘制标签背景
         const label = `${box.class_name} ${(box.confidence * 100).toFixed(0)}%`;
         const textWidth = ctx.measureText(label).width;
         ctx.fillStyle = 'rgba(0, 255, 0, 0.8)';
-        ctx.fillRect(x1, y1 - 20, textWidth + 6, 20);
+        ctx.fillRect(x1, y1 - 22, textWidth + 8, 22);
+        
+        // 绘制标签文字
         ctx.fillStyle = '#000';
-        ctx.fillText(label, x1 + 3, y1 - 5);
+        ctx.fillText(label, x1 + 4, y1 - 6);
     });
-    
+}
+
+// 实际渲染检测框 (在 RAF 中调用)
+function renderBoxes() {
+    renderBoxesImmediate();
     drawScheduled = false;
 }
 
@@ -930,13 +981,77 @@ window.frameDetector = frameDetector;
 // 检测器按钮事件
 const startDetectorBtn = document.getElementById('start-detector-btn');
 const stopDetectorBtn = document.getElementById('stop-detector-btn');
+const modelSelect = document.getElementById('model-select');
+const deviceSelect = document.getElementById('device-select');
+
+// 加载可用模型和设备列表
+async function loadModelsAndDevices() {
+    try {
+        // 并行加载
+        const [models, devices] = await Promise.all([
+            invoke('get_available_models'),
+            invoke('get_available_devices')
+        ]);
+        
+        // 填充模型下拉框
+        modelSelect.innerHTML = '';
+        models.forEach(model => {
+            const option = document.createElement('option');
+            option.value = model.path;
+            option.textContent = model.name;
+            modelSelect.appendChild(option);
+        });
+        
+        // 默认选择 yolov8n.onnx (如果存在)
+        const defaultModel = models.find(m => m.name === 'yolov8n.onnx');
+        if (defaultModel) {
+            modelSelect.value = defaultModel.path;
+        }
+        
+        console.log(`📦 已加载 ${models.length} 个模型`);
+        
+        // 填充设备下拉框
+        deviceSelect.innerHTML = '<option value="auto">🔄 Auto</option>';
+        devices.forEach(device => {
+            const option = document.createElement('option');
+            option.value = device.id;
+            const icon = device.id === 'cuda' ? '🎮' : (device.id === 'directml' ? '🖥️' : '💻');
+            const status = device.available ? '✅' : '❌';
+            option.textContent = `${icon} ${device.name} ${status}`;
+            option.disabled = !device.available;
+            deviceSelect.appendChild(option);
+        });
+        
+        console.log(`⚡ 已加载 ${devices.length} 个设备`);
+        
+    } catch (err) {
+        console.error('加载模型/设备列表失败:', err);
+        modelSelect.innerHTML = '<option value="">加载失败</option>';
+    }
+}
+
+// 页面加载时加载模型和设备列表
+loadModelsAndDevices();
 
 startDetectorBtn.addEventListener('click', async () => {
     try {
         startDetectorBtn.disabled = true;
         startDetectorBtn.textContent = '🔄 加载中...';
         
-        const result = await frameDetector.startDetector('yolov8n', 'bytetrack');
+        // 获取用户选择
+        const selectedModel = modelSelect.value;
+        const selectedDevice = deviceSelect.value;
+        
+        if (!selectedModel) {
+            showStatus('❌ 请选择模型');
+            startDetectorBtn.disabled = false;
+            startDetectorBtn.textContent = '▶ 开启检测';
+            return;
+        }
+        
+        console.log(`🚀 启动检测: 模型=${selectedModel}, 设备=${selectedDevice}`);
+        
+        const result = await frameDetector.startDetectorWithOptions(selectedModel, selectedDevice, 'bytetrack');
         
         if (result) {
             // 更新检测输入尺寸用于坐标缩放
@@ -944,9 +1059,12 @@ startDetectorBtn.addEventListener('click', async () => {
                 console.log(`📐 检测输入尺寸: ${result.input_width}x${result.input_width}`);
             }
             
+            // 显示实际使用的设备
+            const deviceUsed = result.device || selectedDevice;
+            showStatus(`✅ 检测器已启动 [${deviceUsed}]`);
+            
             startDetectorBtn.style.display = 'none';
             stopDetectorBtn.style.display = 'block';
-            showStatus('✅ 检测器已启动');
         }
     } catch (err) {
         console.error('启动检测器失败:', err);

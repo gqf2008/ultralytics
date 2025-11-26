@@ -1,16 +1,12 @@
 //! Pure Rust RTSP Proxy - using retina crate (no FFmpeg dependency)
 
-use futures_util::{SinkExt, StreamExt};
+use futures_util::StreamExt;
 use retina::client::{Credentials, PlayOptions, Session, SessionOptions, SetupOptions, Transport};
 use retina::codec::CodecItem;
 use serde_json::json;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tauri::ipc::{Channel, InvokeResponseBody};
-use tokio::net::TcpListener;
-use tokio::sync::broadcast;
-use tokio_tungstenite::accept_async;
-use tokio_tungstenite::tungstenite::Message;
 use url::Url;
 
 /// 将 AVC/AVCC 格式 (4字节长度前缀) 转换为 Annex-B 格式 (00 00 00 01 起始码)
@@ -40,16 +36,13 @@ fn convert_to_annex_b(data: &[u8]) -> Vec<u8> {
 }
 
 pub struct RtspProxy {
-    tx: broadcast::Sender<Vec<u8>>,
     running: Arc<AtomicBool>,
     active_generation: Arc<AtomicUsize>,
 }
 
 impl RtspProxy {
     pub fn new() -> Self {
-        let (tx, _) = broadcast::channel(100);
         Self {
-            tx,
             running: Arc::new(AtomicBool::new(false)),
             active_generation: Arc::new(AtomicUsize::new(0)),
         }
@@ -64,7 +57,6 @@ impl RtspProxy {
         // 先停止旧流
         self.running.store(false, Ordering::SeqCst);
 
-        let tx = self.tx.clone();
         let running = self.running.clone();
         // 增加 generation，新流使用新值
         let generation = self.active_generation.fetch_add(1, Ordering::SeqCst) + 1;
@@ -188,11 +180,9 @@ impl RtspProxy {
                         let raw_data = frame.into_data();
                         let annex_b_data = convert_to_annex_b(&raw_data);
 
-                        let mut pkt = vec![0xAA];
-                        pkt.extend_from_slice(&annex_b_data);
-                        let _ = tx.send(pkt);
+                        // 直接通过 Tauri Channel 发送到前端 (零缓冲，实时)
                         if let Some(ref c) = video_channel {
-                            let _ = c.send(InvokeResponseBody::Raw(annex_b_data.clone()));
+                            let _ = c.send(InvokeResponseBody::Raw(annex_b_data));
                         }
                     }
                     Some(Ok(_)) => {}
@@ -205,26 +195,5 @@ impl RtspProxy {
 
     pub fn stop(&self) {
         self.running.store(false, Ordering::SeqCst);
-    }
-
-    pub async fn run_server(&self, port: u16) {
-        let addr = format!("127.0.0.1:{}", port);
-        let listener = TcpListener::bind(&addr).await.expect("bind failed");
-        println!("WS Proxy on ws://{}", addr);
-        loop {
-            if let Ok((stream, _)) = listener.accept().await {
-                let mut rx = self.tx.subscribe();
-                tokio::spawn(async move {
-                    if let Ok(ws) = accept_async(stream).await {
-                        let (mut w, _) = ws.split();
-                        while let Ok(data) = rx.recv().await {
-                            if w.send(Message::Binary(data)).await.is_err() {
-                                break;
-                            }
-                        }
-                    }
-                });
-            }
-        }
     }
 }

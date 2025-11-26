@@ -228,6 +228,134 @@ impl AsyncDetectorState {
         Ok((width, height))
     }
 
+    /// 启动检测器 - 指定设备
+    pub fn start_with_device(
+        &self,
+        model_path: &str,
+        device: &str,
+        result_channel: Channel<DetectionResult>,
+    ) -> Result<(u32, u32, String), String> {
+        if *self.is_running.read() {
+            return Err("检测器已在运行".to_string());
+        }
+
+        // 保存结果 Channel
+        *self.result_channel.write() = Some(result_channel.clone());
+
+        // 检查模型文件
+        if !Path::new(model_path).exists() {
+            return Err(format!("模型文件不存在: {}", model_path));
+        }
+
+        println!("🔄 正在加载模型: {}", model_path);
+
+        // 根据用户选择的设备选择执行提供程序
+        let (ep_name, providers) = Self::select_execution_provider_by_device(device);
+        println!(
+            "🎯 用户选择设备: {} → 使用执行提供程序: {}",
+            device, ep_name
+        );
+
+        // 加载模型 - 启用多线程并行推理
+        let session = Session::builder()
+            .map_err(|e| format!("创建 Session Builder 失败: {}", e))?
+            .with_optimization_level(GraphOptimizationLevel::Level3)
+            .map_err(|e| format!("设置优化级别失败: {}", e))?
+            .with_intra_threads(4) // 算子内并行 (4线程)
+            .map_err(|e| format!("设置 intra_threads 失败: {}", e))?
+            .with_inter_threads(2) // 算子间并行 (2线程)
+            .map_err(|e| format!("设置 inter_threads 失败: {}", e))?
+            .with_execution_providers(providers)
+            .map_err(|e| format!("设置 {} EP 失败: {}", ep_name, e))?
+            .commit_from_file(model_path)
+            .map_err(|e| format!("加载模型失败: {}", e))?;
+
+        // 使用 640x640 提高检测精度
+        let width = 640u32;
+        let height = 640u32;
+        *self.input_width.write() = width;
+        *self.input_height.write() = height;
+
+        println!("✅ 模型加载成功，使用 {}x{} 输入尺寸", width, height);
+
+        // 创建 channel (只保留最新帧，丢弃旧帧)
+        let (tx, rx): (Sender<FrameData>, Receiver<FrameData>) = mpsc::channel();
+        *self.sender.write() = Some(tx);
+        *self.is_running.write() = true;
+
+        // 启动检测线程
+        let conf_threshold = 0.25f32;
+        let iou_threshold = 0.45f32;
+
+        thread::spawn(move || {
+            Self::detection_loop(
+                session,
+                rx,
+                result_channel,
+                conf_threshold,
+                iou_threshold,
+                width,
+                height,
+            );
+        });
+
+        Ok((width, height, ep_name.to_string()))
+    }
+
+    /// 根据设备名称选择执行提供程序
+    fn select_execution_provider_by_device(
+        device: &str,
+    ) -> (
+        &'static str,
+        Vec<ort::execution_providers::ExecutionProviderDispatch>,
+    ) {
+        use ort::execution_providers::ExecutionProviderDispatch;
+
+        match device.to_lowercase().as_str() {
+            "cuda" => {
+                let cuda = CUDAExecutionProvider::default();
+                if cuda.is_available().unwrap_or(false) {
+                    println!("✅ CUDA 可用");
+                    return ("CUDA", vec![ExecutionProviderDispatch::from(cuda)]);
+                }
+                println!("⚠️ CUDA 不可用，回退到 CPU");
+                (
+                    "CPU",
+                    vec![ExecutionProviderDispatch::from(
+                        CPUExecutionProvider::default(),
+                    )],
+                )
+            }
+            "directml" => {
+                let dml = DirectMLExecutionProvider::default();
+                if dml.is_available().unwrap_or(false) {
+                    println!("✅ DirectML 可用");
+                    return ("DirectML", vec![ExecutionProviderDispatch::from(dml)]);
+                }
+                println!("⚠️ DirectML 不可用，回退到 CPU");
+                (
+                    "CPU",
+                    vec![ExecutionProviderDispatch::from(
+                        CPUExecutionProvider::default(),
+                    )],
+                )
+            }
+            "cpu" => {
+                println!("ℹ️ 使用 CPU 执行");
+                (
+                    "CPU",
+                    vec![ExecutionProviderDispatch::from(
+                        CPUExecutionProvider::default(),
+                    )],
+                )
+            }
+            "auto" | _ => {
+                // 自动选择最佳设备
+                Self::select_best_execution_provider()
+            }
+        }
+    }
+
     /// 检测线程主循环
     fn detection_loop(
         mut session: Session,
@@ -356,11 +484,13 @@ impl AsyncDetectorState {
         rgba_data: &[u8],
         src_width: u32,
         src_height: u32,
-        model_width: u32,
-        model_height: u32,
+        _model_width: u32,
+        _model_height: u32,
         conf_threshold: f32,
         iou_threshold: f32,
     ) -> Result<Vec<DetectionBox>, String> {
+        let t0 = Instant::now();
+
         let src_pixel_count = (src_width * src_height) as usize;
         let expected_size = src_pixel_count * 4;
 
@@ -378,34 +508,29 @@ impl AsyncDetectorState {
         let (final_width, final_height) = (src_width, src_height);
         let pixel_count = (final_width * final_height) as usize;
 
-        // 预分配输出缓冲区
-        let mut input_data = vec![0f32; pixel_count * 3];
+        // 预分配输出缓冲区 - 使用 unsafe 避免初始化开销
+        let mut input_data: Vec<f32> = Vec::with_capacity(pixel_count * 3);
+        unsafe {
+            input_data.set_len(pixel_count * 3);
+        }
 
-        // 优化: RGBA → CHW 格式转换 (并行 + 避免边界检查)
-        // 分成 R、G、B 三个通道并行处理
-        let (r_channel, rest) = input_data.split_at_mut(pixel_count);
-        let (g_channel, b_channel) = rest.split_at_mut(pixel_count);
+        // 优化: RGBA → CHW 格式转换 (SIMD 友好的单线程版本更快)
+        // 640x640 = 409600 像素，单线程比多线程更快 (避免线程切换开销)
+        let r_offset = 0;
+        let g_offset = pixel_count;
+        let b_offset = pixel_count * 2;
 
-        // 并行处理三个通道
-        rayon::scope(|s| {
-            s.spawn(|_| {
-                for i in 0..pixel_count {
-                    r_channel[i] = rgba_data[i * 4] as f32 / 255.0;
-                }
-            });
-            s.spawn(|_| {
-                for i in 0..pixel_count {
-                    g_channel[i] = rgba_data[i * 4 + 1] as f32 / 255.0;
-                }
-            });
-            s.spawn(|_| {
-                for i in 0..pixel_count {
-                    b_channel[i] = rgba_data[i * 4 + 2] as f32 / 255.0;
-                }
-            });
-        });
+        // 单次遍历完成所有通道转换
+        for i in 0..pixel_count {
+            let base = i * 4;
+            input_data[r_offset + i] = rgba_data[base] as f32 * (1.0 / 255.0);
+            input_data[g_offset + i] = rgba_data[base + 1] as f32 * (1.0 / 255.0);
+            input_data[b_offset + i] = rgba_data[base + 2] as f32 * (1.0 / 255.0);
+        }
 
-        // 创建输入张量
+        let t1 = Instant::now();
+
+        // 创建输入张量 - 直接从 Vec 构建，零拷贝
         let input_array = Array::from_shape_vec(
             IxDyn(&[1, 3, final_height as usize, final_width as usize]),
             input_data,
@@ -416,10 +541,14 @@ impl AsyncDetectorState {
         let input_value = ort::value::Value::from_array(input_array)
             .map_err(|e| format!("创建输入值失败: {}", e))?;
 
+        let t2 = Instant::now();
+
         // 推理
         let outputs = session
             .run(ort::inputs![input_value])
             .map_err(|e| format!("推理失败: {}", e))?;
+
+        let t3 = Instant::now();
 
         // 解析输出
         let output = outputs
@@ -436,45 +565,45 @@ impl AsyncDetectorState {
         // Shape 实现了 Deref<Target = [i64]>，可以直接迭代
         let dims: Vec<usize> = out_shape.iter().map(|&d| d as usize).collect();
 
-        // 构建 ndarray (避免 to_vec 拷贝，直接使用 slice)
-        let output_array = Array::from_shape_vec(IxDyn(&dims), out_slice.to_vec())
-            .map_err(|e| format!("构建输出数组失败: {}", e))?;
+        // 直接使用 slice 避免拷贝
+        let num_classes = dims[1] - 4;
+        let num_detections = dims[2];
 
-        let output_data = output_array.view();
+        // 预分配检测结果
+        let mut detections = Vec::with_capacity(100);
 
-        // YOLOv8 输出: [1, 84, 8400] -> 转置为 [8400, 84]
-        let shape = output_data.shape();
-        if shape.len() != 3 {
-            return Err(format!("输出形状不正确: {:?}", shape));
-        }
-
-        let num_classes = shape[1] - 4;
-        let num_detections = shape[2];
-
-        let mut detections = Vec::new();
-
+        // 优化: 直接访问 slice 避免 ndarray 索引开销
+        let stride1 = dims[2]; // 8400
         for i in 0..num_detections {
-            let x_center = output_data[[0, 0, i]];
-            let y_center = output_data[[0, 1, i]];
-            let w = output_data[[0, 2, i]];
-            let h = output_data[[0, 3, i]];
+            let x_center = out_slice[0 * stride1 + i];
+            let y_center = out_slice[1 * stride1 + i];
+            let w = out_slice[2 * stride1 + i];
+            let h = out_slice[3 * stride1 + i];
 
+            // 快速找最大类别分数
             let mut max_score = 0f32;
             let mut max_class = 0usize;
-
             for c in 0..num_classes {
-                let score = output_data[[0, 4 + c, i]];
+                let score = out_slice[(4 + c) * stride1 + i];
                 if score > max_score {
                     max_score = score;
                     max_class = c;
                 }
             }
 
+            // 🎯 只检测人形 (class_id = 0, person)
+            if max_class != 0 {
+                continue;
+            }
+
             if max_score >= conf_threshold {
-                let x1 = (x_center - w / 2.0) / final_width as f32;
-                let y1 = (y_center - h / 2.0) / final_height as f32;
-                let x2 = (x_center + w / 2.0) / final_width as f32;
-                let y2 = (y_center + h / 2.0) / final_height as f32;
+                let inv_w = 1.0 / final_width as f32;
+                let inv_h = 1.0 / final_height as f32;
+
+                let x1 = ((x_center - w * 0.5) * inv_w).clamp(0.0, 1.0);
+                let y1 = ((y_center - h * 0.5) * inv_h).clamp(0.0, 1.0);
+                let x2 = ((x_center + w * 0.5) * inv_w).clamp(0.0, 1.0);
+                let y2 = ((y_center + h * 0.5) * inv_h).clamp(0.0, 1.0);
 
                 let class_name = COCO_CLASSES
                     .get(max_class)
@@ -482,10 +611,10 @@ impl AsyncDetectorState {
                     .to_string();
 
                 detections.push(DetectionBox {
-                    x1: x1.clamp(0.0, 1.0),
-                    y1: y1.clamp(0.0, 1.0),
-                    x2: x2.clamp(0.0, 1.0),
-                    y2: y2.clamp(0.0, 1.0),
+                    x1,
+                    y1,
+                    x2,
+                    y2,
                     confidence: max_score,
                     class_id: max_class as u32,
                     class_name,
@@ -493,6 +622,8 @@ impl AsyncDetectorState {
                 });
             }
         }
+
+        let t4 = Instant::now();
 
         // NMS
         detections.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap());
@@ -521,6 +652,23 @@ impl AsyncDetectorState {
             .filter(|(i, _)| keep[*i])
             .map(|(_, d)| d)
             .collect();
+
+        let t5 = Instant::now();
+
+        // 打印各阶段耗时 (每50帧打印一次)
+        static TIMING_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let tc = TIMING_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if tc % 50 == 0 {
+            println!(
+                "⏱️ 耗时分析: 预处理={:.1}ms, 张量={:.1}ms, 推理={:.1}ms, 后处理={:.1}ms, NMS={:.1}ms, 总={:.1}ms",
+                (t1 - t0).as_secs_f64() * 1000.0,
+                (t2 - t1).as_secs_f64() * 1000.0,
+                (t3 - t2).as_secs_f64() * 1000.0,
+                (t4 - t3).as_secs_f64() * 1000.0,
+                (t5 - t4).as_secs_f64() * 1000.0,
+                (t5 - t0).as_secs_f64() * 1000.0,
+            );
+        }
 
         Ok(final_detections)
     }
@@ -630,15 +778,25 @@ impl AsyncDetectorState {
         Ok((640, 640))
     }
 
-    /// 选择最佳执行提供程序: DirectML > CUDA > CPU
-    /// (DirectML 在 Windows 上更可靠，不需要额外安装 CUDA SDK)
+    /// 选择最佳执行提供程序: CUDA > DirectML > CPU
+    /// - CUDA: NVIDIA GPU (最快，需要安装 CUDA)
+    /// - DirectML: Windows GPU 通用加速 (AMD/Intel/NVIDIA)
+    /// - CPU: 备选方案
     fn select_best_execution_provider() -> (
         &'static str,
         Vec<ort::execution_providers::ExecutionProviderDispatch>,
     ) {
         use ort::execution_providers::ExecutionProviderDispatch;
 
-        // 1. 优先尝试 DirectML (Windows GPU 通用加速 - AMD/Intel/NVIDIA 都支持，无需额外安装)
+        // 1. 优先尝试 CUDA (NVIDIA GPU - 最快)
+        let cuda = CUDAExecutionProvider::default();
+        if cuda.is_available().unwrap_or(false) {
+            println!("✅ CUDA 可用 (NVIDIA GPU 加速)");
+            return ("CUDA", vec![ExecutionProviderDispatch::from(cuda)]);
+        }
+        println!("⚠️ CUDA 不可用");
+
+        // 2. 尝试 DirectML (Windows GPU 通用加速)
         let dml = DirectMLExecutionProvider::default();
         if dml.is_available().unwrap_or(false) {
             println!("✅ DirectML 可用 (Windows GPU 加速)");
@@ -646,16 +804,24 @@ impl AsyncDetectorState {
         }
         println!("⚠️ DirectML 不可用");
 
-        // 2. 尝试 CUDA (需要 NVIDIA GPU + CUDA SDK + cuDNN)
-        let cuda = CUDAExecutionProvider::default();
-        if cuda.is_available().unwrap_or(false) {
-            println!("✅ CUDA 可用");
-            return ("CUDA", vec![ExecutionProviderDispatch::from(cuda)]);
-        }
-        println!("⚠️ CUDA 不可用");
-
         // 3. 回退到 CPU
-        println!("ℹ️ 使用 CPU 执行");
+        println!("ℹ️ 使用 CPU 执行 (4线程并行)");
+        (
+            "CPU",
+            vec![ExecutionProviderDispatch::from(
+                CPUExecutionProvider::default(),
+            )],
+        )
+    }
+
+    /// 强制使用 CPU (供小模型测试用)
+    #[allow(dead_code)]
+    fn select_cpu_provider() -> (
+        &'static str,
+        Vec<ort::execution_providers::ExecutionProviderDispatch>,
+    ) {
+        use ort::execution_providers::ExecutionProviderDispatch;
+        println!("ℹ️ 强制使用 CPU");
         (
             "CPU",
             vec![ExecutionProviderDispatch::from(

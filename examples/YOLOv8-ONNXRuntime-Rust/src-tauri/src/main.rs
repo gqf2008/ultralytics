@@ -6,6 +6,9 @@ mod detector_async;
 mod rtsp_proxy;
 
 use detector_async::AsyncDetectorState;
+use ort::execution_providers::{
+    CUDAExecutionProvider, DirectMLExecutionProvider, ExecutionProvider,
+};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::panic;
@@ -179,6 +182,101 @@ async fn start_rtsp_stream(
     Ok(format!("RTSP 流已启动 (Gen: {})", generation))
 }
 
+// ==================== 设备和模型配置命令 ====================
+
+/// 可用加速设备信息
+#[derive(Clone, Serialize)]
+pub struct DeviceInfo {
+    pub id: String,
+    pub name: String,
+    pub available: bool,
+}
+
+/// 获取可用加速设备列表
+#[tauri::command]
+async fn get_available_devices() -> Result<Vec<DeviceInfo>, String> {
+    let mut devices = Vec::new();
+
+    // 检查 CUDA
+    let cuda = CUDAExecutionProvider::default();
+    let cuda_available = cuda.is_available().unwrap_or(false);
+    devices.push(DeviceInfo {
+        id: "cuda".to_string(),
+        name: "CUDA (NVIDIA GPU)".to_string(),
+        available: cuda_available,
+    });
+
+    // 检查 DirectML
+    let dml = DirectMLExecutionProvider::default();
+    let dml_available = dml.is_available().unwrap_or(false);
+    devices.push(DeviceInfo {
+        id: "directml".to_string(),
+        name: "DirectML (Windows GPU)".to_string(),
+        available: dml_available,
+    });
+
+    // CPU 始终可用
+    devices.push(DeviceInfo {
+        id: "cpu".to_string(),
+        name: "CPU".to_string(),
+        available: true,
+    });
+
+    Ok(devices)
+}
+
+/// 模型信息
+#[derive(Clone, Serialize)]
+pub struct ModelInfo {
+    pub id: String,
+    pub name: String,
+    pub path: String,
+    pub size: String,
+    pub exists: bool,
+}
+
+/// 获取可用模型列表
+#[tauri::command]
+async fn get_available_models() -> Result<Vec<ModelInfo>, String> {
+    let models_dir = std::env::current_exe()
+        .map_err(|e| format!("获取当前exe路径失败: {}", e))?
+        .parent()
+        .map(|p| p.join("models"))
+        .unwrap_or_else(|| std::path::PathBuf::from("models"));
+
+    let model_configs = vec![
+        ("yolov8n", "YOLOv8 Nano", "~6MB"),
+        ("yolov8s", "YOLOv8 Small", "~22MB"),
+        ("yolov8m", "YOLOv8 Medium", "~52MB"),
+        ("yolov8l", "YOLOv8 Large", "~87MB"),
+        ("yolov8n-seg", "YOLOv8n Seg", "~7MB"),
+        ("yolov8m-seg", "YOLOv8m Seg", "~53MB"),
+        ("yolov10n", "YOLOv10 Nano", "~5MB"),
+        ("yolov11n", "YOLOv11 Nano", "~5MB"),
+    ];
+
+    // 只返回存在的模型
+    let models: Vec<ModelInfo> = model_configs
+        .iter()
+        .filter_map(|(id, name, size)| {
+            let model_path = models_dir.join(format!("{}.onnx", id));
+            if model_path.exists() {
+                Some(ModelInfo {
+                    id: id.to_string(),
+                    name: name.to_string(),
+                    path: model_path.to_string_lossy().to_string(),
+                    size: size.to_string(),
+                    exists: true,
+                })
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    Ok(models)
+}
+
 // ==================== 检测器命令 ====================
 
 /// 启动检测器返回结果
@@ -187,6 +285,7 @@ pub struct StartDetectorResult {
     pub message: String,
     pub input_width: u32,
     pub input_height: u32,
+    pub device: String,
 }
 
 /// 启动检测器
@@ -194,34 +293,57 @@ pub struct StartDetectorResult {
 async fn start_detector(
     app: AppHandle,
     model: String,
+    device: String,
     _tracker: String,
     result_channel: tauri::ipc::Channel<detector_async::DetectionResult>,
 ) -> Result<StartDetectorResult, String> {
-    println!("🚀 启动检测器: model={}", model);
+    println!("🚀 启动检测器: model={}, device={}", model, device);
 
     let detector_state = app.state::<AsyncDetectorState>();
 
-    // 获取模型路径 - 使用当前exe所在目录下的 models 文件夹
-    let model_filename = format!("{}.onnx", model);
-    let model_path = std::env::current_exe()
-        .map_err(|e| format!("获取当前exe路径失败: {}", e))?
-        .parent()
-        .map(|p| p.join("models").join(&model_filename))
-        .unwrap_or_else(|| std::path::PathBuf::from("models").join(&model_filename));
+    // 获取模型路径
+    // 如果 model 已经是完整路径（包含路径分隔符或 .onnx 后缀），直接使用
+    // 否则在 models 目录下查找
+    let model_path = if model.contains(std::path::MAIN_SEPARATOR)
+        || model.contains('/')
+        || model.ends_with(".onnx")
+    {
+        // 可能是完整路径
+        if std::path::Path::new(&model).exists() {
+            std::path::PathBuf::from(&model)
+        } else {
+            // 可能只是文件名，在 models 目录下查找
+            std::env::current_exe()
+                .map_err(|e| format!("获取当前exe路径失败: {}", e))?
+                .parent()
+                .map(|p| p.join("models").join(&model))
+                .unwrap_or_else(|| std::path::PathBuf::from("models").join(&model))
+        }
+    } else {
+        // 简单模型名，添加 .onnx 后缀
+        let model_filename = format!("{}.onnx", model);
+        std::env::current_exe()
+            .map_err(|e| format!("获取当前exe路径失败: {}", e))?
+            .parent()
+            .map(|p| p.join("models").join(&model_filename))
+            .unwrap_or_else(|| std::path::PathBuf::from("models").join(&model_filename))
+    };
 
     let model_path_str = model_path.to_string_lossy().to_string();
     println!("📁 模型路径: {}", model_path_str);
 
-    // 启动异步检测器 - 传入结果 Channel
-    let (input_width, input_height) = detector_state.start(&model_path_str, result_channel)?;
+    // 启动异步检测器 - 传入结果 Channel 和设备选择
+    let (input_width, input_height, actual_device) =
+        detector_state.start_with_device(&model_path_str, &device, result_channel)?;
 
     Ok(StartDetectorResult {
         message: format!(
-            "检测器已启动: {} (输入: {}x{})",
-            model, input_width, input_height
+            "检测器已启动: {} @ {} (输入: {}x{})",
+            model, actual_device, input_width, input_height
         ),
         input_width,
         input_height,
+        device: actual_device,
     })
 }
 
@@ -301,6 +423,9 @@ fn main() {
             get_rtsp_history,
             add_rtsp_history,
             clear_rtsp_history,
+            // 设备和模型配置
+            get_available_devices,
+            get_available_models,
             // 检测器命令
             start_detector,
             stop_detector,

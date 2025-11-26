@@ -49,16 +49,27 @@ export class FrameDetector {
      * 启动检测器
      */
     async startDetector(modelName = 'yolov8n', trackerName = 'bytetrack') {
+        // 委托给新方法，使用自动设备选择
+        return this.startDetectorWithOptions(modelName, 'auto', trackerName);
+    }
+    
+    /**
+     * 启动检测器 - 支持指定模型路径和设备
+     * @param {string} modelPath - 模型文件完整路径或名称
+     * @param {string} device - 设备选择: 'auto', 'cuda', 'directml', 'cpu'
+     * @param {string} trackerName - 追踪器名称
+     */
+    async startDetectorWithOptions(modelPath, device = 'auto', trackerName = 'bytetrack') {
         if (this.isDetecting) {
             console.warn('⚠️ 检测器已在运行');
             return { message: '检测器已在运行', input_width: this.targetWidth, input_height: this.targetHeight };
         }
         
-        this.modelName = modelName;
+        this.modelName = modelPath;
         this.trackerName = trackerName;
         
         try {
-            console.log(`🚀 [Detector] 启动检测器: ${modelName}, tracker: ${trackerName}`);
+            console.log(`🚀 [Detector] 启动检测器: model=${modelPath}, device=${device}, tracker=${trackerName}`);
             
             // 创建结果 Channel (Rust → 前端)
             const resultChannel = new Channel();
@@ -81,7 +92,8 @@ export class FrameDetector {
             };
             
             const result = await invoke('start_detector', { 
-                model: modelName,
+                model: modelPath,
+                device: device,
                 tracker: trackerName,
                 resultChannel: resultChannel
             });
@@ -185,6 +197,11 @@ export class FrameDetector {
         
         // 检查视频源是否有数据
         if (!sourceCanvas || sourceCanvas.width === 0 || sourceCanvas.height === 0) {
+            return;
+        }
+        
+        // 检查渲染器是否正在运行且有视频数据
+        if (!this.videoRenderer.isRunning || this.videoRenderer.videoWidth === 0) {
             return;
         }
         

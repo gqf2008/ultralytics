@@ -284,13 +284,13 @@ pub struct NanoDet {
 impl NanoDet {
     /// 从配置创建 NanoDet 模型
     pub fn new(config: crate::Args) -> Result<Self> {
-        // execution provider
+        // execution provider - 优先使用 Auto 自动选择最佳 EP
         let ep = if config.trt {
             OrtEP::Trt(config.device_id)
         } else if config.cuda {
             OrtEP::CUDA(config.device_id)
         } else {
-            OrtEP::CPU
+            OrtEP::Auto // 自动选择: CUDA > DirectML > CPU
         };
 
         // batch

@@ -1,4 +1,4 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+//#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 /// 数字卫兵 (Digital Sentinel)
 ///
 /// 智能视频监控系统

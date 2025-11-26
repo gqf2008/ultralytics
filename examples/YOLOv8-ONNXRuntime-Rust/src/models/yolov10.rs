@@ -7,9 +7,7 @@ use anyhow::Result;
 use image::{DynamicImage, GenericImageView, ImageBuffer};
 use ndarray::{s, Array, IxDyn};
 
-use crate::{
-    Batch, Bbox, DetectionResult, OrtBackend, OrtConfig, OrtEP, YOLOTask,
-};
+use crate::{Batch, Bbox, DetectionResult, OrtBackend, OrtConfig, OrtEP, YOLOTask};
 
 /// YOLOv10 模型结构
 pub struct YOLOv10 {
@@ -28,13 +26,13 @@ pub struct YOLOv10 {
 impl YOLOv10 {
     /// 从配置创建 YOLOv10 模型
     pub fn new(config: crate::Args) -> Result<Self> {
-        // execution provider
+        // execution provider - 优先使用 Auto 自动选择最佳 EP
         let ep = if config.trt {
             OrtEP::Trt(config.device_id)
         } else if config.cuda {
             OrtEP::CUDA(config.device_id)
         } else {
-            OrtEP::CPU
+            OrtEP::Auto // 自动选择: CUDA > DirectML > CPU
         };
 
         // batch
@@ -49,7 +47,7 @@ impl YOLOv10 {
             ep,
             batch,
             f: config.model,
-            task: Some(YOLOTask::Detect),  // YOLOv10 only supports detection
+            task: Some(YOLOTask::Detect), // YOLOv10 only supports detection
             trt_fp16: config.fp16,
             image_size: (config.height, config.width),
         };
@@ -66,9 +64,18 @@ impl YOLOv10 {
 
         // color palette (与YOLOv8保持一致)
         let bright_colors = vec![
-            (255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0),
-            (255, 0, 255), (0, 255, 255), (255, 128, 0), (255, 0, 128),
-            (128, 255, 0), (0, 128, 255), (128, 0, 255), (255, 128, 128),
+            (255, 0, 0),
+            (0, 255, 0),
+            (0, 0, 255),
+            (255, 255, 0),
+            (255, 0, 255),
+            (0, 255, 255),
+            (255, 128, 0),
+            (255, 0, 128),
+            (128, 255, 0),
+            (0, 128, 255),
+            (128, 0, 255),
+            (255, 128, 128),
         ];
         let color_palette: Vec<(u8, u8, u8)> = (0..nc)
             .map(|i| bright_colors[i as usize % bright_colors.len()])
@@ -92,8 +99,9 @@ impl YOLOv10 {
 impl crate::models::Model for YOLOv10 {
     /// 预处理: 图像缩放与归一化 (与YOLOv8相同)
     fn preprocess(&mut self, xs: &[DynamicImage]) -> Result<Vec<Array<f32, IxDyn>>> {
-        let mut ys = Array::ones((xs.len(), 3, self.height as usize, self.width as usize)).into_dyn();
-        ys.fill(144.0 / 255.0);  // YOLOv8填充值
+        let mut ys =
+            Array::ones((xs.len(), 3, self.height as usize, self.width as usize)).into_dyn();
+        ys.fill(144.0 / 255.0); // YOLOv8填充值
 
         for (idx, x) in xs.iter().enumerate() {
             let img = x.resize_exact(
@@ -101,8 +109,9 @@ impl crate::models::Model for YOLOv10 {
                 self.height,
                 image::imageops::FilterType::Triangle,
             );
-            let img: ImageBuffer<image::Rgb<u8>, Vec<u8>> = ImageBuffer::from_raw(self.width, self.height, img.to_rgb8().into_raw())
-                .expect("Failed to create image buffer");
+            let img: ImageBuffer<image::Rgb<u8>, Vec<u8>> =
+                ImageBuffer::from_raw(self.width, self.height, img.to_rgb8().into_raw())
+                    .expect("Failed to create image buffer");
 
             for (x, y, pixel) in img.enumerate_pixels() {
                 let [r, g, b] = pixel.0;
@@ -118,42 +127,47 @@ impl crate::models::Model for YOLOv10 {
     /// 推理: 调用ONNX Runtime
     fn run(&mut self, xs: Vec<Array<f32, IxDyn>>, profile: bool) -> Result<Vec<Array<f32, IxDyn>>> {
         self.profile = profile;
-        let all_results: Vec<Vec<_>> = xs.into_iter()
+        let all_results: Vec<Vec<_>> = xs
+            .into_iter()
             .map(|x| self.engine.run(x, profile))
             .collect::<Result<Vec<_>>>()?;
         Ok(all_results.into_iter().flatten().collect())
     }
 
     /// 后处理: YOLOv10端到端输出 (无需NMS)
-    /// 
+    ///
     /// YOLOv10输出格式: [batch, num_boxes, 6]
     /// 其中 6 = [x1, y1, x2, y2, confidence, class_id]
-    /// 
+    ///
     /// 关键区别:
     /// - YOLOv8: 输出 [batch, num_boxes, 4+num_classes], 需要NMS
     /// - YOLOv10: 输出 [batch, num_boxes, 6], 已经过模型内部NMS
-    fn postprocess(&self, xs: Vec<Array<f32, IxDyn>>, xs0: &[DynamicImage]) -> Result<Vec<DetectionResult>> {
+    fn postprocess(
+        &self,
+        xs: Vec<Array<f32, IxDyn>>,
+        xs0: &[DynamicImage],
+    ) -> Result<Vec<DetectionResult>> {
         if self.profile {
             println!("\n[YOLOv10 后处理 - NMS-Free]");
         }
 
         let mut ys: Vec<DetectionResult> = Vec::new();
-        let preds = &xs[0];  // [batch, num_boxes, 6]
+        let preds = &xs[0]; // [batch, num_boxes, 6]
 
         for (idx, x0) in xs0.iter().enumerate() {
             let (width_original, height_original) = x0.dimensions();
             let ratio = (self.width as f32 / width_original as f32)
                 .min(self.height as f32 / height_original as f32);
-            
+
             let mut bboxes_vec: Vec<Bbox> = Vec::new();
 
             // 遍历所有检测框
             for i in 0..preds.shape()[1] {
                 let pred = preds.slice(s![idx, i, ..]);
-                
+
                 // YOLOv10输出: [x1, y1, x2, y2, confidence, class_id]
                 let confidence = pred[4];
-                
+
                 // 置信度过滤
                 if confidence < self.conf {
                     continue;
@@ -197,7 +211,11 @@ impl crate::models::Model for YOLOv10 {
 
             let data = DetectionResult {
                 probs: None,
-                bboxes: if bboxes_vec.is_empty() { None } else { Some(bboxes_vec) },
+                bboxes: if bboxes_vec.is_empty() {
+                    None
+                } else {
+                    Some(bboxes_vec)
+                },
                 keypoints: None,
                 masks: None,
             };
@@ -218,7 +236,10 @@ impl crate::models::Model for YOLOv10 {
         println!("│ Model: YOLOv10 (NMS-Free)               │");
         println!("│ Task: Object Detection                  │");
         println!("├─────────────────────────────────────────┤");
-        println!("│ Input: [{}, 3, {}, {}]           │", self.batch, self.height, self.width);
+        println!(
+            "│ Input: [{}, 3, {}, {}]           │",
+            self.batch, self.height, self.width
+        );
         println!("│ Classes: {}                              │", self.nc);
         println!("│ Confidence: {}                         │", self.conf);
         println!("│ NMS: Not Required (End-to-End)         │");
