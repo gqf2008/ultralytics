@@ -3,7 +3,7 @@
  * 负责从视频帧提取、缩放并发送给 Rust 后端进行 YOLO 检测
  */
 
-import { invoke } from '@tauri-apps/api/core';
+import { invoke, Channel } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 
 export class FrameDetector {
@@ -14,10 +14,10 @@ export class FrameDetector {
             willReadFrequently: true // 优化性能
         });
         
-        // YOLO 输入尺寸 - 使用较小尺寸减少 IPC 传输量
-        // 640x640x4 = 1.6MB, 320x320x4 = 400KB
-        this.targetWidth = 320;
-        this.targetHeight = 320;
+        // YOLO 输入尺寸 - 640x640 提高检测精度
+        // Raw Request 优化后 1.6MB/帧 IPC 开销可接受
+        this.targetWidth = 640;
+        this.targetHeight = 640;
         
         // 设置离屏 Canvas 尺寸
         this.detectionCanvas.width = this.targetWidth;
@@ -25,7 +25,8 @@ export class FrameDetector {
         
         // 检测状态
         this.isDetecting = false;
-        this.detectionFps = 5; // 目标检测帧率 (CPU 推理约 10-12 FPS)
+        // Raw Request + Channel 优化后可以提高帧率
+        this.detectionFps = 25; // 目标检测帧率
         this.lastDetectTime = 0;
         this.detectFrameCount = 0;
         this.detectInterval = null;
@@ -58,20 +59,39 @@ export class FrameDetector {
         
         try {
             console.log(`🚀 [Detector] 启动检测器: ${modelName}, tracker: ${trackerName}`);
+            
+            // 创建结果 Channel (Rust → 前端)
+            const resultChannel = new Channel();
+            resultChannel.onmessage = (result) => {
+                this.lastDetections = result.boxes;
+                
+                // 触发自定义事件通知 UI 更新
+                window.dispatchEvent(new CustomEvent('yolo-detection', { 
+                    detail: result 
+                }));
+                
+                this.detectFrameCount++;
+                const now = performance.now();
+                if (now - this.lastDetectTime >= 2000) {
+                    const actualFps = this.detectFrameCount / 2;
+                    this.detectFrameCount = 0;
+                    this.lastDetectTime = now;
+                    console.log(`📊 [Detector] 检测FPS: ${actualFps.toFixed(1)} | 推理: ${result.inference_time_ms.toFixed(1)}ms`);
+                }
+            };
+            
             const result = await invoke('start_detector', { 
                 model: modelName,
-                tracker: trackerName 
+                tracker: trackerName,
+                resultChannel: resultChannel
             });
             console.log('✅ 检测器已启动:', result);
             
-            // 使用后端返回的输入尺寸
+            // 使用后端返回的模型输入尺寸
             if (result.input_width && result.input_height) {
                 this.setTargetSize(result.input_width, result.input_height);
                 console.log(`📐 [Detector] 使用模型输入尺寸: ${result.input_width}x${result.input_height}`);
             }
-            
-            // 监听后端检测结果事件 (先设置监听再开始检测)
-            await this.setupResultListener();
             
             this.isDetecting = true;
             this.startFrameExtraction();
@@ -84,38 +104,11 @@ export class FrameDetector {
     }
     
     /**
-     * 设置检测结果监听
+     * 设置检测结果监听 (已移到 Channel.onmessage)
      */
     async setupResultListener() {
-        if (this.resultUnlisten) return; // 已经在监听
-        
-        console.log('🎧 [Detector] 设置 detection-result 事件监听...');
-        
-        this.resultUnlisten = await listen('detection-result', (event) => {
-            const result = event.payload;
-            this.lastDetections = result.boxes;
-            
-            // 调试日志
-            if (result.boxes && result.boxes.length > 0) {
-                console.log(`📦 [Detector] 收到 ${result.boxes.length} 个检测结果`);
-            }
-            
-            // 触发自定义事件通知 UI 更新
-            window.dispatchEvent(new CustomEvent('yolo-detection', { 
-                detail: result 
-            }));
-            
-            this.detectFrameCount++;
-            const now = performance.now();
-            if (now - this.lastDetectTime >= 2000) {
-                const actualFps = this.detectFrameCount / 2;
-                this.detectFrameCount = 0;
-                this.lastDetectTime = now;
-                console.log(`📊 [Detector] 检测FPS: ${actualFps.toFixed(1)} | 推理: ${result.inference_time_ms.toFixed(1)}ms`);
-            }
-        });
-        
-        console.log('✅ [Detector] 事件监听已设置');
+        // 现在使用 Channel 接收结果，不再需要 listen
+        console.log('ℹ️ [Detector] 结果监听已改用 Channel');
     }
     
     /**
@@ -212,14 +205,16 @@ export class FrameDetector {
                 this.targetHeight
             );
             
-            // 3. 使用 Uint8Array 直接传输 (Tauri 2.0 支持)
+            // 3. 使用 Uint8Array 直接传输 (Tauri 2.0 Raw Request)
             const rgbaData = new Uint8Array(imageData.data.buffer);
             
-            // 4. 非阻塞发送到后端 - Tauri 2.0 可以直接传 Uint8Array
-            invoke('detect_frame', {
-                rgbaData: rgbaData,
-                width: this.targetWidth,
-                height: this.targetHeight
+            // 4. 使用 Raw Request 传输 - 避免 JSON 序列化 400KB 数据
+            // Tauri 2.0 支持直接传 ArrayBuffer/Uint8Array 作为 payload
+            invoke('detect_frame', rgbaData, {
+                headers: {
+                    'X-Width': String(this.targetWidth),
+                    'X-Height': String(this.targetHeight)
+                }
             }).catch(() => {});
             
         } catch (err) {

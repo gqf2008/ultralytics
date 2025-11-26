@@ -195,6 +195,7 @@ async fn start_detector(
     app: AppHandle,
     model: String,
     _tracker: String,
+    result_channel: tauri::ipc::Channel<detector_async::DetectionResult>,
 ) -> Result<StartDetectorResult, String> {
     println!("🚀 启动检测器: model={}", model);
 
@@ -211,8 +212,8 @@ async fn start_detector(
     let model_path_str = model_path.to_string_lossy().to_string();
     println!("📁 模型路径: {}", model_path_str);
 
-    // 启动异步检测器
-    let (input_width, input_height) = detector_state.start(&model_path_str, app.clone())?;
+    // 启动异步检测器 - 传入结果 Channel
+    let (input_width, input_height) = detector_state.start(&model_path_str, result_channel)?;
 
     Ok(StartDetectorResult {
         message: format!(
@@ -232,14 +233,37 @@ async fn stop_detector(app: AppHandle) -> Result<String, String> {
     Ok("检测器已停止".to_string())
 }
 
-/// 发送帧到检测线程 (非阻塞，立即返回)
+/// 发送帧到检测线程 (非阻塞，使用 Raw Request 避免 JSON 序列化)
 #[tauri::command]
-async fn detect_frame(
-    app: AppHandle,
-    rgba_data: Vec<u8>,
-    width: u32,
-    height: u32,
-) -> Result<(), String> {
+async fn detect_frame(app: AppHandle, request: tauri::ipc::Request<'_>) -> Result<(), String> {
+    // 从 Raw Body 获取帧数据 (避免 JSON 序列化 400KB)
+    let rgba_data = match request.body() {
+        tauri::ipc::InvokeBody::Raw(data) => data.clone(),
+        tauri::ipc::InvokeBody::Json(_) => {
+            return Err("期望 Raw body，收到 JSON".to_string());
+        }
+    };
+
+    // 从 headers 获取尺寸 (header 名可能被转为小写)
+    let headers = request.headers();
+    let width: u32 = headers
+        .get("x-width")
+        .or_else(|| headers.get("X-Width"))
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(640);
+    let height: u32 = headers
+        .get("x-height")
+        .or_else(|| headers.get("X-Height"))
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(640);
+
+    // 调试日志
+    if width != 640 || height != 640 {
+        println!("⚠️ detect_frame: 收到 {}x{} (期望 640x640)", width, height);
+    }
+
     let detector_state = app.state::<AsyncDetectorState>();
     detector_state.send_frame(rgba_data, width, height)
 }

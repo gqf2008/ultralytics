@@ -901,12 +901,7 @@ startBtn.addEventListener('click', async () => {
         stopBtn.style.display = 'block';
         rtspInput.disabled = true;
         
-        showStatus('✅ 监控已启动');
-        
-        // 自动启动检测器(可选)
-        // setTimeout(() => {
-        //     frameDetector.startDetector('yolov8n', 'bytetrack');
-        // }, 2000);
+        showStatus('✅ 监控已启动 - 请手动点击开启检测');
     } catch (err) {
         console.error('启动失败:', err);
         showStatus('❌ 启动失败: ' + err);

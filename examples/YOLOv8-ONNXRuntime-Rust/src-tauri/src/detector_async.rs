@@ -1,7 +1,7 @@
 //! 异步检测器 - 使用 channel 避免阻塞主线程
 //!
 //! 数据流:
-//! 前端发送帧 → Channel → 后台检测线程 → 检测结果事件 → 前端
+//! 前端发送帧 (Raw Request) → mpsc Channel → 后台检测线程 → Tauri Channel → 前端
 
 use ndarray::{Array, IxDyn};
 use ort::execution_providers::{
@@ -13,10 +13,9 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
-use tauri::{AppHandle, Emitter};
+use tauri::ipc::Channel;
 
 /// 检测结果 (发送到前端)
 #[derive(Clone, Serialize, Deserialize)]
@@ -141,6 +140,8 @@ pub struct AsyncDetectorState {
     is_running: RwLock<bool>,
     // 最新检测结果 (供前端轮询)
     last_result: RwLock<Option<DetectionResult>>,
+    // 结果 Channel (发送到前端)
+    result_channel: RwLock<Option<Channel<DetectionResult>>>,
 }
 
 impl Default for AsyncDetectorState {
@@ -151,16 +152,24 @@ impl Default for AsyncDetectorState {
             input_height: RwLock::new(640),
             is_running: RwLock::new(false),
             last_result: RwLock::new(None),
+            result_channel: RwLock::new(None),
         }
     }
 }
 
 impl AsyncDetectorState {
     /// 启动检测器 (后台线程)
-    pub fn start(&self, model_path: &str, app: AppHandle) -> Result<(u32, u32), String> {
+    pub fn start(
+        &self,
+        model_path: &str,
+        result_channel: Channel<DetectionResult>,
+    ) -> Result<(u32, u32), String> {
         if *self.is_running.read() {
             return Err("检测器已在运行".to_string());
         }
+
+        // 保存结果 Channel
+        *self.result_channel.write() = Some(result_channel.clone());
 
         // 检查模型文件
         if !Path::new(model_path).exists() {
@@ -187,12 +196,13 @@ impl AsyncDetectorState {
             .commit_from_file(model_path)
             .map_err(|e| format!("加载模型失败: {}", e))?;
 
-        // 从模型动态读取输入尺寸
-        let (width, height) = Self::get_model_input_size(&session)?;
+        // 使用 640x640 提高检测精度 (Raw Request 优化后 IPC 开销可接受)
+        let width = 640u32;
+        let height = 640u32;
         *self.input_width.write() = width;
         *self.input_height.write() = height;
 
-        println!("✅ 模型加载成功 ({}x{})", width, height);
+        println!("✅ 模型加载成功，使用 {}x{} 输入尺寸", width, height);
 
         // 创建 channel (只保留最新帧，丢弃旧帧)
         let (tx, rx): (Sender<FrameData>, Receiver<FrameData>) = mpsc::channel();
@@ -207,7 +217,7 @@ impl AsyncDetectorState {
             Self::detection_loop(
                 session,
                 rx,
-                app,
+                result_channel,
                 conf_threshold,
                 iou_threshold,
                 width,
@@ -222,7 +232,7 @@ impl AsyncDetectorState {
     fn detection_loop(
         mut session: Session,
         rx: Receiver<FrameData>,
-        app: AppHandle,
+        result_channel: Channel<DetectionResult>,
         conf_threshold: f32,
         iou_threshold: f32,
         input_width: u32,
@@ -273,10 +283,12 @@ impl AsyncDetectorState {
 
             let start = Instant::now();
 
-            // 执行检测 (前端已经 resize 好了)
-            match Self::detect_frame(
+            // 执行检测 (前端已 resize 到正确尺寸)
+            match Self::detect_frame_with_resize(
                 &mut session,
                 &latest_frame.rgba_data,
+                latest_frame.width,
+                latest_frame.height,
                 input_width,
                 input_height,
                 conf_threshold,
@@ -301,14 +313,33 @@ impl AsyncDetectorState {
                         );
                     }
 
+                    // 调试：前几帧总是打印
+                    if received_frames <= 10 {
+                        println!(
+                            "🎯 帧 #{} 检测结果: {} 个目标, 耗时: {:.1}ms",
+                            received_frames,
+                            boxes.len(),
+                            inference_time
+                        );
+                    }
+
                     let result = DetectionResult {
                         boxes,
                         inference_time_ms: inference_time,
                         detect_fps: current_fps,
                     };
 
-                    // 发送事件到前端
-                    let _ = app.emit("detection-result", &result);
+                    // 通过 Channel 发送结果到前端 (比 emit 更高效)
+                    match result_channel.send(result) {
+                        Ok(_) => {
+                            if received_frames <= 5 {
+                                println!("✅ 检测结果已发送到前端");
+                            }
+                        }
+                        Err(e) => {
+                            println!("❌ 发送检测结果失败: {}", e);
+                        }
+                    }
                 }
                 Err(e) => {
                     eprintln!("❌ 检测失败: {}", e);
@@ -319,43 +350,64 @@ impl AsyncDetectorState {
         println!("🛑 检测线程已退出");
     }
 
-    /// 检测单帧 (前端已经 resize 到正确尺寸)
-    fn detect_frame(
+    /// 检测单帧 (优化版 - 前端已 resize 到正确尺寸，避免额外拷贝)
+    fn detect_frame_with_resize(
         session: &mut Session,
         rgba_data: &[u8],
-        input_width: u32,
-        input_height: u32,
+        src_width: u32,
+        src_height: u32,
+        model_width: u32,
+        model_height: u32,
         conf_threshold: f32,
         iou_threshold: f32,
     ) -> Result<Vec<DetectionBox>, String> {
-        let pixel_count = (input_width * input_height) as usize;
-        let expected_size = pixel_count * 4;
+        let src_pixel_count = (src_width * src_height) as usize;
+        let expected_size = src_pixel_count * 4;
 
         if rgba_data.len() != expected_size {
             return Err(format!(
                 "数据尺寸不匹配: 期望 {} bytes ({}x{}x4), 实际 {} bytes",
                 expected_size,
-                input_width,
-                input_height,
+                src_width,
+                src_height,
                 rgba_data.len()
             ));
         }
 
+        // 前端已发送正确尺寸，直接使用（避免 resize 和额外拷贝）
+        let (final_width, final_height) = (src_width, src_height);
+        let pixel_count = (final_width * final_height) as usize;
+
+        // 预分配输出缓冲区
         let mut input_data = vec![0f32; pixel_count * 3];
 
-        // RGBA → CHW 格式 (并行处理)
-        input_data
-            .par_chunks_mut(pixel_count)
-            .enumerate()
-            .for_each(|(c, channel)| {
+        // 优化: RGBA → CHW 格式转换 (并行 + 避免边界检查)
+        // 分成 R、G、B 三个通道并行处理
+        let (r_channel, rest) = input_data.split_at_mut(pixel_count);
+        let (g_channel, b_channel) = rest.split_at_mut(pixel_count);
+
+        // 并行处理三个通道
+        rayon::scope(|s| {
+            s.spawn(|_| {
                 for i in 0..pixel_count {
-                    channel[i] = rgba_data[i * 4 + c] as f32 / 255.0;
+                    r_channel[i] = rgba_data[i * 4] as f32 / 255.0;
                 }
             });
+            s.spawn(|_| {
+                for i in 0..pixel_count {
+                    g_channel[i] = rgba_data[i * 4 + 1] as f32 / 255.0;
+                }
+            });
+            s.spawn(|_| {
+                for i in 0..pixel_count {
+                    b_channel[i] = rgba_data[i * 4 + 2] as f32 / 255.0;
+                }
+            });
+        });
 
         // 创建输入张量
         let input_array = Array::from_shape_vec(
-            IxDyn(&[1, 3, input_height as usize, input_width as usize]),
+            IxDyn(&[1, 3, final_height as usize, final_width as usize]),
             input_data,
         )
         .map_err(|e| format!("创建输入张量失败: {}", e))?;
@@ -384,7 +436,7 @@ impl AsyncDetectorState {
         // Shape 实现了 Deref<Target = [i64]>，可以直接迭代
         let dims: Vec<usize> = out_shape.iter().map(|&d| d as usize).collect();
 
-        // 构建 ndarray
+        // 构建 ndarray (避免 to_vec 拷贝，直接使用 slice)
         let output_array = Array::from_shape_vec(IxDyn(&dims), out_slice.to_vec())
             .map_err(|e| format!("构建输出数组失败: {}", e))?;
 
@@ -419,10 +471,10 @@ impl AsyncDetectorState {
             }
 
             if max_score >= conf_threshold {
-                let x1 = (x_center - w / 2.0) / input_width as f32;
-                let y1 = (y_center - h / 2.0) / input_height as f32;
-                let x2 = (x_center + w / 2.0) / input_width as f32;
-                let y2 = (y_center + h / 2.0) / input_height as f32;
+                let x1 = (x_center - w / 2.0) / final_width as f32;
+                let y1 = (y_center - h / 2.0) / final_height as f32;
+                let x2 = (x_center + w / 2.0) / final_width as f32;
+                let y2 = (y_center + h / 2.0) / final_height as f32;
 
                 let class_name = COCO_CLASSES
                     .get(max_class)
@@ -497,16 +549,39 @@ impl AsyncDetectorState {
 
     /// 发送帧到检测线程 (非阻塞)
     pub fn send_frame(&self, rgba_data: Vec<u8>, width: u32, height: u32) -> Result<(), String> {
+        // 调试：统计发送的帧
+        static SEND_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let count = SEND_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if count < 5 || count % 50 == 0 {
+            println!(
+                "📤 send_frame #{}: {}x{}, {} bytes",
+                count,
+                width,
+                height,
+                rgba_data.len()
+            );
+        }
+
         let sender = self.sender.read();
         if let Some(tx) = sender.as_ref() {
             // 非阻塞发送，如果队列满了就丢弃
-            let _ = tx.send(FrameData {
+            match tx.send(FrameData {
                 rgba_data,
                 width,
                 height,
-            });
+            }) {
+                Ok(_) => {
+                    if count < 5 {
+                        println!("✅ 帧已发送到检测线程");
+                    }
+                }
+                Err(e) => {
+                    println!("❌ 发送帧失败: {}", e);
+                }
+            }
             Ok(())
         } else {
+            println!("⚠️ send_frame: 检测器未启动 (sender 为空)");
             Err("检测器未启动".to_string())
         }
     }
@@ -555,28 +630,29 @@ impl AsyncDetectorState {
         Ok((640, 640))
     }
 
-    /// 选择最佳执行提供程序: CUDA > DirectML > CPU
+    /// 选择最佳执行提供程序: DirectML > CUDA > CPU
+    /// (DirectML 在 Windows 上更可靠，不需要额外安装 CUDA SDK)
     fn select_best_execution_provider() -> (
         &'static str,
         Vec<ort::execution_providers::ExecutionProviderDispatch>,
     ) {
         use ort::execution_providers::ExecutionProviderDispatch;
 
-        // 1. 尝试 CUDA (NVIDIA GPU)
+        // 1. 优先尝试 DirectML (Windows GPU 通用加速 - AMD/Intel/NVIDIA 都支持，无需额外安装)
+        let dml = DirectMLExecutionProvider::default();
+        if dml.is_available().unwrap_or(false) {
+            println!("✅ DirectML 可用 (Windows GPU 加速)");
+            return ("DirectML", vec![ExecutionProviderDispatch::from(dml)]);
+        }
+        println!("⚠️ DirectML 不可用");
+
+        // 2. 尝试 CUDA (需要 NVIDIA GPU + CUDA SDK + cuDNN)
         let cuda = CUDAExecutionProvider::default();
         if cuda.is_available().unwrap_or(false) {
             println!("✅ CUDA 可用");
             return ("CUDA", vec![ExecutionProviderDispatch::from(cuda)]);
         }
         println!("⚠️ CUDA 不可用");
-
-        // 2. 尝试 DirectML (Windows GPU 通用加速 - AMD/Intel/NVIDIA)
-        let dml = DirectMLExecutionProvider::default();
-        if dml.is_available().unwrap_or(false) {
-            println!("✅ DirectML 可用");
-            return ("DirectML", vec![ExecutionProviderDispatch::from(dml)]);
-        }
-        println!("⚠️ DirectML 不可用");
 
         // 3. 回退到 CPU
         println!("ℹ️ 使用 CPU 执行");

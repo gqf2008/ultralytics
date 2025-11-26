@@ -35,3 +35,10 @@ ndarray = "0.16"
 # 图像处理
 image = "0.25"
 rayon = "1.10"
+
+# Windows 共享内存
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_System_Memory",
+] }
