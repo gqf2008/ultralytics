@@ -1,8 +1,10 @@
 // Prevents additional console window on Windows in release
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod detector;
 mod rtsp_proxy;
 
+use detector::DetectorState;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::panic;
@@ -176,6 +178,75 @@ async fn start_rtsp_stream(
     Ok(format!("RTSP 流已启动 (Gen: {})", generation))
 }
 
+// ==================== 检测器命令 ====================
+
+/// 启动检测器返回结果
+#[derive(Clone, serde::Serialize)]
+pub struct StartDetectorResult {
+    pub message: String,
+    pub input_width: u32,
+    pub input_height: u32,
+}
+
+/// 启动检测器
+#[tauri::command]
+async fn start_detector(
+    app: AppHandle,
+    model: String,
+    tracker: String,
+) -> Result<StartDetectorResult, String> {
+    println!("🚀 启动检测器: model={}, tracker={}", model, tracker);
+
+    let detector_state = app.state::<DetectorState>();
+
+    // 获取模型路径 - 使用项目根目录下的 models 文件夹
+    // 开发模式下，工作目录是 src-tauri，需要向上一级
+    let model_filename = format!("{}.onnx", model);
+    let model_path = std::env::current_dir()
+        .map_err(|e| format!("获取当前目录失败: {}", e))?
+        .parent()
+        .map(|p| p.join("models").join(&model_filename))
+        .unwrap_or_else(|| std::path::PathBuf::from("models").join(&model_filename));
+
+    let model_path_str = model_path.to_string_lossy().to_string();
+    println!("📁 模型路径: {}", model_path_str);
+
+    // 加载模型，获取输入尺寸
+    let (input_width, input_height) = detector_state.load_model(&model_path_str)?;
+
+    // 初始化追踪器
+    detector_state.init_tracker(&tracker);
+
+    Ok(StartDetectorResult {
+        message: format!(
+            "检测器已启动: {} + {} (输入: {}x{})",
+            model, tracker, input_width, input_height
+        ),
+        input_width,
+        input_height,
+    })
+}
+
+/// 停止检测器
+#[tauri::command]
+async fn stop_detector(app: AppHandle) -> Result<String, String> {
+    let detector_state = app.state::<DetectorState>();
+    detector_state.stop();
+    Ok("检测器已停止".to_string())
+}
+
+/// 检测帧 (接收前端已 resize 的 640x640 RGBA 数据)
+#[tauri::command]
+async fn detect_frame(
+    app: AppHandle,
+    rgba_data: Vec<u8>,
+    width: u32,
+    height: u32,
+) -> Result<detector::DetectionResult, String> {
+    let detector_state = app.state::<DetectorState>();
+    detector_state.detect(&rgba_data, width, height)
+}
+
 fn main() {
     // 添加 panic hook 以捕获 Rust 层面的崩溃
     panic::set_hook(Box::new(|info| {
@@ -198,6 +269,7 @@ fn main() {
         .plugin(tauri_plugin_shell::init())
         .manage(VideoFrameState::default())
         .manage(ProxyState { proxy })
+        .manage(DetectorState::default())
         .invoke_handler(tauri::generate_handler![
             get_latest_frame,
             has_new_frame,
@@ -208,6 +280,10 @@ fn main() {
             get_rtsp_history,
             add_rtsp_history,
             clear_rtsp_history,
+            // 检测器命令
+            start_detector,
+            stop_detector,
+            detect_frame,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

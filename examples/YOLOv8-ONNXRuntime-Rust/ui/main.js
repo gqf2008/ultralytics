@@ -574,8 +574,8 @@ const toggleBtn = document.getElementById('toggle-btn');
 const volumeSlider = document.getElementById('volume-slider');
 const volumeValue = document.getElementById('volume-value');
 
-// 检测控制按钮 (稍后添加)
-let startDetectorBtn, stopDetectorBtn, detectionFpsSlider;
+// 检测控制按钮
+let detectionFpsSlider;
 
 // 在 Canvas 上绘制检测框
 function drawDetections(boxes) {
@@ -880,6 +880,43 @@ stopBtn.addEventListener('click', async () => {
 // 暴露到全局方便调试
 window.renderer = renderer;
 window.frameDetector = frameDetector;
+
+// 检测器按钮事件
+const startDetectorBtn = document.getElementById('start-detector-btn');
+const stopDetectorBtn = document.getElementById('stop-detector-btn');
+
+startDetectorBtn.addEventListener('click', async () => {
+    try {
+        startDetectorBtn.disabled = true;
+        startDetectorBtn.textContent = '🔄 加载中...';
+        
+        await frameDetector.startDetector('yolov8n', 'bytetrack');
+        
+        startDetectorBtn.style.display = 'none';
+        stopDetectorBtn.style.display = 'block';
+        showStatus('✅ 检测器已启动');
+    } catch (err) {
+        console.error('启动检测器失败:', err);
+        showStatus('❌ 检测器启动失败: ' + err);
+        startDetectorBtn.disabled = false;
+        startDetectorBtn.textContent = '▶ 开启检测';
+    }
+});
+
+stopDetectorBtn.addEventListener('click', async () => {
+    try {
+        await frameDetector.stopDetector();
+        
+        stopDetectorBtn.style.display = 'none';
+        startDetectorBtn.style.display = 'block';
+        startDetectorBtn.disabled = false;
+        startDetectorBtn.textContent = '▶ 开启检测';
+        showStatus('⏹ 检测器已停止');
+    } catch (err) {
+        console.error('停止检测器失败:', err);
+        showStatus('❌ 停止检测器失败: ' + err);
+    }
+});
 
 console.log('WebGL renderer initialized');
 console.log('使用方法:');

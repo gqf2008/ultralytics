@@ -57,13 +57,16 @@ export class FrameDetector {
                 model: modelName,
                 tracker: trackerName 
             });
-            console.log('✅', result);
+            console.log('✅', result.message);
+            
+            // 使用后端返回的输入尺寸
+            if (result.input_width && result.input_height) {
+                this.setTargetSize(result.input_width, result.input_height);
+                console.log(`📐 [Detector] 使用模型输入尺寸: ${result.input_width}x${result.input_height}`);
+            }
             
             this.isDetecting = true;
             this.startFrameExtraction();
-            
-            // 订阅检测结果
-            this.listenDetectionResults();
             
             return result;
         } catch (err) {
@@ -150,12 +153,31 @@ export class FrameDetector {
             // 3. 转换为普通 Uint8Array (Tauri 需要)
             const uint8Array = new Uint8Array(rgbaData);
             
-            // 4. 发送到 Rust 后端检测
-            await invoke('detect_frame', {
+            // 4. 发送到 Rust 后端检测并获取结果
+            const result = await invoke('detect_frame', {
                 rgbaData: Array.from(uint8Array), // Tauri 需要 Array
                 width: this.targetWidth,
                 height: this.targetHeight
             });
+            
+            // 5. 处理检测结果
+            if (result && result.boxes) {
+                this.lastDetections = result.boxes;
+                
+                // 触发自定义事件通知 UI 更新
+                window.dispatchEvent(new CustomEvent('yolo-detection', { 
+                    detail: result 
+                }));
+                
+                // 打印检测摘要 (有检测结果时打印)
+                if (result.boxes.length > 0) {
+                    console.log(
+                        `🎯 [Detection] 检测到 ${result.boxes.length} 个目标 | ` +
+                        `推理耗时: ${result.inference_time_ms.toFixed(1)}ms | ` +
+                        `FPS: ${result.detect_fps.toFixed(1)}`
+                    );
+                }
+            }
             
             this.detectFrameCount++;
             
@@ -170,7 +192,7 @@ export class FrameDetector {
             }
             
         } catch (err) {
-            console.error('❌ [Detector] 帧提取失败:', err);
+            console.error('❌ [Detector] 帧检测失败:', err);
         }
     }
     

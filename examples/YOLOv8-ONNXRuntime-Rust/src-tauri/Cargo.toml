@@ -23,5 +23,14 @@ url = "2"                                            # URL 解析
 parking_lot = "0.12"
 crossbeam-channel = "0.5"
 
-# 不依赖主项目! Tauri 版本独立运行,WebView 负责解码
-# 用 retina 替代 ffmpeg-next,避免 QSV/x264 链接错误
+# ONNX Runtime - 直接引入，不依赖主项目 (避免 FFmpeg 链接)
+ort = { version = "2.0.0-rc.5", features = [
+    "cuda",
+    "download-binaries",
+    "copy-dylibs",
+] }
+ndarray = "0.16"
+
+# 图像处理
+image = "0.25"
+rayon = "1.10"
