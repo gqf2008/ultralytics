@@ -948,8 +948,8 @@ startBtn.addEventListener('click', async () => {
         }
         
         renderer.start();
-        startBtn.style.display = 'none';
-        stopBtn.style.display = 'block';
+        startBtn.classList.add('hidden');
+        stopBtn.classList.remove('hidden');
         rtspInput.disabled = true;
         
         showStatus('✅ 监控已启动 - 请手动点击开启检测');
@@ -967,8 +967,8 @@ stopBtn.addEventListener('click', async () => {
     }
     
     renderer.stop();
-    stopBtn.style.display = 'none';
-    startBtn.style.display = 'block';
+    stopBtn.classList.add('hidden');
+    startBtn.classList.remove('hidden');
     startBtn.disabled = false;
     rtspInput.disabled = false;
     showStatus('⏹ 监控已停止');
@@ -1036,7 +1036,7 @@ loadModelsAndDevices();
 startDetectorBtn.addEventListener('click', async () => {
     try {
         startDetectorBtn.disabled = true;
-        startDetectorBtn.textContent = '🔄 加载中...';
+        startDetectorBtn.innerHTML = '<span>🔄</span> 加载中...';
         
         // 获取用户选择
         const selectedModel = modelSelect.value;
@@ -1045,7 +1045,7 @@ startDetectorBtn.addEventListener('click', async () => {
         if (!selectedModel) {
             showStatus('❌ 请选择模型');
             startDetectorBtn.disabled = false;
-            startDetectorBtn.textContent = '▶ 开启检测';
+            startDetectorBtn.innerHTML = '<span>🎯</span> 开启检测';
             return;
         }
         
@@ -1063,14 +1063,14 @@ startDetectorBtn.addEventListener('click', async () => {
             const deviceUsed = result.device || selectedDevice;
             showStatus(`✅ 检测器已启动 [${deviceUsed}]`);
             
-            startDetectorBtn.style.display = 'none';
-            stopDetectorBtn.style.display = 'block';
+            startDetectorBtn.classList.add('hidden');
+            stopDetectorBtn.classList.remove('hidden');
         }
     } catch (err) {
         console.error('启动检测器失败:', err);
         showStatus('❌ 检测器启动失败: ' + (err.message || err));
         startDetectorBtn.disabled = false;
-        startDetectorBtn.textContent = '▶ 开启检测';
+        startDetectorBtn.innerHTML = '<span>🎯</span> 开启检测';
     }
 });
 
@@ -1081,10 +1081,10 @@ stopDetectorBtn.addEventListener('click', async () => {
         // 清除检测框
         detectionCtx.clearRect(0, 0, detectionOverlay.width, detectionOverlay.height);
         
-        stopDetectorBtn.style.display = 'none';
-        startDetectorBtn.style.display = 'block';
+        stopDetectorBtn.classList.add('hidden');
+        startDetectorBtn.classList.remove('hidden');
         startDetectorBtn.disabled = false;
-        startDetectorBtn.textContent = '▶ 开启检测';
+        startDetectorBtn.innerHTML = '<span>🎯</span> 开启检测';
         showStatus('⏹ 检测器已停止');
     } catch (err) {
         console.error('停止检测器失败:', err);

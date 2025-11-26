@@ -3,36 +3,51 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>YOLOv8 实时监控</title>
+    <title>YOLO Vision</title>
     <style>
         * {
             margin: 0;
             padding: 0;
             box-sizing: border-box;
         }
-        body {
-            background: #000;
-            overflow: hidden;
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif;
-            color: #fff;
+        
+        :root {
+            --accent: #6366f1;
+            --accent-light: #818cf8;
+            --success: #10b981;
+            --danger: #ef4444;
+            --warning: #f59e0b;
+            --glass-bg: rgba(15, 15, 20, 0.75);
+            --glass-border: rgba(255, 255, 255, 0.08);
+            --text-primary: rgba(255, 255, 255, 0.95);
+            --text-secondary: rgba(255, 255, 255, 0.6);
+            --text-muted: rgba(255, 255, 255, 0.4);
         }
+        
+        body {
+            background: #0a0a0f;
+            overflow: hidden;
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            color: var(--text-primary);
+        }
+        
         #app {
             width: 100vw;
             height: 100vh;
             position: relative;
         }
         
-        /* 视频画布 - 全屏铺满 */
+        /* 视频画布 */
         #canvas {
             position: absolute;
             top: 0;
             left: 0;
             width: 100vw;
             height: 100vh;
-            background: #000;
+            background: #0a0a0f;
         }
         
-        /* 检测框叠加层 - 覆盖在视频上 */
+        /* 检测框叠加层 */
         #detection-overlay {
             position: absolute;
             top: 0;
@@ -42,534 +57,547 @@
             pointer-events: none;
         }
         
-        /* 控制面板 - 玻璃态风格 */
+        /* ========== 现代控制面板 ========== */
         #control-panel {
             position: absolute;
-            top: 24px;
-            left: 50%;
-            transform: translateX(-50%);
-            background: linear-gradient(135deg, rgba(255, 255, 255, 0.08) 0%, rgba(255, 255, 255, 0.05) 100%);
-            backdrop-filter: blur(20px) saturate(180%);
-            -webkit-backdrop-filter: blur(20px) saturate(180%);
-            border: 1px solid rgba(255, 255, 255, 0.18);
-            border-radius: 16px;
-            box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.4), 
-                        0 0 0 1px rgba(255, 255, 255, 0.05) inset;
-            padding: 0;
+            top: 20px;
+            left: 20px;
+            width: 340px;
+            background: var(--glass-bg);
+            backdrop-filter: blur(24px) saturate(180%);
+            -webkit-backdrop-filter: blur(24px) saturate(180%);
+            border: 1px solid var(--glass-border);
+            border-radius: 20px;
             z-index: 100;
-            min-width: 660px;
             overflow: hidden;
-            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            transition: all 0.4s cubic-bezier(0.16, 1, 0.3, 1);
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5),
+                        0 0 1px rgba(255, 255, 255, 0.1) inset;
         }
         
         #control-panel:hover {
-            background: linear-gradient(135deg, rgba(255, 255, 255, 0.12) 0%, rgba(255, 255, 255, 0.08) 100%);
-            box-shadow: 0 12px 48px 0 rgba(0, 0, 0, 0.5),
-                        0 0 0 1px rgba(255, 255, 255, 0.1) inset;
+            box-shadow: 0 25px 70px rgba(0, 0, 0, 0.6),
+                        0 0 1px rgba(255, 255, 255, 0.15) inset;
         }
         
-        /* 现代化标题栏 */
-        #panel-header {
-            padding: 16px 24px;
-            cursor: move;
-            background: linear-gradient(to right, rgba(99, 102, 241, 0.15), rgba(139, 92, 246, 0.15));
-            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+        /* 标题栏 */
+        .panel-header {
+            padding: 18px 20px;
             display: flex;
-            justify-content: space-between;
             align-items: center;
+            justify-content: space-between;
+            border-bottom: 1px solid var(--glass-border);
+            cursor: move;
             user-select: none;
-            transition: background 0.3s ease;
         }
         
-        #panel-header:hover {
-            background: linear-gradient(to right, rgba(99, 102, 241, 0.2), rgba(139, 92, 246, 0.2));
-        }
-        
-        #panel-title {
-            font-size: 16px;
-            font-weight: 600;
-            background: linear-gradient(to right, #818cf8, #a78bfa);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            background-clip: text;
-            letter-spacing: 0.5px;
-        }
-        
-        #panel-body {
-            padding: 24px;
+        .panel-title {
             display: flex;
-            flex-direction: column;
-            gap: 20px;
-            max-height: 800px;
-            overflow: hidden;
-            transition: max-height 0.4s cubic-bezier(0.4, 0, 0.2, 1), 
-                        padding 0.4s cubic-bezier(0.4, 0, 0.2, 1),
-                        opacity 0.3s ease;
-            opacity: 1;
+            align-items: center;
+            gap: 10px;
         }
         
-        #control-panel.collapsed #panel-body {
-            max-height: 0;
-            padding: 0 24px;
-            opacity: 0;
-        }
-        
-        /* 折叠按钮 */
-        #toggle-btn {
+        .panel-title .logo {
             width: 32px;
             height: 32px;
-            background: rgba(255, 255, 255, 0.1);
-            border: 1px solid rgba(255, 255, 255, 0.2);
-            border-radius: 8px;
-            color: #fff;
-            cursor: pointer;
-            font-size: 14px;
+            background: linear-gradient(135deg, var(--accent), #a855f7);
+            border-radius: 10px;
             display: flex;
             align-items: center;
             justify-content: center;
-            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            font-size: 16px;
+        }
+        
+        .panel-title h1 {
+            font-size: 15px;
+            font-weight: 600;
+            letter-spacing: -0.3px;
+        }
+        
+        .panel-title span {
+            font-size: 11px;
+            color: var(--text-muted);
+            font-weight: 500;
+        }
+        
+        #toggle-btn {
+            width: 28px;
+            height: 28px;
+            background: rgba(255, 255, 255, 0.06);
+            border: none;
+            border-radius: 8px;
+            color: var(--text-secondary);
+            cursor: pointer;
+            font-size: 12px;
+            transition: all 0.2s ease;
+            display: flex;
+            align-items: center;
+            justify-content: center;
         }
         
         #toggle-btn:hover {
-            background: rgba(255, 255, 255, 0.2);
-            transform: scale(1.1);
+            background: rgba(255, 255, 255, 0.12);
+            color: var(--text-primary);
         }
         
         #control-panel.collapsed #toggle-btn {
             transform: rotate(180deg);
         }
         
-        #control-panel.collapsed #toggle-btn:hover {
-            transform: rotate(180deg) scale(1.1);
+        /* 面板主体 */
+        #panel-body {
+            padding: 16px;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            max-height: 800px;
+            transition: all 0.4s cubic-bezier(0.16, 1, 0.3, 1);
         }
         
-        /* 统计信息区域 */
-        #stats-section {
-            background: linear-gradient(135deg, rgba(99, 102, 241, 0.1) 0%, rgba(139, 92, 246, 0.1) 100%);
-            border: 1px solid rgba(255, 255, 255, 0.15);
-            border-radius: 12px;
-            padding: 20px;
-            transition: all 0.3s ease;
+        #control-panel.collapsed #panel-body {
+            max-height: 0;
+            padding: 0 16px;
+            opacity: 0;
+            pointer-events: none;
         }
         
-        #stats-section:hover {
-            border-color: rgba(255, 255, 255, 0.25);
-            box-shadow: 0 4px 16px rgba(99, 102, 241, 0.15);
-        }
-        
-        #stats-grid {
+        /* ========== 实时统计卡片 ========== */
+        .stats-card {
             display: grid;
-            grid-template-columns: repeat(4, 1fr);
-            gap: 16px;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 10px;
         }
         
         .stat-item {
-            text-align: center;
-            padding: 12px;
-            border-radius: 8px;
             background: rgba(255, 255, 255, 0.03);
-            transition: all 0.3s ease;
-        }
-        
-        .stat-item:hover {
-            background: rgba(255, 255, 255, 0.06);
-            transform: translateY(-2px);
-        }
-        
-        .stat-label {
-            color: rgba(255, 255, 255, 0.6);
-            font-size: 12px;
-            margin-bottom: 8px;
-            font-weight: 500;
-            letter-spacing: 0.5px;
-        }
-        
-        .stat-value {
-            background: linear-gradient(to right, #60a5fa, #a78bfa);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            background-clip: text;
-            font-size: 24px;
-            font-weight: 700;
-            letter-spacing: -0.5px;
-        }
-        
-        .input-row {
-            display: flex;
-            gap: 12px;
-            align-items: center;
-        }
-        
-        .input-wrapper {
-            flex: 1;
-            position: relative;
-        }
-        
-        #rtsp-url {
-            width: 100%;
-            padding: 14px 80px 14px 16px;
-            background: rgba(255, 255, 255, 0.05);
-            border: 1px solid rgba(255, 255, 255, 0.15);
-            border-radius: 10px;
-            color: #fff;
-            font-size: 14px;
-            transition: all 0.3s ease;
-            font-family: 'SF Mono', Monaco, 'Cascadia Code', monospace;
-        }
-        
-        #rtsp-url::placeholder {
-            color: rgba(255, 255, 255, 0.3);
-        }
-        
-        #rtsp-url:focus {
-            outline: none;
-            background: rgba(255, 255, 255, 0.08);
-            border-color: rgba(139, 92, 246, 0.5);
-            box-shadow: 0 0 0 3px rgba(139, 92, 246, 0.1);
-        }
-        
-        /* 下拉按钮组 */
-        #history-toggle, #clear-history {
-            position: absolute;
-            top: 50%;
-            transform: translateY(-50%);
-            background: rgba(255, 255, 255, 0.08);
-            border: 1px solid rgba(255, 255, 255, 0.15);
-            border-radius: 6px;
-            color: rgba(255, 255, 255, 0.7);
-            cursor: pointer;
-            padding: 6px 10px;
-            font-size: 14px;
+            border: 1px solid var(--glass-border);
+            border-radius: 12px;
+            padding: 14px;
+            text-align: center;
             transition: all 0.2s ease;
         }
         
-        #history-toggle {
-            right: 44px;
+        .stat-item:hover {
+            background: rgba(255, 255, 255, 0.05);
+            border-color: rgba(255, 255, 255, 0.12);
         }
         
-        #clear-history {
-            right: 10px;
-            padding: 6px 8px;
+        .stat-item .value {
+            font-size: 26px;
+            font-weight: 700;
+            background: linear-gradient(135deg, #60a5fa, var(--accent-light));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            line-height: 1.2;
         }
         
-        #history-toggle:hover, #clear-history:hover {
-            background: rgba(255, 255, 255, 0.15);
-            border-color: rgba(255, 255, 255, 0.3);
-            color: #fff;
+        .stat-item .label {
+            font-size: 11px;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-top: 4px;
         }
         
-        /* 历史记录下拉列表 */
+        /* ========== 输入区域 ========== */
+        .input-group {
+            position: relative;
+        }
+        
+        .input-group input {
+            width: 100%;
+            padding: 14px 16px;
+            padding-right: 80px;
+            background: rgba(255, 255, 255, 0.04);
+            border: 1px solid var(--glass-border);
+            border-radius: 12px;
+            color: var(--text-primary);
+            font-size: 13px;
+            font-family: 'JetBrains Mono', 'SF Mono', monospace;
+            transition: all 0.2s ease;
+        }
+        
+        .input-group input::placeholder {
+            color: var(--text-muted);
+        }
+        
+        .input-group input:focus {
+            outline: none;
+            border-color: var(--accent);
+            background: rgba(255, 255, 255, 0.06);
+            box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.15);
+        }
+        
+        .input-actions {
+            position: absolute;
+            right: 8px;
+            top: 50%;
+            transform: translateY(-50%);
+            display: flex;
+            gap: 4px;
+        }
+        
+        .input-actions button {
+            width: 30px;
+            height: 30px;
+            padding: 0;
+            background: rgba(255, 255, 255, 0.06);
+            border: none;
+            border-radius: 8px;
+            color: var(--text-secondary);
+            cursor: pointer;
+            font-size: 12px;
+            transition: all 0.2s ease;
+        }
+        
+        .input-actions button:hover {
+            background: rgba(255, 255, 255, 0.12);
+            color: var(--text-primary);
+        }
+        
+        /* 历史下拉 */
         #history-dropdown {
             position: absolute;
-            top: calc(100% + 8px);
+            top: calc(100% + 6px);
             left: 0;
             right: 0;
-            background: linear-gradient(135deg, rgba(30, 30, 40, 0.95) 0%, rgba(20, 20, 30, 0.95) 100%);
+            background: rgba(20, 20, 28, 0.98);
             backdrop-filter: blur(20px);
-            border: 1px solid rgba(255, 255, 255, 0.15);
-            border-radius: 10px;
-            max-height: 320px;
+            border: 1px solid var(--glass-border);
+            border-radius: 12px;
+            max-height: 240px;
             overflow-y: auto;
             z-index: 1000;
             display: none;
-            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+            box-shadow: 0 16px 48px rgba(0, 0, 0, 0.5);
         }
         
         #history-dropdown.show {
             display: block;
-            animation: slideDown 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            animation: dropIn 0.2s ease;
         }
         
-        @keyframes slideDown {
-            from {
-                opacity: 0;
-                transform: translateY(-10px);
-            }
-            to {
-                opacity: 1;
-                transform: translateY(0);
-            }
+        @keyframes dropIn {
+            from { opacity: 0; transform: translateY(-8px); }
+            to { opacity: 1; transform: translateY(0); }
         }
         
         .history-item {
-            padding: 12px 16px;
+            padding: 12px 14px;
             cursor: pointer;
-            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
-            color: rgba(255, 255, 255, 0.8);
-            font-size: 13px;
-            font-family: 'SF Mono', Monaco, monospace;
-            transition: all 0.2s ease;
+            color: var(--text-secondary);
+            font-size: 12px;
+            font-family: 'JetBrains Mono', monospace;
+            border-bottom: 1px solid var(--glass-border);
+            transition: all 0.15s ease;
         }
         
-        .history-item:last-child {
-            border-bottom: none;
-        }
+        .history-item:last-child { border-bottom: none; }
         
         .history-item:hover {
-            background: linear-gradient(to right, rgba(99, 102, 241, 0.2), rgba(139, 92, 246, 0.2));
-            color: #fff;
-            padding-left: 20px;
+            background: rgba(99, 102, 241, 0.15);
+            color: var(--text-primary);
         }
         
-        /* 滚动条样式 */
-        #history-dropdown::-webkit-scrollbar {
-            width: 6px;
+        /* ========== 按钮组 ========== */
+        .btn-group {
+            display: flex;
+            gap: 8px;
         }
         
-        #history-dropdown::-webkit-scrollbar-track {
-            background: transparent;
-        }
-        
-        #history-dropdown::-webkit-scrollbar-thumb {
-            background: rgba(255, 255, 255, 0.2);
-            border-radius: 3px;
-        }
-        
-        #history-dropdown::-webkit-scrollbar-thumb:hover {
-            background: rgba(255, 255, 255, 0.3);
-        }
-        
-        /* 音量控制 */
-        .volume-control {
+        .btn {
+            flex: 1;
+            padding: 12px 16px;
+            border: none;
+            border-radius: 10px;
+            font-size: 13px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s ease;
             display: flex;
             align-items: center;
-            gap: 16px;
-            padding: 16px;
-            background: rgba(255, 255, 255, 0.03);
-            border-radius: 10px;
-            border: 1px solid rgba(255, 255, 255, 0.08);
+            justify-content: center;
+            gap: 8px;
         }
         
-        .volume-control label {
-            color: rgba(255, 255, 255, 0.7);
-            font-size: 13px;
-            font-weight: 500;
-            min-width: 80px;
+        .btn-primary {
+            background: linear-gradient(135deg, var(--success), #059669);
+            color: white;
+            box-shadow: 0 4px 16px rgba(16, 185, 129, 0.3);
         }
         
-        #volume-slider {
+        .btn-primary:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 6px 24px rgba(16, 185, 129, 0.4);
+        }
+        
+        .btn-danger {
+            background: linear-gradient(135deg, var(--danger), #dc2626);
+            color: white;
+            box-shadow: 0 4px 16px rgba(239, 68, 68, 0.3);
+        }
+        
+        .btn-danger:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 6px 24px rgba(239, 68, 68, 0.4);
+        }
+        
+        .btn-secondary {
+            background: rgba(255, 255, 255, 0.06);
+            color: var(--text-primary);
+            border: 1px solid var(--glass-border);
+        }
+        
+        .btn-secondary:hover {
+            background: rgba(255, 255, 255, 0.1);
+            border-color: rgba(255, 255, 255, 0.15);
+        }
+        
+        .btn-accent {
+            background: linear-gradient(135deg, var(--accent), #7c3aed);
+            color: white;
+            box-shadow: 0 4px 16px rgba(99, 102, 241, 0.3);
+        }
+        
+        .btn-accent:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 6px 24px rgba(99, 102, 241, 0.4);
+        }
+        
+        /* ========== 设置区域 ========== */
+        .settings-section {
+            background: rgba(255, 255, 255, 0.02);
+            border: 1px solid var(--glass-border);
+            border-radius: 14px;
+            padding: 14px;
+        }
+        
+        .settings-row {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+        
+        .settings-row + .settings-row {
+            margin-top: 12px;
+            padding-top: 12px;
+            border-top: 1px solid var(--glass-border);
+        }
+        
+        .settings-label {
+            font-size: 12px;
+            color: var(--text-secondary);
+            min-width: 60px;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        
+        .settings-label .icon {
+            font-size: 14px;
+        }
+        
+        select {
             flex: 1;
-            height: 6px;
-            background: linear-gradient(to right, rgba(99, 102, 241, 0.2), rgba(139, 92, 246, 0.2));
-            border-radius: 3px;
-            outline: none;
-            -webkit-appearance: none;
-            appearance: none;
-        }
-        
-        #volume-slider::-webkit-slider-thumb {
-            -webkit-appearance: none;
-            appearance: none;
-            width: 18px;
-            height: 18px;
-            border-radius: 50%;
-            background: linear-gradient(135deg, #818cf8, #a78bfa);
+            padding: 10px 12px;
+            background: rgba(255, 255, 255, 0.04);
+            border: 1px solid var(--glass-border);
+            border-radius: 8px;
+            color: var(--text-primary);
+            font-size: 12px;
             cursor: pointer;
-            box-shadow: 0 2px 8px rgba(139, 92, 246, 0.4);
             transition: all 0.2s ease;
         }
         
-        #volume-slider::-webkit-slider-thumb:hover {
-            transform: scale(1.2);
-            box-shadow: 0 4px 12px rgba(139, 92, 246, 0.6);
+        select:focus {
+            outline: none;
+            border-color: var(--accent);
         }
         
-        #volume-value {
-            color: rgba(255, 255, 255, 0.9);
-            font-size: 14px;
+        select option {
+            background: #1a1a24;
+            color: var(--text-primary);
+        }
+        
+        /* 音量滑块 */
+        .slider-control {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            flex: 1;
+        }
+        
+        input[type="range"] {
+            flex: 1;
+            height: 4px;
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 2px;
+            outline: none;
+            -webkit-appearance: none;
+        }
+        
+        input[type="range"]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            width: 16px;
+            height: 16px;
+            border-radius: 50%;
+            background: linear-gradient(135deg, var(--accent-light), var(--accent));
+            cursor: pointer;
+            box-shadow: 0 2px 8px rgba(99, 102, 241, 0.4);
+            transition: all 0.2s ease;
+        }
+        
+        input[type="range"]::-webkit-slider-thumb:hover {
+            transform: scale(1.15);
+        }
+        
+        .slider-value {
+            font-size: 12px;
             font-weight: 600;
-            min-width: 50px;
+            color: var(--accent-light);
+            min-width: 36px;
             text-align: right;
         }
         
-        /* 按钮样式 */
-        button {
-            padding: 14px 28px;
-            border: 1px solid rgba(255, 255, 255, 0.2);
-            border-radius: 10px;
-            cursor: pointer;
-            font-size: 14px;
-            font-weight: 600;
-            letter-spacing: 0.3px;
-            background: linear-gradient(135deg, rgba(99, 102, 241, 0.2), rgba(139, 92, 246, 0.2));
-            color: #fff;
-            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-            position: relative;
-            overflow: hidden;
-        }
-        
-        button::before {
-            content: '';
-            position: absolute;
-            top: 50%;
-            left: 50%;
-            width: 0;
-            height: 0;
-            border-radius: 50%;
-            background: rgba(255, 255, 255, 0.2);
-            transform: translate(-50%, -50%);
-            transition: width 0.6s, height 0.6s;
-        }
-        
-        button:hover::before {
-            width: 300px;
-            height: 300px;
-        }
-        
-        button:hover {
-            background: linear-gradient(135deg, rgba(99, 102, 241, 0.3), rgba(139, 92, 246, 0.3));
-            border-color: rgba(255, 255, 255, 0.3);
-            transform: translateY(-2px);
-            box-shadow: 0 8px 24px rgba(139, 92, 246, 0.3);
-        }
-        
-        button:active {
-            transform: translateY(0);
-        }
-        
-        #start-btn {
-            flex: 1;
-            background: linear-gradient(135deg, rgba(34, 197, 94, 0.2), rgba(22, 163, 74, 0.2));
-        }
-        
-        #start-btn:hover {
-            background: linear-gradient(135deg, rgba(34, 197, 94, 0.3), rgba(22, 163, 74, 0.3));
-            box-shadow: 0 8px 24px rgba(34, 197, 94, 0.3);
-        }
-        
-        #stop-btn {
-            flex: 1;
-            display: none;
-            background: linear-gradient(135deg, rgba(239, 68, 68, 0.2), rgba(220, 38, 38, 0.2));
-        }
-        
-        #stop-btn:hover {
-            background: linear-gradient(135deg, rgba(239, 68, 68, 0.3), rgba(220, 38, 38, 0.3));
-            box-shadow: 0 8px 24px rgba(239, 68, 68, 0.3);
-        }
-        
-        /* 状态提示 */
+        /* ========== 状态提示 ========== */
         #status {
             position: absolute;
-            bottom: 32px;
+            bottom: 24px;
             left: 50%;
             transform: translateX(-50%);
-            background: linear-gradient(135deg, rgba(99, 102, 241, 0.9), rgba(139, 92, 246, 0.9));
-            backdrop-filter: blur(10px);
-            border: 1px solid rgba(255, 255, 255, 0.2);
+            background: var(--glass-bg);
+            backdrop-filter: blur(20px);
+            border: 1px solid var(--glass-border);
             border-radius: 12px;
-            padding: 12px 28px;
-            font-size: 14px;
-            font-weight: 600;
+            padding: 12px 24px;
+            font-size: 13px;
+            font-weight: 500;
             display: none;
             z-index: 100;
-            letter-spacing: 0.3px;
-            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
-            animation: statusSlideUp 0.4s cubic-bezier(0.4, 0, 0.2, 1);
-        }
-        
-        @keyframes statusSlideUp {
-            from {
-                opacity: 0;
-                transform: translateX(-50%) translateY(20px);
-            }
-            to {
-                opacity: 1;
-                transform: translateX(-50%) translateY(0);
-            }
+            box-shadow: 0 12px 40px rgba(0, 0, 0, 0.4);
         }
         
         #status.show {
             display: block;
+            animation: slideUp 0.3s ease;
         }
+        
+        @keyframes slideUp {
+            from { opacity: 0; transform: translateX(-50%) translateY(16px); }
+            to { opacity: 1; transform: translateX(-50%) translateY(0); }
+        }
+        
+        /* 隐藏类 */
+        .hidden { display: none !important; }
+        
+        /* 滚动条 */
+        ::-webkit-scrollbar { width: 5px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.15); border-radius: 3px; }
+        ::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.25); }
     </style>
 </head>
 <body>
     <div id="app">
-        <!-- 全屏视频画布 -->
         <canvas id="canvas"></canvas>
-        <!-- 检测框叠加层 -->
         <canvas id="detection-overlay"></canvas>
         
-        <!-- 控制面板浮层 - 玻璃态风格 -->
+        <!-- 现代控制面板 -->
         <div id="control-panel">
-            <div id="panel-header">
-                <div id="panel-title">🎥 RTSP Stream Control</div>
-                <button id="toggle-btn" title="折叠/展开">▲</button>
+            <div class="panel-header" id="panel-header">
+                <div class="panel-title">
+                    <div class="logo">👁</div>
+                    <div>
+                        <h1>YOLO Vision</h1>
+                        <span>Real-time Detection</span>
+                    </div>
+                </div>
+                <button id="toggle-btn" title="折叠">▲</button>
             </div>
+            
             <div id="panel-body">
-                <!-- 统计信息 -->
-                <div id="stats-section">
-                    <div id="stats-grid">
-                        <div class="stat-item">
-                            <div class="stat-label">Video FPS</div>
-                            <div class="stat-value" id="fps">0</div>
-                        </div>
-                        <div class="stat-item">
-                            <div class="stat-label">Detect FPS</div>
-                            <div class="stat-value" id="detect-fps">0</div>
-                        </div>
-                        <div class="stat-item">
-                            <div class="stat-label">Objects</div>
-                            <div class="stat-value" id="detect-count">0</div>
-                        </div>
-                        <div class="stat-item">
-                            <div class="stat-label">Latency</div>
-                            <div class="stat-value" id="latency">0ms</div>
-                        </div>
+                <!-- 实时统计 -->
+                <div class="stats-card">
+                    <div class="stat-item">
+                        <div class="value" id="fps">0</div>
+                        <div class="label">Video FPS</div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="value" id="detect-fps">0</div>
+                        <div class="label">AI FPS</div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="value" id="detect-count">0</div>
+                        <div class="label">Objects</div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="value" id="latency">0<small style="font-size:12px">ms</small></div>
+                        <div class="label">Latency</div>
                     </div>
                 </div>
                 
-                <!-- 音量控制 -->
-                <div class="volume-control">
-                    <label>🔊 Volume</label>
-                    <input type="range" id="volume-slider" min="0" max="5" step="0.1" value="1.5">
-                    <span id="volume-value">1.5×</span>
-                </div>
-                
-                <!-- 输入框 -->
-                <div class="input-row">
-                    <div class="input-wrapper">
-                        <input 
-                            type="text" 
-                            id="rtsp-url" 
-                            placeholder="Enter RTSP URL or video path..."
-                            value=""
-                        />
+                <!-- RTSP 输入 -->
+                <div class="input-group">
+                    <input type="text" id="rtsp-url" placeholder="rtsp://username:password@host:port/path">
+                    <div class="input-actions">
                         <button id="history-toggle" title="历史记录">▼</button>
-                        <button id="clear-history" title="清空历史">🗑️</button>
-                        <div id="history-dropdown"></div>
+                        <button id="clear-history" title="清空">🗑</button>
+                    </div>
+                    <div id="history-dropdown"></div>
+                </div>
+                
+                <!-- 流控制按钮 -->
+                <div class="btn-group">
+                    <button id="start-btn" class="btn btn-primary">
+                        <span>▶</span> 开始推流
+                    </button>
+                    <button id="stop-btn" class="btn btn-danger hidden">
+                        <span>⏹</span> 停止推流
+                    </button>
+                </div>
+                
+                <!-- AI 设置 -->
+                <div class="settings-section">
+                    <div class="settings-row">
+                        <div class="settings-label">
+                            <span class="icon">🧠</span> 模型
+                        </div>
+                        <select id="model-select">
+                            <option value="">加载中...</option>
+                        </select>
+                    </div>
+                    <div class="settings-row">
+                        <div class="settings-label">
+                            <span class="icon">⚡</span> 设备
+                        </div>
+                        <select id="device-select">
+                            <option value="auto">Auto</option>
+                        </select>
+                    </div>
+                    <div class="settings-row">
+                        <div class="settings-label">
+                            <span class="icon">🔊</span> 音量
+                        </div>
+                        <div class="slider-control">
+                            <input type="range" id="volume-slider" min="0" max="5" step="0.1" value="1.5">
+                            <span class="slider-value" id="volume-value">1.5×</span>
+                        </div>
                     </div>
                 </div>
                 
-                <!-- 按钮 -->
-                <div class="input-row">
-                    <button id="start-btn">▶ Start Stream</button>
-                    <button id="stop-btn">⏹ Stop Stream</button>
-                </div>
-                
-                <!-- 检测器设置 -->
-                <div class="detector-settings" style="display: flex; gap: 12px; align-items: center; padding: 16px; background: rgba(255, 255, 255, 0.03); border-radius: 10px; border: 1px solid rgba(255, 255, 255, 0.08);">
-                    <label style="color: rgba(255, 255, 255, 0.7); font-size: 13px; font-weight: 500; min-width: 50px;">🧠 Model</label>
-                    <select id="model-select" style="flex: 1; padding: 10px 14px; background: rgba(255, 255, 255, 0.05); border: 1px solid rgba(255, 255, 255, 0.15); border-radius: 8px; color: #fff; font-size: 13px; cursor: pointer;">
-                        <option value="">加载中...</option>
-                    </select>
-                    <label style="color: rgba(255, 255, 255, 0.7); font-size: 13px; font-weight: 500; min-width: 50px;">⚡ Device</label>
-                    <select id="device-select" style="flex: 1; padding: 10px 14px; background: rgba(255, 255, 255, 0.05); border: 1px solid rgba(255, 255, 255, 0.15); border-radius: 8px; color: #fff; font-size: 13px; cursor: pointer;">
-                        <option value="auto">Auto</option>
-                    </select>
-                </div>
-                
-                <!-- 检测器控制 -->
-                <div class="detector-control" style="display: flex; gap: 12px; align-items: center; padding: 16px; background: rgba(255, 255, 255, 0.03); border-radius: 10px; border: 1px solid rgba(255, 255, 255, 0.08);">
-                    <label style="color: rgba(255, 255, 255, 0.7); font-size: 13px; font-weight: 500; min-width: 80px;">🎯 Detection</label>
-                    <button id="start-detector-btn" style="flex: 1; background: linear-gradient(135deg, rgba(59, 130, 246, 0.2), rgba(37, 99, 235, 0.2));">▶ 开启检测</button>
-                    <button id="stop-detector-btn" style="flex: 1; display: none; background: linear-gradient(135deg, rgba(239, 68, 68, 0.2), rgba(220, 38, 38, 0.2));">⏹ 停止检测</button>
+                <!-- 检测控制 -->
+                <div class="btn-group">
+                    <button id="start-detector-btn" class="btn btn-accent">
+                        <span>🎯</span> 开启检测
+                    </button>
+                    <button id="stop-detector-btn" class="btn btn-danger hidden">
+                        <span>⏹</span> 停止检测
+                    </button>
                 </div>
             </div>
         </div>
         
-        <!-- 状态提示 -->
         <div id="status"></div>
     </div>
 
