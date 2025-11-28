@@ -2,6 +2,186 @@ import { invoke, Channel } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { FrameDetector } from './detector.js';
 
+// 前端加载完成后显示窗口（避免白屏闪烁）
+invoke('show_window').catch(console.error);
+
+// ==================== 摄像头/桌面采集 ====================
+
+class CaptureManager {
+    constructor(canvas) {
+        this.canvas = canvas;
+        this.ctx = canvas.getContext('2d');
+        this.running = false;
+        this.animationId = null;
+        this.timeoutId = null;  // 🔧 用于 setTimeout 模式
+        this.frameCount = 0;
+        this.lastFpsTime = performance.now();
+        this.fps = 0;
+        this.currentDevice = null;
+        
+        // 共享内存
+        this.sharedMemory = null;
+        this.shmName = null;
+        this.lastFrameId = 0;
+        
+        // 🔧 遮挡渲染模式: true = 使用 setTimeout (窗口被遮挡时仍渲染)
+        this.backgroundRenderMode = true;
+        this.targetFps = 30;
+    }
+    
+    async listDevices() {
+        try {
+            return await invoke('list_capture_devices');
+        } catch (e) {
+            console.error('列出设备失败:', e);
+            return [];
+        }
+    }
+    
+    async start(deviceId, deviceType, width, height, fps = 30, region = null) {
+        if (this.running) {
+            await this.stop();
+        }
+        
+        console.log(`🎥 启动采集: ${deviceId} (${deviceType}) @ ${width}x${height}, region:`, region);
+        
+        // start_capture 现在返回共享内存信息
+        const shmInfo = await invoke('start_capture', {
+            deviceId,
+            deviceType,
+            width,
+            height,
+            fps,
+            region
+        });
+        
+        console.log('📝 共享内存信息:', shmInfo);
+        this.shmName = shmInfo.name;
+        
+        this.running = true;
+        this.currentDevice = { id: deviceId, type: deviceType };
+        this.lastFrameId = 0;
+        this._lastDebugTime = null; // 重置调试时间
+        console.log('🔄 启动渲染循环...');
+        this.renderLoop();
+    }
+    
+    async stop() {
+        this.running = false;
+        if (this.animationId) {
+            cancelAnimationFrame(this.animationId);
+            this.animationId = null;
+        }
+        
+        try {
+            await invoke('stop_capture');
+            console.log('🛑 采集已停止');
+        } catch (e) {
+            console.error('停止采集失败:', e);
+        }
+        
+        this.currentDevice = null;
+        this.shmName = null;
+        this.lastFrameId = 0;
+    }
+    
+    async renderLoop() {
+        if (!this.running) {
+            console.log('⏹️ 渲染循环已停止');
+            return;
+        }
+        
+        try {
+            // 轮询帧信息 (检查是否有新帧)
+            const frameInfo = await invoke('get_capture_frame_info');
+            
+            if (frameInfo && frameInfo.frame_id > this.lastFrameId) {
+                // 有新帧，读取帧数据
+                const response = await invoke('read_capture_frame');
+                
+                // Tauri 2 Response 格式 - 需要提取 ArrayBuffer
+                let data;
+                if (response instanceof ArrayBuffer) {
+                    data = new Uint8Array(response);
+                } else if (response instanceof Uint8Array) {
+                    data = response;
+                } else if (response && response.data) {
+                    data = new Uint8Array(response.data);
+                } else if (Array.isArray(response)) {
+                    data = new Uint8Array(response);
+                } else {
+                    this.animationId = requestAnimationFrame(() => this.renderLoop());
+                    return;
+                }
+                
+                if (data.length > 24) {
+                    // 解析 header: frame_id(8) + width(4) + height(4) + timestamp(8) = 24 bytes
+                    const headerView = new DataView(data.buffer, data.byteOffset, 24);
+                    const frameId = Number(headerView.getBigUint64(0, true));
+                    const width = headerView.getUint32(8, true);
+                    const height = headerView.getUint32(12, true);
+                    
+                    // 仅第一帧打印调试
+                    if (this.lastFrameId === 0) {
+                        console.log(`🖼️ 首帧: ${width}x${height}, 帧ID: ${frameId}`);
+                    }
+                    
+                    this.lastFrameId = frameId;
+                    
+                    const expectedLen = width * height * 4;
+                    const dataLen = data.length - 24;
+                    
+                    if (dataLen >= expectedLen && width > 0 && height > 0) {
+                        // RGBA 数据 (从 offset 24 开始)
+                        const rgbaData = new Uint8ClampedArray(data.buffer, data.byteOffset + 24, expectedLen);
+                        
+                        // 调整 canvas 尺寸
+                        if (this.canvas.width !== width || this.canvas.height !== height) {
+                            this.canvas.width = width;
+                            this.canvas.height = height;
+                            console.log(`📐 Canvas 调整为: ${width}x${height}`);
+                            
+                            // 同步 detection-overlay 尺寸
+                            syncOverlayToCanvas(width, height);
+                        }
+                        
+                        const imageData = new ImageData(rgbaData, width, height);
+                        this.ctx.putImageData(imageData, 0, 0);
+                        
+                        // FPS 统计
+                        this.frameCount++;
+                        const now = performance.now();
+                        if (now - this.lastFpsTime >= 1000) {
+                            this.fps = this.frameCount / ((now - this.lastFpsTime) / 1000);
+                            this.frameCount = 0;
+                            this.lastFpsTime = now;
+                            document.getElementById('fps').textContent = this.fps.toFixed(0);
+                        }
+                    }
+                }
+            }
+        } catch (e) {
+            // 忽略 "没有可用的帧" 错误
+            if (!String(e).includes('没有可用的帧')) {
+                console.warn('采集帧错误:', e);
+            }
+        }
+        
+        this.animationId = requestAnimationFrame(() => this.renderLoop());
+    }
+    
+    // 获取当前帧用于检测
+    getCurrentFrame() {
+        if (!this.canvas.width || !this.canvas.height) return null;
+        const imageData = this.ctx.getImageData(0, 0, this.canvas.width, this.canvas.height);
+        return {
+            data: imageData.data,
+            width: this.canvas.width,
+            height: this.canvas.height
+        };
+    }
+}
+
 // 重写 console.log 以发送到后端
 const originalLog = console.log;
 const originalError = console.error;
@@ -82,37 +262,6 @@ class WebGLVideoRenderer {
     initAudioContext() {
         this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
         console.log('🔊 Audio Context initialized:', this.audioContext.sampleRate, 'Hz');
-        
-        // 添加测试音按钮
-        this.addTestAudioButton();
-    }
-    
-    addTestAudioButton() {
-        const testBtn = document.createElement('button');
-        testBtn.textContent = '🔊 测试音频';
-        testBtn.style.cssText = 'position: fixed; top: 10px; right: 10px; z-index: 10000; padding: 10px; background: #4CAF50; color: white; border: none; border-radius: 4px; cursor: pointer; font-family: monospace;';
-        testBtn.onclick = () => this.playTestTone();
-        document.body.appendChild(testBtn);
-    }
-    
-    playTestTone() {
-        console.log('🔔 Playing test tone...');
-        const oscillator = this.audioContext.createOscillator();
-        const gainNode = this.audioContext.createGain();
-        
-        oscillator.type = 'sine';
-        oscillator.frequency.setValueAtTime(440, this.audioContext.currentTime); // A4 音符
-        
-        gainNode.gain.setValueAtTime(0.3, this.audioContext.currentTime);
-        gainNode.gain.exponentialRampToValueAtTime(0.01, this.audioContext.currentTime + 0.5);
-        
-        oscillator.connect(gainNode);
-        gainNode.connect(this.audioContext.destination);
-        
-        oscillator.start(this.audioContext.currentTime);
-        oscillator.stop(this.audioContext.currentTime + 0.5);
-        
-        console.log('✅ Test tone played');
     }
     
     resizeCanvas() {
@@ -584,6 +733,153 @@ class WebGLVideoRenderer {
 const canvas = document.getElementById('canvas');
 const renderer = new WebGLVideoRenderer(canvas);
 
+// ==================== 图像缩放和拖拽功能 ====================
+
+class CanvasTransform {
+    constructor(canvas, overlayCanvas) {
+        this.canvas = canvas;
+        this.overlayCanvas = overlayCanvas;
+        this.scale = 1;
+        this.minScale = 0.1;
+        this.maxScale = 10;
+        this.offsetX = 0;
+        this.offsetY = 0;
+        this.isDragging = false;
+        this.lastMouseX = 0;
+        this.lastMouseY = 0;
+        
+        // 变换容器
+        this.container = document.getElementById('canvas-container');
+        
+        this.initEvents();
+        this.updateTransform();
+    }
+    
+    initEvents() {
+        // 鼠标滚轮缩放
+        this.container.addEventListener('wheel', (e) => {
+            e.preventDefault();
+            
+            // 获取鼠标相对于容器的位置
+            const rect = this.container.getBoundingClientRect();
+            const mouseX = e.clientX - rect.left;
+            const mouseY = e.clientY - rect.top;
+            
+            // 计算缩放前鼠标指向的图像坐标
+            const imgX = (mouseX - this.offsetX) / this.scale;
+            const imgY = (mouseY - this.offsetY) / this.scale;
+            
+            // 计算新缩放比例
+            const delta = e.deltaY > 0 ? 0.9 : 1.1;
+            const newScale = Math.max(this.minScale, Math.min(this.maxScale, this.scale * delta));
+            
+            // 更新偏移量，使鼠标位置保持不变
+            this.offsetX = mouseX - imgX * newScale;
+            this.offsetY = mouseY - imgY * newScale;
+            this.scale = newScale;
+            
+            this.updateTransform();
+            this.updateZoomDisplay();
+        }, { passive: false });
+        
+        // 鼠标拖拽
+        this.container.addEventListener('mousedown', (e) => {
+            // 只响应左键拖拽
+            if (e.button !== 0) return;
+            // 如果点击的是控制面板或区域选择，不处理
+            if (e.target.closest('#control-panel') || e.target.closest('#region-selector')) return;
+            
+            this.isDragging = true;
+            this.lastMouseX = e.clientX;
+            this.lastMouseY = e.clientY;
+            this.container.style.cursor = 'grabbing';
+        });
+        
+        document.addEventListener('mousemove', (e) => {
+            if (!this.isDragging) return;
+            
+            const deltaX = e.clientX - this.lastMouseX;
+            const deltaY = e.clientY - this.lastMouseY;
+            
+            this.offsetX += deltaX;
+            this.offsetY += deltaY;
+            
+            this.lastMouseX = e.clientX;
+            this.lastMouseY = e.clientY;
+            
+            this.updateTransform();
+        });
+        
+        document.addEventListener('mouseup', () => {
+            if (this.isDragging) {
+                this.isDragging = false;
+                this.container.style.cursor = 'grab';
+            }
+        });
+        
+        // 双击重置视图
+        this.container.addEventListener('dblclick', (e) => {
+            if (e.target.closest('#control-panel') || e.target.closest('#region-selector')) return;
+            this.resetView();
+        });
+        
+        // 设置初始光标
+        this.container.style.cursor = 'grab';
+    }
+    
+    updateTransform() {
+        const transform = `translate(${this.offsetX}px, ${this.offsetY}px) scale(${this.scale})`;
+        this.canvas.style.transform = transform;
+        this.canvas.style.transformOrigin = '0 0';
+        this.overlayCanvas.style.transform = transform;
+        this.overlayCanvas.style.transformOrigin = '0 0';
+    }
+    
+    updateZoomDisplay() {
+        const zoomEl = document.getElementById('zoom-level');
+        if (zoomEl) {
+            zoomEl.textContent = `${Math.round(this.scale * 100)}%`;
+        }
+    }
+    
+    resetView() {
+        this.scale = 1;
+        this.offsetX = 0;
+        this.offsetY = 0;
+        this.updateTransform();
+        this.updateZoomDisplay();
+        console.log('🔄 视图已重置');
+    }
+    
+    // 适应窗口
+    fitToWindow() {
+        const containerRect = this.container.getBoundingClientRect();
+        const canvasWidth = this.canvas.width || containerRect.width;
+        const canvasHeight = this.canvas.height || containerRect.height;
+        
+        const scaleX = containerRect.width / canvasWidth;
+        const scaleY = containerRect.height / canvasHeight;
+        this.scale = Math.min(scaleX, scaleY, 1);
+        
+        // 居中
+        this.offsetX = (containerRect.width - canvasWidth * this.scale) / 2;
+        this.offsetY = (containerRect.height - canvasHeight * this.scale) / 2;
+        
+        this.updateTransform();
+        this.updateZoomDisplay();
+    }
+}
+
+// 初始化变换控制（等待 DOM 加载完成）
+let canvasTransform = null;
+document.addEventListener('DOMContentLoaded', () => {
+    const detectionOverlay = document.getElementById('detection-overlay');
+    if (canvas && detectionOverlay) {
+        canvasTransform = new CanvasTransform(canvas, detectionOverlay);
+        window.canvasTransform = canvasTransform;
+    }
+});
+
 // 初始化检测器
 const frameDetector = new FrameDetector(renderer);
 
@@ -632,24 +928,32 @@ let drawScheduled = false;
 let overlayWidth = window.innerWidth;
 let overlayHeight = window.innerHeight;
 
-// 同步 overlay canvas 尺寸
-function syncOverlaySize() {
-    const newW = window.innerWidth;
-    const newH = window.innerHeight;
-    
-    // 只有尺寸真正改变时才更新
-    if (detectionOverlay.width !== newW || detectionOverlay.height !== newH) {
-        detectionOverlay.width = newW;
-        detectionOverlay.height = newH;
-        overlayWidth = newW;
-        overlayHeight = newH;
-        console.log(`🔄 [Overlay] 尺寸更新: ${newW}x${newH}`);
+// 同步 overlay 到 canvas 尺寸
+function syncOverlayToCanvas(width, height) {
+    if (detectionOverlay.width !== width || detectionOverlay.height !== height) {
+        detectionOverlay.width = width;
+        detectionOverlay.height = height;
+        overlayWidth = width;
+        overlayHeight = height;
+        console.log(`🔄 [Overlay] 同步到 Canvas: ${width}x${height}`);
         
-        // 立即重绘（不使用 RAF 调度，避免被跳过）
+        // 立即重绘
         renderBoxesImmediate();
     }
 }
-syncOverlaySize();
+
+// 同步 overlay canvas 尺寸 (窗口 resize 时)
+function syncOverlaySize() {
+    // 如果有 captureManager 且有 canvas，使用 canvas 尺寸
+    const mainCanvas = document.getElementById('canvas');
+    if (mainCanvas && mainCanvas.width > 0 && mainCanvas.height > 0) {
+        // 只在真正需要时更新
+        if (detectionOverlay.width !== mainCanvas.width || detectionOverlay.height !== mainCanvas.height) {
+            syncOverlayToCanvas(mainCanvas.width, mainCanvas.height);
+        }
+    }
+}
+// 初始化时不立即同步，等待 canvas 尺寸确定
 window.addEventListener('resize', syncOverlaySize);
 
 // 立即渲染检测框（不依赖 RAF 调度）
@@ -1097,3 +1401,556 @@ console.log('使用方法:');
 console.log('  启动检测: frameDetector.startDetector("yolov8n", "bytetrack")');
 console.log('  停止检测: frameDetector.stopDetector()');
 console.log('  调整FPS:  frameDetector.setDetectionFps(15)');
+
+// ==================== 摄像头/桌面采集 UI 集成 ====================
+
+// 初始化采集管理器
+const captureManager = new CaptureManager(canvas);
+window.captureManager = captureManager;
+
+// Tab 切换
+const tabs = document.querySelectorAll('.tab');
+const rtspInputGroup = document.querySelector('.input-group');
+const rtspBtnGroup = document.getElementById('start-btn').parentElement;
+const captureSettings = document.getElementById('capture-settings');
+const captureControls = document.getElementById('capture-controls');
+const captureDeviceSelect = document.getElementById('capture-device-select');
+const captureResolution = document.getElementById('capture-resolution');
+const startCaptureBtn = document.getElementById('start-capture-btn');
+const stopCaptureBtn = document.getElementById('stop-capture-btn');
+
+// 区域选择相关元素
+const regionSelectRow = document.getElementById('region-select-row');
+const selectRegionBtn = document.getElementById('select-region-btn');
+const regionInfo = document.getElementById('region-info');
+const regionCoords = document.getElementById('region-coords');
+const clearRegionBtn = document.getElementById('clear-region-btn');
+const regionSelectorOverlay = document.getElementById('region-selector-overlay');
+const selectionBox = document.getElementById('selection-box');
+const selectionInfo = document.getElementById('selection-info');
+const recordingRegion = document.getElementById('recording-region');
+
+// 当前输入源模式
+let currentInputMode = 'rtsp';
+
+// 选中的区域 (null 表示全屏)
+let selectedRegion = null;
+
+// Tab 点击事件
+tabs.forEach(tab => {
+    tab.addEventListener('click', async () => {
+        // 更新 Tab 样式
+        tabs.forEach(t => t.classList.remove('active'));
+        tab.classList.add('active');
+        
+        const previousMode = currentInputMode;
+        const mode = tab.dataset.tab;
+        currentInputMode = mode;
+        
+        // 切换显示内容
+        if (mode === 'rtsp') {
+            // RTSP 模式 - 关闭录制指示器
+            rtspInputGroup?.classList.remove('hidden');
+            rtspBtnGroup?.classList.remove('hidden');
+            captureSettings?.classList.add('hidden');
+            captureControls?.classList.add('hidden');
+            regionSelectRow?.classList.add('hidden');
+            
+            // 关闭录制指示器（如果有）
+            if (previousMode === 'screen') {
+                try {
+                    await invoke('close_recording_indicator');
+                } catch (e) {}
+            }
+        } else {
+            // 摄像头/桌面模式
+            rtspInputGroup?.classList.add('hidden');
+            rtspBtnGroup?.classList.add('hidden');
+            captureSettings?.classList.remove('hidden');
+            captureControls?.classList.remove('hidden');
+            
+            // 桌面模式：隐藏区域选择按钮（不再需要），直接弹出录制指示器
+            if (mode === 'screen') {
+                regionSelectRow?.classList.add('hidden');  // 隐藏区域选择按钮
+                regionInfo?.classList.add('hidden');
+                
+                // 直接打开录制指示器窗口（默认位置居中，640x480）
+                try {
+                    await invoke('open_recording_indicator', { region: null });
+                    showStatus('🎯 拖动录制指示器框选择采集区域，调整大小后点击开始采集');
+                } catch (e) {
+                    console.error('打开录制指示器失败:', e);
+                }
+            } else if (mode === 'window') {
+                // 窗口模式 - 不需要录制指示器
+                regionSelectRow?.classList.add('hidden');
+                regionInfo?.classList.add('hidden');
+                
+                if (previousMode === 'screen') {
+                    try {
+                        await invoke('close_recording_indicator');
+                    } catch (e) {}
+                }
+            } else {
+                // 摄像头模式 - 关闭录制指示器
+                regionSelectRow?.classList.add('hidden');
+                regionInfo?.classList.add('hidden');
+                
+                if (previousMode === 'screen') {
+                    try {
+                        await invoke('close_recording_indicator');
+                    } catch (e) {}
+                }
+            }
+            
+            // 加载设备列表
+            await loadCaptureDevices(mode);
+        }
+    });
+});
+
+// 加载采集设备列表，并自动选择默认设备
+async function loadCaptureDevices(filterType) {
+    if (!captureDeviceSelect) return;
+    
+    captureDeviceSelect.innerHTML = '<option value="">加载中...</option>';
+    
+    try {
+        const devices = await captureManager.listDevices();
+        captureDeviceSelect.innerHTML = '<option value="">选择设备...</option>';
+        
+        // 根据当前 Tab 过滤设备
+        let filtered = devices;
+        if (filterType === 'camera') {
+            filtered = devices.filter(d => d.device_type === 'camera');
+        } else if (filterType === 'screen') {
+            filtered = devices.filter(d => d.device_type === 'screen');
+        } else if (filterType === 'window') {
+            filtered = devices.filter(d => d.device_type === 'window');
+        }
+        
+        let defaultIndex = -1;
+        
+        filtered.forEach((device, index) => {
+            const option = document.createElement('option');
+            option.value = JSON.stringify({ id: device.id, type: device.device_type });
+            const icon = device.device_type === 'camera' ? '📷' : 
+                        device.device_type === 'screen' ? '🖥️' : '🪟';
+            option.textContent = `${icon} ${device.name}`;
+            captureDeviceSelect.appendChild(option);
+            
+            // 自动选择默认设备
+            if (filterType === 'camera') {
+                // 摄像头模式：选择第一个摄像头
+                if (defaultIndex === -1 && device.device_type === 'camera') {
+                    defaultIndex = index;
+                }
+            } else if (filterType === 'screen') {
+                // 桌面模式：选择主显示器（包含 "primary" 或 "主显示器"）
+                if (device.id.includes('primary') || device.name.includes('主显示器')) {
+                    defaultIndex = index;
+                } else if (defaultIndex === -1 && device.device_type === 'screen') {
+                    // 回退：选择第一个显示器
+                    defaultIndex = index;
+                }
+            } else if (filterType === 'window') {
+                // 窗口模式：选择第一个窗口
+                if (defaultIndex === -1 && device.device_type === 'window') {
+                    defaultIndex = index;
+                }
+            }
+        });
+        
+        // 设置默认选中项 (+1 是因为有一个 "选择设备..." 占位选项)
+        if (defaultIndex >= 0 && captureDeviceSelect.options.length > defaultIndex + 1) {
+            captureDeviceSelect.selectedIndex = defaultIndex + 1;
+            console.log(`🎯 自动选择默认设备: ${filtered[defaultIndex].name}`);
+        }
+        
+        console.log(`📦 已加载 ${filtered.length} 个采集设备`);
+    } catch (e) {
+        console.error('加载设备列表失败:', e);
+        captureDeviceSelect.innerHTML = '<option value="">加载失败</option>';
+    }
+}
+
+// 开始采集
+startCaptureBtn?.addEventListener('click', async () => {
+    const deviceValue = captureDeviceSelect?.value;
+    if (!deviceValue) {
+        showStatus('❌ 请选择采集设备');
+        return;
+    }
+    
+    try {
+        const device = JSON.parse(deviceValue);
+        const [width, height] = (captureResolution?.value || '1280x720').split('x').map(Number);
+        
+        startCaptureBtn.disabled = true;
+        startCaptureBtn.innerHTML = '<span>🔄</span> 启动中...';
+        
+        // 停止 RTSP 流（如果有）
+        renderer.stop();
+        
+        // 如果是桌面采集，从录制指示器获取当前区域
+        let captureRegion = null;
+        if (device.type === 'screen') {
+            try {
+                const indicatorRegion = await invoke('get_recording_indicator_region');
+                if (indicatorRegion) {
+                    captureRegion = {
+                        x: indicatorRegion.x,
+                        y: indicatorRegion.y,
+                        width: indicatorRegion.width,
+                        height: indicatorRegion.height
+                    };
+                    console.log('📐 从录制指示器获取采集区域:', captureRegion);
+                }
+            } catch (e) {
+                console.warn('获取录制指示器区域失败:', e);
+            }
+        }
+        
+        await captureManager.start(device.id, device.type, width, height, 30, captureRegion);
+        
+        startCaptureBtn.classList.add('hidden');
+        stopCaptureBtn.classList.remove('hidden');
+        captureDeviceSelect.disabled = true;
+        captureResolution.disabled = true;
+        
+        if (device.type === 'screen' && captureRegion) {
+            showStatus(`✅ 桌面区域采集已启动 (${captureRegion.width}×${captureRegion.height})`);
+        } else {
+            showStatus(`✅ 采集已启动 (${width}x${height})`);
+        }
+    } catch (e) {
+        console.error('启动采集失败:', e);
+        showStatus('❌ 启动采集失败: ' + e);
+        startCaptureBtn.disabled = false;
+        startCaptureBtn.innerHTML = '<span>▶</span> 开始采集';
+    }
+});
+
+// 停止采集
+stopCaptureBtn?.addEventListener('click', async () => {
+    try {
+        // 先停止检测器
+        if (frameDetector.isDetecting) {
+            await frameDetector.stopDetector();
+        }
+        
+        // 注意：停止采集后不关闭录制指示器，让用户可以继续调整区域
+        // 只有切换到其他输入模式时才关闭
+        
+        await captureManager.stop();
+        
+        stopCaptureBtn.classList.add('hidden');
+        startCaptureBtn.classList.remove('hidden');
+        startCaptureBtn.disabled = false;
+        startCaptureBtn.innerHTML = '<span>▶</span> 开始采集';
+        captureDeviceSelect.disabled = false;
+        captureResolution.disabled = false;
+        
+        showStatus('⏹ 采集已停止 (可继续调整录制区域)');
+    } catch (e) {
+        console.error('停止采集失败:', e);
+        showStatus('❌ 停止采集失败: ' + e);
+    }
+});
+
+// ==================== 缩放按钮事件 ====================
+
+document.getElementById('zoom-reset')?.addEventListener('click', () => {
+    if (canvasTransform) {
+        canvasTransform.resetView();
+    }
+});
+
+document.getElementById('zoom-fit')?.addEventListener('click', () => {
+    if (canvasTransform) {
+        canvasTransform.fitToWindow();
+    }
+});
+
+// ==================== 桌面区域选择功能 ====================
+
+class RegionSelector {
+    constructor() {
+        this.recordingRegion = document.getElementById('recording-region');
+        this.region = null; // { x, y, width, height }
+        this.isListening = false;
+        this.screenRegion = null; // 屏幕坐标区域（用于录制指示器）
+        
+        // 画中选择相关
+        this.overlay = document.getElementById('region-select-overlay');
+        this.selectBox = document.getElementById('region-select-box');
+        this.isSelecting = false;
+        this.startX = 0;
+        this.startY = 0;
+        this.currentBox = null;
+        
+        this.initEventListener();
+        this.initInCanvasSelector();
+    }
+    
+    initEventListener() {
+        // 监听区域选择窗口发来的事件（全屏窗口选择方式）
+        listen('region-selected', (event) => {
+            const data = event.payload;
+            
+            if (data.cancelled) {
+                console.log('❌ 区域选择已取消');
+                showStatus('❌ 区域选择已取消');
+            } else if (data.region) {
+                this.region = data.region;
+                this.screenRegion = data.region; // 全屏选择时，region 就是屏幕坐标
+                this.onRegionSelected(this.region);
+            }
+        });
+    }
+    
+    // 初始化画中选择功能
+    initInCanvasSelector() {
+        if (!this.overlay) return;
+        
+        const mainCanvas = document.getElementById('canvas');
+        
+        this.overlay.addEventListener('mousedown', (e) => {
+            this.isSelecting = true;
+            
+            // 获取相对于 canvas 的坐标
+            const rect = mainCanvas.getBoundingClientRect();
+            this.startX = e.clientX - rect.left;
+            this.startY = e.clientY - rect.top;
+            
+            // 保存 canvas 到屏幕的缩放比例
+            this.scaleX = mainCanvas.width / rect.width;
+            this.scaleY = mainCanvas.height / rect.height;
+            this.canvasRect = rect;
+            
+            this.selectBox.style.left = `${e.clientX}px`;
+            this.selectBox.style.top = `${e.clientY}px`;
+            this.selectBox.style.width = '0';
+            this.selectBox.style.height = '0';
+            this.selectBox.style.display = 'block';
+        });
+        
+        this.overlay.addEventListener('mousemove', (e) => {
+            if (!this.isSelecting) return;
+            
+            const currentX = e.clientX - this.canvasRect.left;
+            const currentY = e.clientY - this.canvasRect.top;
+            
+            const x = Math.min(this.startX, currentX);
+            const y = Math.min(this.startY, currentY);
+            const w = Math.abs(currentX - this.startX);
+            const h = Math.abs(currentY - this.startY);
+            
+            // 屏幕坐标（用于显示）
+            this.selectBox.style.left = `${this.canvasRect.left + x}px`;
+            this.selectBox.style.top = `${this.canvasRect.top + y}px`;
+            this.selectBox.style.width = `${w}px`;
+            this.selectBox.style.height = `${h}px`;
+            
+            // 保存当前选择框（canvas 坐标）
+            this.currentBox = {
+                x: Math.round(x * this.scaleX),
+                y: Math.round(y * this.scaleY),
+                width: Math.round(w * this.scaleX),
+                height: Math.round(h * this.scaleY)
+            };
+        });
+        
+        this.overlay.addEventListener('mouseup', () => {
+            this.isSelecting = false;
+        });
+        
+        // ESC 取消, Enter 确认
+        document.addEventListener('keydown', (e) => {
+            if (!this.overlay || this.overlay.classList.contains('hidden')) return;
+            
+            if (e.key === 'Escape') {
+                this.cancelInCanvasSelect();
+            } else if (e.key === 'Enter') {
+                this.confirmInCanvasSelect();
+            }
+        });
+    }
+    
+    // 开始画中选择
+    startInCanvasSelect() {
+        if (!this.overlay) {
+            // 后备：使用旧的全屏窗口方式
+            this.show();
+            return;
+        }
+        
+        // 检查是否正在采集
+        if (!captureManager.running) {
+            showStatus('⚠️ 请先开始全屏采集，然后再选择区域');
+            return;
+        }
+        
+        this.overlay.classList.remove('hidden');
+        this.selectBox.style.display = 'none';
+        this.currentBox = null;
+        showStatus('🎯 在视频画面上拖拽选择区域，ESC 取消，Enter 确认');
+    }
+    
+    // 取消画中选择
+    cancelInCanvasSelect() {
+        this.overlay.classList.add('hidden');
+        this.selectBox.style.display = 'none';
+        this.currentBox = null;
+        showStatus('❌ 区域选择已取消');
+    }
+    
+    // 确认画中选择
+    async confirmInCanvasSelect() {
+        if (!this.currentBox || this.currentBox.width < 50 || this.currentBox.height < 50) {
+            showStatus('⚠️ 请选择一个有效区域（至少 50x50）');
+            return;
+        }
+        
+        this.overlay.classList.add('hidden');
+        this.selectBox.style.display = 'none';
+        
+        // 保存区域
+        this.region = this.currentBox;
+        this.onRegionSelected(this.region);
+        
+        // 询问是否重新采集
+        const shouldRestart = confirm(`已选择区域 ${this.region.width}×${this.region.height}\n\n是否重新启动采集（只采集选中区域）？`);
+        
+        if (shouldRestart && captureManager.running) {
+            const device = captureManager.currentDevice;
+            if (device && device.type === 'screen') {
+                showStatus('🔄 重新启动区域采集...');
+                
+                // 停止当前采集
+                await captureManager.stop();
+                
+                // 以区域模式重新启动
+                const captureRegion = {
+                    x: this.region.x,
+                    y: this.region.y,
+                    width: this.region.width,
+                    height: this.region.height
+                };
+                
+                await captureManager.start(device.id, device.type, 1920, 1080, 30, captureRegion);
+                showStatus(`✅ 区域采集已启动 (${captureRegion.width}×${captureRegion.height})`);
+                
+                // 开始闪烁指示
+                this.startRecordingBlink();
+            }
+        }
+    }
+    
+    async show() {
+        try {
+            // 调用后端打开全屏选择窗口
+            await invoke('open_region_selector');
+            showStatus('🎯 在屏幕上拖动选择区域，ESC 取消，Enter 确认');
+        } catch (e) {
+            console.error('打开区域选择器失败:', e);
+            showStatus('❌ 打开区域选择器失败: ' + e);
+        }
+    }
+    
+    onRegionSelected(region) {
+        selectedRegion = region;
+        
+        // 更新 UI
+        if (regionCoords) {
+            regionCoords.textContent = `(${region.x}, ${region.y}) ${region.width}×${region.height}`;
+        }
+        if (regionInfo) {
+            regionInfo.classList.remove('hidden');
+        }
+        
+        showStatus(`✂️ 已选择区域: ${region.width}×${region.height}`);
+        console.log(`✂️ 已选择区域: (${region.x}, ${region.y}) ${region.width}×${region.height}`);
+    }
+    
+    clearRegion() {
+        this.region = null;
+        this.screenRegion = null;
+        selectedRegion = null;
+        
+        if (regionInfo) {
+            regionInfo.classList.add('hidden');
+        }
+        if (regionCoords) {
+            regionCoords.textContent = '未选择';
+        }
+        
+        this.stopRecordingBlink();
+        console.log('🗑️ 已清除区域选择');
+    }
+    
+    // 开始录制闪烁 - 在屏幕上被采集的区域显示闪烁边框
+    async startRecordingBlink() {
+        if (!this.screenRegion) {
+            console.warn('⚠️ 没有屏幕区域信息，无法显示录制指示器');
+            return;
+        }
+        
+        try {
+            // 调用后端创建录制指示器窗口
+            await invoke('open_recording_indicator', {
+                region: {
+                    x: Math.round(this.screenRegion.x),
+                    y: Math.round(this.screenRegion.y),
+                    width: Math.round(this.screenRegion.width),
+                    height: Math.round(this.screenRegion.height)
+                }
+            });
+            
+            console.log(`🔴 录制指示器已显示 (${this.screenRegion.width}×${this.screenRegion.height}) @ (${this.screenRegion.x}, ${this.screenRegion.y})`);
+        } catch (e) {
+            console.error('打开录制指示器失败:', e);
+        }
+    }
+    
+    // 停止录制闪烁
+    async stopRecordingBlink() {
+        try {
+            await invoke('close_recording_indicator');
+            console.log('⬛ 录制指示器已关闭');
+        } catch (e) {
+            // 忽略关闭失败（可能窗口已不存在）
+        }
+    }
+    
+    getRegion() {
+        return this.region;
+    }
+}
+
+// 初始化区域选择器
+const regionSelector = new RegionSelector();
+window.regionSelector = regionSelector;
+
+// 区域选择按钮事件 - 使用画中选择
+selectRegionBtn?.addEventListener('click', async () => {
+    // 如果正在采集，使用画中选择；否则使用全屏窗口选择
+    if (captureManager.running) {
+        regionSelector.startInCanvasSelect();
+    } else {
+        // 提示用户先开始采集
+        showStatus('💡 提示：先开始全屏采集，然后点击此按钮在画面上选择区域');
+        // 也可以使用旧的全屏窗口方式
+        await regionSelector.show();
+    }
+});
+
+// 清除区域按钮事件
+clearRegionBtn?.addEventListener('click', () => {
+    regionSelector.clearRegion();
+    showStatus('🗑️ 已清除区域选择');
+});
+
+console.log('🎥 摄像头/桌面采集模块已加载');
+console.log('🔍 缩放功能: 滚轮缩放, 拖拽平移, 双击重置');
+console.log('✂️ 区域选择: 采集时点击按钮在画面上直接选择');

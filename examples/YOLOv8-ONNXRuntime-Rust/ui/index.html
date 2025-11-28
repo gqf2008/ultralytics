@@ -31,30 +31,157 @@
             color: var(--text-primary);
         }
         
+        html {
+            background: #0a0a0f;
+        }
+        
         #app {
             width: 100vw;
             height: 100vh;
             position: relative;
+            background: #0a0a0f;
+            overflow: hidden;
         }
         
-        /* 视频画布 */
-        #canvas {
+        /* Canvas 容器 - 支持缩放和拖拽 */
+        #canvas-container {
             position: absolute;
             top: 0;
             left: 0;
-            width: 100vw;
-            height: 100vh;
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+        
+        /* 视频画布 - 保持原始比例，居中显示 */
+        #canvas {
+            position: absolute;
+            /* 不设置固定尺寸，由 JS 设置实际像素尺寸 */
+            max-width: 100%;
+            max-height: 100%;
+            object-fit: contain;
+            background: transparent;
+            will-change: transform;
+            transform-origin: center center;
+        }
+        
+        /* 非混合模式的后备背景 */
+        #canvas.fallback-mode {
             background: #0a0a0f;
         }
         
-        /* 检测框叠加层 */
+        /* 检测框叠加层 - 与 canvas 同步 */
         #detection-overlay {
+            position: absolute;
+            pointer-events: none;
+            will-change: transform;
+            transform-origin: center center;
+        }
+        
+        /* 区域选择覆盖层 */
+        #region-select-overlay {
             position: absolute;
             top: 0;
             left: 0;
-            width: 100vw;
-            height: 100vh;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.3);
+            cursor: crosshair;
+            z-index: 100;
+        }
+        #region-select-overlay.hidden {
+            display: none;
+        }
+        #region-select-box {
+            position: absolute;
+            border: 2px dashed #00ff88;
+            background: rgba(0, 255, 136, 0.1);
+            box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.5);
             pointer-events: none;
+        }
+        #region-select-hint {
+            position: absolute;
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: rgba(0, 0, 0, 0.8);
+            color: #fff;
+            padding: 10px 20px;
+            border-radius: 8px;
+            font-size: 14px;
+            pointer-events: none;
+        }
+        
+        /* 缩放指示器 */
+        #zoom-indicator {
+            position: absolute;
+            bottom: 20px;
+            right: 20px;
+            background: var(--glass-bg);
+            backdrop-filter: blur(12px);
+            border: 1px solid var(--glass-border);
+            border-radius: 10px;
+            padding: 8px 12px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            z-index: 50;
+            font-size: 13px;
+            color: var(--text-secondary);
+        }
+        
+        #zoom-level {
+            min-width: 45px;
+            text-align: center;
+            font-weight: 600;
+            color: var(--accent-light);
+        }
+        
+        #zoom-indicator button {
+            width: 28px;
+            height: 28px;
+            background: rgba(255, 255, 255, 0.08);
+            border: none;
+            border-radius: 6px;
+            color: var(--text-secondary);
+            cursor: pointer;
+            font-size: 14px;
+            transition: all 0.2s ease;
+        }
+        
+        #zoom-indicator button:hover {
+            background: rgba(255, 255, 255, 0.15);
+            color: var(--text-primary);
+        }
+        
+        /* ========== 录制区域闪烁框 - 已禁用 ========== */
+        #recording-region {
+            display: none !important;
+        }
+        
+        /* 区域选择按钮 */
+        .btn-region {
+            background: linear-gradient(135deg, #f59e0b, #d97706);
+            color: white;
+            box-shadow: 0 4px 16px rgba(245, 158, 11, 0.3);
+        }
+        
+        .btn-region:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 6px 24px rgba(245, 158, 11, 0.4);
+        }
+        
+        .region-info {
+            font-size: 11px;
+            color: var(--text-muted);
+            padding: 6px 10px;
+            background: rgba(255, 255, 255, 0.03);
+            border-radius: 6px;
+            margin-top: 8px;
+            font-family: monospace;
         }
         
         /* ========== 现代控制面板 ========== */
@@ -491,6 +618,43 @@
         /* 隐藏类 */
         .hidden { display: none !important; }
         
+        /* ========== Tab 切换样式 ========== */
+        .tab-container {
+            margin-bottom: 8px;
+        }
+        
+        .tabs {
+            display: flex;
+            gap: 4px;
+            background: rgba(255, 255, 255, 0.03);
+            padding: 4px;
+            border-radius: 10px;
+        }
+        
+        .tab {
+            flex: 1;
+            padding: 10px 12px;
+            background: transparent;
+            border: none;
+            border-radius: 8px;
+            color: var(--text-secondary);
+            font-size: 12px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+        
+        .tab:hover {
+            background: rgba(255, 255, 255, 0.06);
+            color: var(--text-primary);
+        }
+        
+        .tab.active {
+            background: linear-gradient(135deg, var(--accent), #7c3aed);
+            color: white;
+            box-shadow: 0 2px 8px rgba(99, 102, 241, 0.3);
+        }
+        
         /* 滚动条 */
         ::-webkit-scrollbar { width: 5px; }
         ::-webkit-scrollbar-track { background: transparent; }
@@ -500,8 +664,25 @@
 </head>
 <body>
     <div id="app">
-        <canvas id="canvas"></canvas>
-        <canvas id="detection-overlay"></canvas>
+        <!-- Canvas 容器，支持缩放和拖拽 -->
+        <div id="canvas-container">
+            <canvas id="canvas"></canvas>
+            <canvas id="detection-overlay"></canvas>
+            <!-- 录制区域闪烁框 (覆盖 canvas) -->
+            <div id="recording-region"></div>
+            <!-- 区域选择覆盖层 (在视频上直接选择) -->
+            <div id="region-select-overlay" class="hidden">
+                <div id="region-select-box"></div>
+                <div id="region-select-hint">拖拽选择区域 | ESC 取消 | Enter 确认</div>
+            </div>
+        </div>
+        
+        <!-- 缩放指示器 -->
+        <div id="zoom-indicator">
+            <span id="zoom-level">100%</span>
+            <button id="zoom-reset" title="重置视图 (双击)">⟳</button>
+            <button id="zoom-fit" title="适应窗口">⊡</button>
+        </div>
         
         <!-- 现代控制面板 -->
         <div id="control-panel">
@@ -554,6 +735,61 @@
                     </button>
                     <button id="stop-btn" class="btn btn-danger hidden">
                         <span>⏹</span> 停止推流
+                    </button>
+                </div>
+                
+                <!-- 输入源选择 Tab -->
+                <div class="tab-container">
+                    <div class="tabs">
+                        <button class="tab active" data-tab="rtsp">📡 RTSP</button>
+                        <button class="tab" data-tab="camera">📷 摄像头</button>
+                        <button class="tab" data-tab="screen">🖥️ 桌面</button>
+                        <button class="tab" data-tab="window">🪟 窗口</button>
+                    </div>
+                </div>
+                
+                <!-- 采集设备选择 (摄像头/桌面模式) -->
+                <div id="capture-settings" class="settings-section hidden">
+                    <div class="settings-row">
+                        <div class="settings-label">
+                            <span class="icon">📹</span> 设备
+                        </div>
+                        <select id="capture-device-select">
+                            <option value="">选择设备...</option>
+                        </select>
+                    </div>
+                    <div class="settings-row">
+                        <div class="settings-label">
+                            <span class="icon">📐</span> 分辨率
+                        </div>
+                        <select id="capture-resolution">
+                            <option value="640x480">640×480</option>
+                            <option value="1280x720" selected>1280×720</option>
+                            <option value="1920x1080">1920×1080</option>
+                        </select>
+                    </div>
+                    <!-- 区域选择 (仅桌面模式) -->
+                    <div id="region-select-row" class="settings-row hidden">
+                        <div class="settings-label">
+                            <span class="icon">✂️</span> 区域
+                        </div>
+                        <button id="select-region-btn" class="btn btn-region" style="flex:1; padding: 8px 12px;">
+                            <span>🎯</span> 选择区域
+                        </button>
+                    </div>
+                    <div id="region-info" class="region-info hidden">
+                        📍 区域: <span id="region-coords">未选择</span>
+                        <button id="clear-region-btn" style="margin-left: 8px; background: none; border: none; color: var(--danger); cursor: pointer;">✕</button>
+                    </div>
+                </div>
+                
+                <!-- 采集控制按钮 -->
+                <div id="capture-controls" class="btn-group hidden">
+                    <button id="start-capture-btn" class="btn btn-primary">
+                        <span>▶</span> 开始采集
+                    </button>
+                    <button id="stop-capture-btn" class="btn btn-danger hidden">
+                        <span>⏹</span> 停止采集
                     </button>
                 </div>
                 

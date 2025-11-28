@@ -1,0 +1,430 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>录制指示器</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        html, body {
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background: transparent;
+        }
+        
+        /* 录制指示边框 - 默认绿色，采集中红色 */
+        .recording-border {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            border: 2px solid #00ff00;
+            pointer-events: none;
+            z-index: 999;
+            transition: border-color 0.3s;
+        }
+        
+        .recording-border.recording {
+            border-color: #ff3c3c;
+        }
+        
+        /* 角标 - 显示状态 - 可拖动移动窗口 */
+        .rec-badge {
+            position: fixed;
+            top: 10px;
+            left: 10px;
+            background: rgba(60, 180, 60, 0.95);
+            color: white;
+            padding: 6px 12px;
+            border-radius: 4px;
+            font-size: 14px;
+            font-weight: bold;
+            font-family: 'Consolas', 'Monaco', monospace;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            cursor: move;
+            user-select: none;
+            pointer-events: auto;
+            z-index: 1000;
+            transition: background 0.3s;
+        }
+        
+        .rec-badge:hover {
+            background: rgba(80, 200, 80, 1);
+            transform: scale(1.05);
+        }
+        
+        .rec-badge:active {
+            cursor: grabbing;
+        }
+        
+        /* 采集中状态 */
+        .rec-badge.recording {
+            background: rgba(255, 60, 60, 0.95);
+            animation: rec-pulse 1s infinite;
+        }
+        
+        .rec-badge.recording:hover {
+            background: rgba(255, 80, 80, 1);
+        }
+        
+        .rec-dot {
+            width: 10px;
+            height: 10px;
+            background: white;
+            border-radius: 50%;
+        }
+        
+        /* 采集中呼吸灯闪烁 */
+        .rec-badge.recording .rec-dot {
+            animation: dot-blink 1s infinite;
+        }
+        
+        @keyframes rec-pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.7; }
+        }
+        
+        @keyframes dot-blink {
+            0%, 100% { background: white; }
+            50% { background: rgba(255, 255, 255, 0.3); }
+        }
+        
+        /* 尺寸信息显示 */
+        .size-info {
+            position: fixed;
+            bottom: 10px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: rgba(0, 0, 0, 0.7);
+            color: #0f0;
+            padding: 4px 10px;
+            border-radius: 4px;
+            font-size: 12px;
+            font-family: 'Consolas', 'Monaco', monospace;
+            pointer-events: none;
+            z-index: 1000;
+        }
+        
+        /* 调整大小的手柄 */
+        .resize-handle {
+            position: fixed;
+            width: 20px;
+            height: 20px;
+            background: rgba(255, 200, 60, 0.8);
+            border: 2px solid rgba(255, 255, 255, 0.9);
+            border-radius: 4px;
+            pointer-events: auto;
+            z-index: 1001;
+            transition: transform 0.1s, background 0.1s;
+        }
+        
+        .resize-handle:hover {
+            background: rgba(255, 100, 60, 1);
+            transform: scale(1.2);
+        }
+        
+        /* 四角手柄位置 */
+        .resize-nw { top: -6px; left: -6px; cursor: nw-resize; }
+        .resize-ne { top: -6px; right: -6px; cursor: ne-resize; }
+        .resize-sw { bottom: -6px; left: -6px; cursor: sw-resize; }
+        .resize-se { bottom: -6px; right: -6px; cursor: se-resize; }
+        
+        /* 边缘手柄 */
+        .resize-n { top: -6px; left: 50%; transform: translateX(-50%); cursor: n-resize; width: 40px; height: 12px; }
+        .resize-s { bottom: -6px; left: 50%; transform: translateX(-50%); cursor: s-resize; width: 40px; height: 12px; }
+        .resize-w { left: -6px; top: 50%; transform: translateY(-50%); cursor: w-resize; width: 12px; height: 40px; }
+        .resize-e { right: -6px; top: 50%; transform: translateY(-50%); cursor: e-resize; width: 12px; height: 40px; }
+    </style>
+</head>
+<body>
+    <div class="recording-border" id="recording-border"></div>
+    
+    <!-- 移动手柄 -->
+    <div class="rec-badge" id="rec-badge">
+        <div class="rec-dot"></div>
+        <span id="badge-text">READY</span>
+    </div>
+    
+    <!-- 尺寸信息 -->
+    <div class="size-info" id="size-info">640 x 480</div>
+    
+    <!-- 调整大小手柄 - 四角 -->
+    <div class="resize-handle resize-nw" data-resize="nw"></div>
+    <div class="resize-handle resize-ne" data-resize="ne"></div>
+    <div class="resize-handle resize-sw" data-resize="sw"></div>
+    <div class="resize-handle resize-se" data-resize="se"></div>
+    
+    <!-- 调整大小手柄 - 边缘 -->
+    <div class="resize-handle resize-n" data-resize="n"></div>
+    <div class="resize-handle resize-s" data-resize="s"></div>
+    <div class="resize-handle resize-w" data-resize="w"></div>
+    <div class="resize-handle resize-e" data-resize="e"></div>
+
+    <script type="module">
+        import { invoke } from '@tauri-apps/api/core';
+        import { listen } from '@tauri-apps/api/event';
+        import { getCurrentWindow } from '@tauri-apps/api/window';
+        
+        const win = getCurrentWindow();
+        const badge = document.getElementById('rec-badge');
+        const badgeText = document.getElementById('badge-text');
+        const border = document.getElementById('recording-border');
+        const sizeInfo = document.getElementById('size-info');
+        const MIN_SIZE = 100;  // 最小尺寸
+        
+        let isRecording = false;  // 是否正在采集
+        
+        // 窗口状态
+        let windowX = 0;
+        let windowY = 0;
+        let windowWidth = 640;
+        let windowHeight = 480;
+        
+        // 拖动/调整状态
+        let isDragging = false;
+        let isResizing = false;
+        let resizeDirection = '';
+        let startMouseX = 0;
+        let startMouseY = 0;
+        let startWindowX = 0;
+        let startWindowY = 0;
+        let startWindowWidth = 0;
+        let startWindowHeight = 0;
+        
+        // 节流控制
+        let lastUpdateTime = 0;
+        const THROTTLE_MS = 16; // ~60fps
+        let pendingUpdate = null;
+        
+        // 获取窗口位置和大小
+        async function getWindowGeometry() {
+            try {
+                const pos = await win.outerPosition();
+                const size = await win.innerSize();
+                windowX = pos.x;
+                windowY = pos.y;
+                windowWidth = size.width;
+                windowHeight = size.height;
+                updateSizeInfo();
+                return { x: pos.x, y: pos.y, width: size.width, height: size.height };
+            } catch (e) {
+                console.error('获取窗口信息失败:', e);
+                return { x: 0, y: 0, width: 640, height: 480 };
+            }
+        }
+        
+        // 更新尺寸显示
+        function updateSizeInfo() {
+            sizeInfo.textContent = `${windowWidth} x ${windowHeight}`;
+        }
+        
+        // ==================== 拖动移动 ====================
+        badge.addEventListener('mousedown', async (e) => {
+            isDragging = true;
+            startMouseX = e.screenX;
+            startMouseY = e.screenY;
+            await getWindowGeometry();
+            startWindowX = windowX;
+            startWindowY = windowY;
+            e.preventDefault();
+        });
+        
+        // ==================== 调整大小 ====================
+        document.querySelectorAll('.resize-handle').forEach(handle => {
+            handle.addEventListener('mousedown', async (e) => {
+                isResizing = true;
+                resizeDirection = handle.dataset.resize;
+                startMouseX = e.screenX;
+                startMouseY = e.screenY;
+                await getWindowGeometry();
+                startWindowX = windowX;
+                startWindowY = windowY;
+                startWindowWidth = windowWidth;
+                startWindowHeight = windowHeight;
+                e.preventDefault();
+                e.stopPropagation();
+            });
+        });
+        
+        // ==================== 鼠标移动处理 (节流优化) ====================
+        document.addEventListener('mousemove', (e) => {
+            if (!isDragging && !isResizing) return;
+            
+            const now = performance.now();
+            const deltaX = e.screenX - startMouseX;
+            const deltaY = e.screenY - startMouseY;
+            
+            // 节流：限制更新频率
+            if (now - lastUpdateTime < THROTTLE_MS) {
+                // 保存最新的位置，稍后更新
+                pendingUpdate = { deltaX, deltaY, screenX: e.screenX, screenY: e.screenY };
+                return;
+            }
+            lastUpdateTime = now;
+            pendingUpdate = null;
+            
+            if (isDragging) {
+                // 移动窗口 - 直接使用 Tauri 窗口 API
+                const newX = startWindowX + deltaX;
+                const newY = startWindowY + deltaY;
+                win.setPosition({ type: 'Physical', x: newX, y: newY }).then(() => {
+                    windowX = newX;
+                    windowY = newY;
+                }).catch(() => {});
+            } else if (isResizing) {
+                // 调整大小
+                let newX = startWindowX;
+                let newY = startWindowY;
+                let newWidth = startWindowWidth;
+                let newHeight = startWindowHeight;
+                
+                // 根据调整方向计算新的位置和大小
+                switch (resizeDirection) {
+                    case 'nw':
+                        newX = startWindowX + deltaX;
+                        newY = startWindowY + deltaY;
+                        newWidth = startWindowWidth - deltaX;
+                        newHeight = startWindowHeight - deltaY;
+                        break;
+                    case 'ne':
+                        newY = startWindowY + deltaY;
+                        newWidth = startWindowWidth + deltaX;
+                        newHeight = startWindowHeight - deltaY;
+                        break;
+                    case 'sw':
+                        newX = startWindowX + deltaX;
+                        newWidth = startWindowWidth - deltaX;
+                        newHeight = startWindowHeight + deltaY;
+                        break;
+                    case 'se':
+                        newWidth = startWindowWidth + deltaX;
+                        newHeight = startWindowHeight + deltaY;
+                        break;
+                    case 'n':
+                        newY = startWindowY + deltaY;
+                        newHeight = startWindowHeight - deltaY;
+                        break;
+                    case 's':
+                        newHeight = startWindowHeight + deltaY;
+                        break;
+                    case 'w':
+                        newX = startWindowX + deltaX;
+                        newWidth = startWindowWidth - deltaX;
+                        break;
+                    case 'e':
+                        newWidth = startWindowWidth + deltaX;
+                        break;
+                }
+                
+                // 限制最小尺寸
+                if (newWidth < MIN_SIZE) {
+                    if (resizeDirection.includes('w')) {
+                        newX = startWindowX + startWindowWidth - MIN_SIZE;
+                    }
+                    newWidth = MIN_SIZE;
+                }
+                if (newHeight < MIN_SIZE) {
+                    if (resizeDirection.includes('n')) {
+                        newY = startWindowY + startWindowHeight - MIN_SIZE;
+                    }
+                    newHeight = MIN_SIZE;
+                }
+                
+                // 使用 Promise.all 同时设置位置和大小
+                Promise.all([
+                    win.setPosition({ type: 'Physical', x: Math.round(newX), y: Math.round(newY) }),
+                    win.setSize({ type: 'Physical', width: Math.round(newWidth), height: Math.round(newHeight) })
+                ]).then(() => {
+                    windowX = newX;
+                    windowY = newY;
+                    windowWidth = newWidth;
+                    windowHeight = newHeight;
+                    updateSizeInfo();
+                }).catch(() => {});
+            }
+        });
+        
+        // ==================== 鼠标释放 ====================
+        document.addEventListener('mouseup', async () => {
+            if (isDragging || isResizing) {
+                // 处理可能遗漏的最后一次更新
+                if (pendingUpdate) {
+                    const { deltaX, deltaY } = pendingUpdate;
+                    if (isDragging) {
+                        const newX = startWindowX + deltaX;
+                        const newY = startWindowY + deltaY;
+                        await win.setPosition({ type: 'Physical', x: newX, y: newY });
+                    }
+                    pendingUpdate = null;
+                }
+                
+                isDragging = false;
+                isResizing = false;
+                resizeDirection = '';
+                await getWindowGeometry();
+                
+                // 通知后端更新采集区域
+                try {
+                    await invoke('update_capture_region', {
+                        x: Math.max(0, windowX),
+                        y: Math.max(0, windowY),
+                        width: windowWidth,
+                        height: windowHeight
+                    });
+                    console.log(`📐 采集区域已更新: (${windowX}, ${windowY}) ${windowWidth}x${windowHeight}`);
+                } catch (e) {
+                    // 如果还没开始采集，忽略错误
+                }
+            }
+        });
+        
+        // ==================== 初始化 ====================
+        async function init() {
+            try {
+                await invoke('show_recording_indicator');
+                await getWindowGeometry();
+                console.log('录制指示器已显示:', windowX, windowY, windowWidth, windowHeight);
+            } catch (e) {
+                console.error('显示录制指示器失败:', e);
+            }
+        }
+        
+        // 监听关闭事件
+        listen('close-recording-indicator', async () => {
+            await win.close();
+        });
+        
+        // 监听采集状态变化
+        listen('capture-state-changed', (event) => {
+            const { recording } = event.payload;
+            isRecording = recording;
+            
+            if (recording) {
+                // 采集中：红色闪烁
+                badge.classList.add('recording');
+                border.classList.add('recording');
+                badgeText.textContent = 'REC';
+                console.log('🔴 切换到录制状态');
+            } else {
+                // 待机中：绿色静止
+                badge.classList.remove('recording');
+                border.classList.remove('recording');
+                badgeText.textContent = 'READY';
+                console.log('🟢 切换到待机状态');
+            }
+        });
+        
+        // 启动
+        init();
+    </script>
+</body>
+</html>

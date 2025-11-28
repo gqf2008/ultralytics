@@ -1,0 +1,10 @@
+[target.x86_64-pc-windows-msvc]
+# 注意: 由于 ONNX Runtime (ort-sys) 使用动态 CRT (MD_DynamicRelease) 编译，
+# 我们无法使用静态 CRT，否则会与静态库 (libmfx.lib 等) 产生 LNK2038 冲突。
+# 分发时需要包含 MSVCP140.dll / VCRUNTIME140.dll，或确保用户已安装 VC++ 运行时。
+#
+# rustflags = ["-C", "target-feature=+crt-static"]  # 已禁用
+
+[env]
+# 使用 x64-windows-static-md triplet 的 FFmpeg（动态 CRT 兼容 ONNX Runtime）
+FFMPEG_DIR = "D:\\workspace\\vcpkg\\installed\\x64-windows-static-md"

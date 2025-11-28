@@ -9,7 +9,6 @@ use ort::execution_providers::{
 };
 use ort::session::{builder::GraphOptimizationLevel, Session};
 use parking_lot::RwLock;
-use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -138,8 +137,6 @@ pub struct AsyncDetectorState {
     input_height: RwLock<u32>,
     // 是否正在运行
     is_running: RwLock<bool>,
-    // 最新检测结果 (供前端轮询)
-    last_result: RwLock<Option<DetectionResult>>,
     // 结果 Channel (发送到前端)
     result_channel: RwLock<Option<Channel<DetectionResult>>>,
 }
@@ -151,83 +148,12 @@ impl Default for AsyncDetectorState {
             input_width: RwLock::new(640),
             input_height: RwLock::new(640),
             is_running: RwLock::new(false),
-            last_result: RwLock::new(None),
             result_channel: RwLock::new(None),
         }
     }
 }
 
 impl AsyncDetectorState {
-    /// 启动检测器 (后台线程)
-    pub fn start(
-        &self,
-        model_path: &str,
-        result_channel: Channel<DetectionResult>,
-    ) -> Result<(u32, u32), String> {
-        if *self.is_running.read() {
-            return Err("检测器已在运行".to_string());
-        }
-
-        // 保存结果 Channel
-        *self.result_channel.write() = Some(result_channel.clone());
-
-        // 检查模型文件
-        if !Path::new(model_path).exists() {
-            return Err(format!("模型文件不存在: {}", model_path));
-        }
-
-        println!("🔄 正在加载模型: {}", model_path);
-
-        // 选择最佳执行提供程序: CUDA > DirectML > CPU
-        let (ep_name, providers) = Self::select_best_execution_provider();
-        println!("🎯 使用执行提供程序: {}", ep_name);
-
-        // 加载模型 - 启用多线程并行推理
-        let session = Session::builder()
-            .map_err(|e| format!("创建 Session Builder 失败: {}", e))?
-            .with_optimization_level(GraphOptimizationLevel::Level3)
-            .map_err(|e| format!("设置优化级别失败: {}", e))?
-            .with_intra_threads(4) // 算子内并行 (4线程)
-            .map_err(|e| format!("设置 intra_threads 失败: {}", e))?
-            .with_inter_threads(2) // 算子间并行 (2线程)
-            .map_err(|e| format!("设置 inter_threads 失败: {}", e))?
-            .with_execution_providers(providers)
-            .map_err(|e| format!("设置 {} EP 失败: {}", ep_name, e))?
-            .commit_from_file(model_path)
-            .map_err(|e| format!("加载模型失败: {}", e))?;
-
-        // 使用 640x640 提高检测精度 (Raw Request 优化后 IPC 开销可接受)
-        let width = 640u32;
-        let height = 640u32;
-        *self.input_width.write() = width;
-        *self.input_height.write() = height;
-
-        println!("✅ 模型加载成功，使用 {}x{} 输入尺寸", width, height);
-
-        // 创建 channel (只保留最新帧，丢弃旧帧)
-        let (tx, rx): (Sender<FrameData>, Receiver<FrameData>) = mpsc::channel();
-        *self.sender.write() = Some(tx);
-        *self.is_running.write() = true;
-
-        // 启动检测线程
-        let conf_threshold = 0.25f32;
-        let iou_threshold = 0.45f32;
-
-        thread::spawn(move || {
-            Self::detection_loop(
-                session,
-                rx,
-                result_channel,
-                conf_threshold,
-                iou_threshold,
-                width,
-                height,
-            );
-        });
-
-        Ok((width, height))
-    }
-
     /// 启动检测器 - 指定设备
     pub fn start_with_device(
         &self,
@@ -741,43 +667,6 @@ impl AsyncDetectorState {
         println!("🛑 检测器已停止");
     }
 
-    /// 获取输入尺寸
-    pub fn get_input_size(&self) -> (u32, u32) {
-        (*self.input_width.read(), *self.input_height.read())
-    }
-
-    /// 是否正在运行
-    pub fn is_running(&self) -> bool {
-        *self.is_running.read()
-    }
-
-    /// 从模型获取输入尺寸
-    fn get_model_input_size(session: &Session) -> Result<(u32, u32), String> {
-        use ort::value::ValueType;
-
-        if session.inputs.is_empty() {
-            return Err("模型没有输入".to_string());
-        }
-
-        let input = &session.inputs[0];
-        if let ValueType::Tensor { shape, .. } = &input.input_type {
-            // YOLO 输入格式: [batch, channels, height, width]
-            if shape.len() >= 4 {
-                let height = shape[2];
-                let width = shape[3];
-
-                if height > 0 && width > 0 {
-                    println!("📐 从模型读取输入尺寸: {}x{}", width, height);
-                    return Ok((width as u32, height as u32));
-                }
-            }
-        }
-
-        // 默认 640x640
-        println!("⚠️ 无法从模型读取尺寸，使用默认 640x640");
-        Ok((640, 640))
-    }
-
     /// 选择最佳执行提供程序: CUDA > DirectML > CPU
     /// - CUDA: NVIDIA GPU (最快，需要安装 CUDA)
     /// - DirectML: Windows GPU 通用加速 (AMD/Intel/NVIDIA)
@@ -806,22 +695,6 @@ impl AsyncDetectorState {
 
         // 3. 回退到 CPU
         println!("ℹ️ 使用 CPU 执行 (4线程并行)");
-        (
-            "CPU",
-            vec![ExecutionProviderDispatch::from(
-                CPUExecutionProvider::default(),
-            )],
-        )
-    }
-
-    /// 强制使用 CPU (供小模型测试用)
-    #[allow(dead_code)]
-    fn select_cpu_provider() -> (
-        &'static str,
-        Vec<ort::execution_providers::ExecutionProviderDispatch>,
-    ) {
-        use ort::execution_providers::ExecutionProviderDispatch;
-        println!("ℹ️ 强制使用 CPU");
         (
             "CPU",
             vec![ExecutionProviderDispatch::from(

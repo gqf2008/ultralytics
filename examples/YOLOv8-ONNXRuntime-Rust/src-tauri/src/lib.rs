@@ -4,6 +4,10 @@
 
 // pub mod shared_memory;  // TODO: 暂时禁用，后续实现
 
+// Windows Graphics Capture 模块
+#[cfg(windows)]
+pub mod wgc_capture;
+
 #[cfg(target_os = "android")]
 pub use mobile::*;
 

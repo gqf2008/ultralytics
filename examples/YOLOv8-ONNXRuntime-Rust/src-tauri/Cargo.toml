@@ -2,6 +2,7 @@
 name = "yolov8-sentinel-tauri"
 version = "0.1.0"
 edition = "2021"
+default-run = "yolov8-sentinel-tauri"
 
 [lib]
 name = "yolov8_sentinel_lib"
@@ -36,9 +37,53 @@ ndarray = "0.16"
 image = "0.25"
 rayon = "1.10"
 
+# wgpu 零拷贝 GPU 渲染
+# wgpu = "23"
+# winit = "0.30"
+bytemuck = { version = "1.21", features = ["derive"] }
+pollster = "0.4"
+raw-window-handle = "0.6"
+
+# 字体渲染 (用于检测框标签)
+fontdue = "0.9"
+
+# FFmpeg H.265 硬件解码 (QSV/CUDA) - 仅用于 RTSP 解码
+ffmpeg-next = "7.0"
+
+# 摄像头采集 (跨平台，不需要 FFmpeg)
+nokhwa = { version = "0.10", features = ["input-native"] }
+
+# 桌面采集 (跨平台，无边框)
+xcap = "0.7"
+
 # Windows 共享内存
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.52", features = [
     "Win32_Foundation",
     "Win32_System_Memory",
+    "Win32_Security",
+    "Win32_UI_WindowsAndMessaging",
 ] }
+
+# Windows Graphics Capture API (用于窗口捕获，支持后台/遮挡窗口)
+windows = { version = "0.61", features = [
+    "Graphics_Capture",
+    "Graphics_DirectX",
+    "Graphics_DirectX_Direct3D11",
+    "Graphics_Imaging",
+    "Foundation",
+    "Foundation_Collections",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_System_WinRT",
+    "Win32_System_WinRT_Direct3D11",
+    "Win32_System_WinRT_Graphics_Capture",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Foundation",
+] }
+
+# Unix 共享内存 (macOS/Linux)
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
