@@ -174,14 +174,22 @@ class WebGLVideoRenderer {
 
         // 根据编码格式和分辨率动态配置
         let codecString;
-        if (codec === 'h264') {
+        // 支持直接传入 codec string (如 avc1.640028) 或类型名 (如 h264)
+        const codecLower = codec.toLowerCase();
+        const isH264 = codecLower === 'h264' || codecLower.startsWith('avc');
+        const isHEVC = codecLower === 'hevc' || codecLower === 'h265' || codecLower.startsWith('hvc') || codecLower.startsWith('hev');
+        
+        if (isH264) {
             // H.264 编码字符串 (根据分辨率选择 Level)
             const level = height > 1080 ? '5.1' : '4.0';
             codecString = `avc1.64${level === '5.1' ? '0033' : '0028'}`;
-        } else {
+        } else if (isHEVC) {
             // H.265/HEVC 编码字符串
             const level = height > 2160 ? 'L156' : (height > 1080 ? 'L153' : 'L120');
             codecString = `hvc1.1.6.${level}.B0`;
+        } else {
+            // 其他格式，直接使用传入的 codec
+            codecString = codec;
         }
         
         const config = {

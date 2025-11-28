@@ -8,6 +8,9 @@
 //! - HTTP/HTTPS 流: http://, https://
 //! - 本地文件: file:// 或直接路径
 //! - 摄像头设备: /dev/video0, video=xxx (Windows)
+//!
+//! 注意: Rust 端只做解复用 (demux)，不做解码！
+//! 压缩数据包转为 Annex-B 格式后发送给前端 WebCodecs 解码。
 
 use ffmpeg_next as ffmpeg;
 use serde::{Deserialize, Serialize};
@@ -97,10 +100,6 @@ pub struct StreamConfig {
     pub timeout_ms: Option<u32>,
     /// 缓冲区大小（字节）
     pub buffer_size: Option<u32>,
-    /// 是否启用硬件解码
-    pub hw_decode: Option<bool>,
-    /// 硬件解码器名称（如 h264_qsv, hevc_cuvid）
-    pub hw_decoder: Option<String>,
     /// 是否循环播放（仅文件）
     pub loop_file: Option<bool>,
 }
@@ -113,11 +112,44 @@ impl Default for StreamConfig {
             transport: Some("tcp".to_string()),
             timeout_ms: Some(5000),
             buffer_size: Some(1048576), // 1MB
-            hw_decode: Some(false),
-            hw_decoder: None,
             loop_file: Some(false),
         }
     }
+}
+
+/// 将 AVCC 格式 (4字节长度前缀) 转换为 Annex-B 格式 (00 00 00 01 起始码)
+/// WebCodecs 需要 Annex-B 格式
+fn convert_avcc_to_annex_b(data: &[u8]) -> Vec<u8> {
+    let mut result = Vec::with_capacity(data.len() + 32);
+    let mut i = 0;
+
+    while i + 4 <= data.len() {
+        // 读取 NAL 单元长度 (big-endian u32)
+        let nal_len = u32::from_be_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]) as usize;
+        i += 4;
+
+        if nal_len == 0 || i + nal_len > data.len() {
+            break;
+        }
+
+        // 添加 Annex-B 起始码
+        result.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+        // 添加 NAL 数据
+        result.extend_from_slice(&data[i..i + nal_len]);
+        i += nal_len;
+    }
+
+    result
+}
+
+/// 检查数据是否已经是 Annex-B 格式
+fn is_annex_b(data: &[u8]) -> bool {
+    if data.len() < 4 {
+        return false;
+    }
+    // 检查是否以 00 00 00 01 或 00 00 01 开头
+    (data[0] == 0 && data[1] == 0 && data[2] == 0 && data[3] == 1)
+        || (data[0] == 0 && data[1] == 0 && data[2] == 1)
 }
 
 /// 流媒体代理
@@ -178,7 +210,7 @@ impl StreamProxy {
             thread::sleep(std::time::Duration::from_millis(100));
             running.store(true, Ordering::SeqCst);
 
-            if let Err(e) = Self::decode_loop(
+            if let Err(e) = Self::demux_loop(
                 &config,
                 protocol,
                 &running,
@@ -186,16 +218,16 @@ impl StreamProxy {
                 generation,
                 video_channel,
             ) {
-                eprintln!("❌ StreamProxy 解码错误: {}", e);
+                eprintln!("❌ StreamProxy 错误: {}", e);
             }
 
             running.store(false, Ordering::SeqCst);
-            println!("📴 StreamProxy 解码线程退出 (Gen: {})", generation);
+            println!("📴 StreamProxy 线程退出 (Gen: {})", generation);
         });
     }
 
-    /// 解码主循环
-    fn decode_loop(
+    /// 解复用主循环 - 只读取压缩数据包，不解码！
+    fn demux_loop(
         config: &StreamConfig,
         protocol: StreamProtocol,
         running: &Arc<AtomicBool>,
@@ -293,68 +325,49 @@ impl StreamProxy {
 
         println!("🎬 视频流索引: {}", video_stream_index);
 
-        // 创建解码器
+        // 获取编解码器信息 (不创建解码器！只获取参数)
         let codec_id = codec_params.id();
-        let codec_name = match codec_id {
-            ffmpeg::codec::Id::H264 => "h264",
-            ffmpeg::codec::Id::HEVC => "hevc",
-            ffmpeg::codec::Id::VP8 => "vp8",
-            ffmpeg::codec::Id::VP9 => "vp9",
-            ffmpeg::codec::Id::AV1 => "av1",
-            _ => "unknown",
+
+        // codec_type: 简单类型名 (h264/hevc/vp9 等)
+        // codec_string: WebCodecs 需要的完整 codec string
+        let (codec_type, codec_string) = match codec_id {
+            ffmpeg::codec::Id::H264 => ("h264", "avc1.640028"), // H.264 High Profile Level 4.0
+            ffmpeg::codec::Id::HEVC => ("hevc", "hev1.1.6.L93.B0"), // HEVC Main Profile
+            ffmpeg::codec::Id::VP8 => ("vp8", "vp8"),
+            ffmpeg::codec::Id::VP9 => ("vp9", "vp09.00.10.08"),
+            ffmpeg::codec::Id::AV1 => ("av1", "av01.0.01M.08"),
+            _ => ("unknown", "unknown"),
         };
 
-        // 尝试硬件解码器
-        let decoder = if config.hw_decode.unwrap_or(false) {
-            let hw_name = config
-                .hw_decoder
-                .as_deref()
-                .unwrap_or_else(|| match codec_id {
-                    ffmpeg::codec::Id::H264 => "h264_qsv",
-                    ffmpeg::codec::Id::HEVC => "hevc_qsv",
-                    _ => "",
-                });
+        // 从 codec_params 获取宽高
+        let (width, height) = unsafe {
+            let par = codec_params.as_ptr();
+            ((*par).width as u32, (*par).height as u32)
+        };
 
-            if !hw_name.is_empty() {
-                match ffmpeg::decoder::find_by_name(hw_name) {
-                    Some(dec) => {
-                        println!("✅ 使用硬件解码器: {}", hw_name);
-                        Some(dec)
-                    }
-                    None => {
-                        println!("⚠️ 硬件解码器 {} 不可用，回退到软件解码", hw_name);
-                        None
-                    }
-                }
+        println!(
+            "📐 视频尺寸: {}x{}, 编码: {} ({})",
+            width, height, codec_type, codec_string
+        );
+
+        // 获取 extradata (SPS/PPS for H.264, VPS/SPS/PPS for HEVC)
+        let extradata = unsafe {
+            let par = codec_params.as_ptr();
+            if !(*par).extradata.is_null() && (*par).extradata_size > 0 {
+                let slice =
+                    std::slice::from_raw_parts((*par).extradata, (*par).extradata_size as usize);
+                Some(slice.to_vec())
             } else {
                 None
             }
-        } else {
-            None
         };
-
-        let decoder = decoder
-            .or_else(|| ffmpeg::decoder::find(codec_id))
-            .ok_or(format!("找不到解码器: {:?}", codec_id))?;
-
-        println!("🔧 使用解码器: {}", decoder.name());
-
-        let context = ffmpeg::codec::context::Context::from_parameters(codec_params)
-            .map_err(|e| format!("创建解码上下文失败: {}", e))?;
-        let mut video_decoder = context
-            .decoder()
-            .video()
-            .map_err(|e| format!("创建视频解码器失败: {}", e))?;
-
-        let width = video_decoder.width();
-        let height = video_decoder.height();
-        println!("📐 视频尺寸: {}x{}", width, height);
 
         // 发送元数据到前端
         if let Some(ref ch) = video_channel {
             let metadata = json!({
                 "type": "metadata",
-                "video_codec": codec_name,
+                "codec_type": codec_type,        // 简单类型: h264, hevc, vp9...
+                "video_codec": codec_string,     // WebCodecs codec string
                 "width": width,
                 "height": height,
                 "protocol": protocol.name(),
@@ -364,25 +377,24 @@ impl StreamProxy {
             let _ = ch.send(InvokeResponseBody::Raw(bytes));
         }
 
-        // 创建色彩空间转换器（输出 NV12 给 WebCodecs）
-        let mut scaler = ffmpeg::software::scaling::Context::get(
-            video_decoder.format(),
-            width,
-            height,
-            ffmpeg::format::Pixel::NV12,
-            width,
-            height,
-            ffmpeg::software::scaling::Flags::BILINEAR,
-        )
-        .map_err(|e| format!("创建缩放器失败: {}", e))?;
+        // 如果有 extradata，先发送 (包含 SPS/PPS)
+        // 对于 H.264/HEVC 容器格式 (MP4/FLV/RTMP)，extradata 是 AVCC/HVCC 格式
+        // 需要转换为 Annex-B 格式
+        if let Some(extra) = &extradata {
+            if let Some(ref ch) = video_channel {
+                let annex_b_extra = parse_extradata_to_annex_b(extra, codec_id);
+                if !annex_b_extra.is_empty() {
+                    println!("📦 发送 extradata (SPS/PPS): {} bytes", annex_b_extra.len());
+                    let _ = ch.send(InvokeResponseBody::Raw(annex_b_extra));
+                }
+            }
+        }
 
-        let mut decoded_frame = ffmpeg::frame::Video::empty();
-        let mut nv12_frame = ffmpeg::frame::Video::empty();
-        let mut frame_count = 0u64;
+        let mut packet_count = 0u64;
         let loop_file = config.loop_file.unwrap_or(false) && protocol == StreamProtocol::File;
 
-        // 解码循环
-        'decode_loop: loop {
+        // 解复用循环 - 只读取压缩包，不解码！
+        'demux_loop: loop {
             if !running.load(Ordering::Relaxed) || active_gen.load(Ordering::Relaxed) != generation
             {
                 break;
@@ -392,67 +404,49 @@ impl StreamProxy {
                 if !running.load(Ordering::Relaxed)
                     || active_gen.load(Ordering::Relaxed) != generation
                 {
-                    break 'decode_loop;
+                    break 'demux_loop;
                 }
 
                 if stream.index() != video_stream_index {
                     continue;
                 }
 
-                if let Err(e) = video_decoder.send_packet(&packet) {
-                    eprintln!("⚠️ 发送数据包失败: {}", e);
+                // 获取压缩数据
+                let data = packet.data().unwrap_or(&[]);
+                if data.is_empty() {
                     continue;
                 }
 
-                while video_decoder.receive_frame(&mut decoded_frame).is_ok() {
-                    // 转换为 NV12
-                    if let Err(e) = scaler.run(&decoded_frame, &mut nv12_frame) {
-                        eprintln!("⚠️ 色彩转换失败: {}", e);
-                        continue;
-                    }
+                // 转换为 Annex-B 格式 (如果需要)
+                let annex_b_data = if is_annex_b(data) {
+                    // 已经是 Annex-B (如 RTSP/TS)
+                    data.to_vec()
+                } else {
+                    // AVCC 格式 (如 MP4/FLV/RTMP)，需要转换
+                    convert_avcc_to_annex_b(data)
+                };
 
-                    // 提取 NV12 数据
-                    let y_data = nv12_frame.data(0);
-                    let uv_data = nv12_frame.data(1);
-                    let y_stride = nv12_frame.stride(0);
-                    let uv_stride = nv12_frame.stride(1);
+                if annex_b_data.is_empty() {
+                    continue;
+                }
 
-                    // 打包 NV12 数据 (紧凑格式)
-                    let mut nv12_packed = Vec::with_capacity((width * height * 3 / 2) as usize);
+                // 直接发送压缩数据到前端 WebCodecs
+                if let Some(ref ch) = video_channel {
+                    let _ = ch.send(InvokeResponseBody::Raw(annex_b_data));
+                }
 
-                    // Y 平面
-                    for row in 0..height as usize {
-                        let start = row * y_stride;
-                        let end = start + width as usize;
-                        nv12_packed.extend_from_slice(&y_data[start..end]);
-                    }
-
-                    // UV 平面
-                    for row in 0..(height / 2) as usize {
-                        let start = row * uv_stride;
-                        let end = start + width as usize;
-                        nv12_packed.extend_from_slice(&uv_data[start..end]);
-                    }
-
-                    // 发送到前端
-                    if let Some(ref ch) = video_channel {
-                        let _ = ch.send(InvokeResponseBody::Raw(nv12_packed));
-                    }
-
-                    frame_count += 1;
-                    if frame_count == 1 {
-                        println!("🎨 首帧解码成功 (Gen: {})", generation);
-                    }
-                    if frame_count % 300 == 0 {
-                        println!("📺 已解码 {} 帧 (Gen: {})", frame_count, generation);
-                    }
+                packet_count += 1;
+                if packet_count == 1 {
+                    println!("📦 首个视频包已发送 (Gen: {})", generation);
+                }
+                if packet_count % 300 == 0 {
+                    println!("📦 已发送 {} 个视频包 (Gen: {})", packet_count, generation);
                 }
             }
 
             // 文件播放完毕
             if loop_file {
                 println!("🔄 文件循环播放");
-                // 重新定位到开头
                 if ictx.seek(0, ..).is_err() {
                     break;
                 }
@@ -461,7 +455,7 @@ impl StreamProxy {
             }
         }
 
-        println!("📊 总计解码 {} 帧", frame_count);
+        println!("📊 总计发送 {} 个视频包", packet_count);
         Ok(())
     }
 
@@ -480,4 +474,151 @@ impl Default for StreamProxy {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// 解析 extradata (AVCC/HVCC 格式) 转换为 Annex-B 格式的 SPS/PPS
+fn parse_extradata_to_annex_b(extradata: &[u8], codec_id: ffmpeg::codec::Id) -> Vec<u8> {
+    match codec_id {
+        ffmpeg::codec::Id::H264 => parse_avcc_extradata(extradata),
+        ffmpeg::codec::Id::HEVC => parse_hvcc_extradata(extradata),
+        _ => Vec::new(),
+    }
+}
+
+/// 解析 H.264 AVCC extradata -> Annex-B SPS/PPS
+fn parse_avcc_extradata(data: &[u8]) -> Vec<u8> {
+    if data.len() < 7 {
+        return Vec::new();
+    }
+
+    // 检查是否已经是 Annex-B 格式
+    if is_annex_b(data) {
+        return data.to_vec();
+    }
+
+    // AVCC 格式:
+    // byte 0: version (always 1)
+    // byte 1: profile
+    // byte 2: profile compatibility
+    // byte 3: level
+    // byte 4: 6 bits reserved (111111) + 2 bits NAL size length minus 1
+    // byte 5: 3 bits reserved (111) + 5 bits number of SPS
+    if data[0] != 1 {
+        // 可能不是 AVCC 格式，直接返回
+        return data.to_vec();
+    }
+
+    let mut result = Vec::with_capacity(data.len() + 16);
+    let mut offset = 5;
+
+    // 解析 SPS
+    let num_sps = (data[offset] & 0x1F) as usize;
+    offset += 1;
+
+    for _ in 0..num_sps {
+        if offset + 2 > data.len() {
+            break;
+        }
+        let sps_len = u16::from_be_bytes([data[offset], data[offset + 1]]) as usize;
+        offset += 2;
+
+        if offset + sps_len > data.len() {
+            break;
+        }
+
+        // 添加 Annex-B 起始码 + SPS
+        result.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+        result.extend_from_slice(&data[offset..offset + sps_len]);
+        offset += sps_len;
+    }
+
+    // 解析 PPS
+    if offset >= data.len() {
+        return result;
+    }
+    let num_pps = data[offset] as usize;
+    offset += 1;
+
+    for _ in 0..num_pps {
+        if offset + 2 > data.len() {
+            break;
+        }
+        let pps_len = u16::from_be_bytes([data[offset], data[offset + 1]]) as usize;
+        offset += 2;
+
+        if offset + pps_len > data.len() {
+            break;
+        }
+
+        // 添加 Annex-B 起始码 + PPS
+        result.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+        result.extend_from_slice(&data[offset..offset + pps_len]);
+        offset += pps_len;
+    }
+
+    result
+}
+
+/// 解析 HEVC HVCC extradata -> Annex-B VPS/SPS/PPS
+fn parse_hvcc_extradata(data: &[u8]) -> Vec<u8> {
+    if data.len() < 23 {
+        return Vec::new();
+    }
+
+    // 检查是否已经是 Annex-B 格式
+    if is_annex_b(data) {
+        return data.to_vec();
+    }
+
+    // HVCC 格式检查
+    // byte 0: configurationVersion (always 1)
+    if data[0] != 1 {
+        return data.to_vec();
+    }
+
+    let mut result = Vec::with_capacity(data.len() + 32);
+
+    // HVCC header 是 22 bytes，然后是 NAL unit arrays
+    let mut offset = 22;
+
+    // numOfArrays
+    if offset >= data.len() {
+        return result;
+    }
+    let num_arrays = data[offset] as usize;
+    offset += 1;
+
+    for _ in 0..num_arrays {
+        if offset + 3 > data.len() {
+            break;
+        }
+
+        // array_completeness (1 bit) + reserved (1 bit) + NAL_unit_type (6 bits)
+        let _nal_type = data[offset] & 0x3F;
+        offset += 1;
+
+        // numNalus
+        let num_nalus = u16::from_be_bytes([data[offset], data[offset + 1]]) as usize;
+        offset += 2;
+
+        for _ in 0..num_nalus {
+            if offset + 2 > data.len() {
+                break;
+            }
+
+            let nal_len = u16::from_be_bytes([data[offset], data[offset + 1]]) as usize;
+            offset += 2;
+
+            if offset + nal_len > data.len() {
+                break;
+            }
+
+            // 添加 Annex-B 起始码 + NAL
+            result.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+            result.extend_from_slice(&data[offset..offset + nal_len]);
+            offset += nal_len;
+        }
+    }
+
+    result
 }
