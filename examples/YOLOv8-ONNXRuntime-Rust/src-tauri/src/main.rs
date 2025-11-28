@@ -3,7 +3,7 @@
 
 mod detector;
 mod detector_async;
-mod rtsp_proxy;
+mod stream_proxy; // 通用流媒体代理 (替代 rtsp_proxy)
 
 use detector_async::AsyncDetectorState;
 use ort::execution_providers::{
@@ -16,9 +16,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tauri::{AppHandle, Manager, State};
 
-// Global Proxy State
+// Global Proxy State - 通用流媒体代理
 pub struct ProxyState {
-    pub proxy: Arc<rtsp_proxy::RtspProxy>,
+    pub proxy: Arc<stream_proxy::StreamProxy>,
 }
 
 /// 视频帧共享状态
@@ -159,7 +159,37 @@ async fn clear_rtsp_history() -> Result<(), String> {
     std::fs::write(path, "").map_err(|e| format!("Failed to clear history: {}", e))
 }
 
-/// 启动 RTSP 流
+/// 检测流媒体协议类型
+#[derive(Clone, serde::Serialize)]
+pub struct ProtocolInfo {
+    pub protocol: String,
+    pub name: String,
+}
+
+#[tauri::command]
+async fn detect_stream_protocol(url: String) -> Result<ProtocolInfo, String> {
+    let protocol = stream_proxy::StreamProtocol::detect(&url);
+    Ok(ProtocolInfo {
+        protocol: format!("{:?}", protocol).to_lowercase(),
+        name: protocol.name().to_string(),
+    })
+}
+
+/// 获取支持的流媒体协议列表
+#[tauri::command]
+async fn get_supported_protocols() -> Result<Vec<String>, String> {
+    Ok(vec![
+        "RTSP (rtsp://)".to_string(),
+        "RTMP (rtmp://, rtmps://)".to_string(),
+        "HTTP-FLV (http://*.flv)".to_string(),
+        "HLS (http://*.m3u8)".to_string(),
+        "HTTP/HTTPS 流".to_string(),
+        "本地文件 (mp4, mkv, avi, mov, ts)".to_string(),
+        "摄像头设备 (DirectShow/V4L2)".to_string(),
+    ])
+}
+
+/// 启动流媒体 (兼容旧的 start_rtsp_stream，支持所有协议)
 #[tauri::command]
 async fn start_rtsp_stream(
     app: AppHandle,
@@ -167,19 +197,55 @@ async fn start_rtsp_stream(
     video_channel: tauri::ipc::Channel,
     audio_channel: tauri::ipc::Channel,
 ) -> Result<String, String> {
-    println!("🚀 启动 RTSP 流: {}", url);
+    let protocol = stream_proxy::StreamProtocol::detect(&url);
+    println!("🚀 启动流媒体: {} (协议: {})", url, protocol.name());
 
     // 增加解码器代数
     let generation = DECODER_GENERATION.fetch_add(1, Ordering::SeqCst);
     println!("📌 新解码器代数: {}", generation);
 
-    // 启动 RTSP 代理 (用于前端显示)
+    // 启动流媒体代理 (支持 RTSP/RTMP/HLS/HTTP-FLV 等)
     let proxy_state = app.state::<ProxyState>();
     proxy_state
         .proxy
         .start(url.clone(), Some(video_channel), Some(audio_channel));
 
-    Ok(format!("RTSP 流已启动 (Gen: {})", generation))
+    Ok(format!(
+        "{} 流已启动 (Gen: {})",
+        protocol.name(),
+        generation
+    ))
+}
+
+/// 启动流媒体 (带完整配置)
+#[tauri::command]
+async fn start_stream_with_config(
+    app: AppHandle,
+    config: stream_proxy::StreamConfig,
+    video_channel: tauri::ipc::Channel,
+    audio_channel: tauri::ipc::Channel,
+) -> Result<String, String> {
+    let protocol = config
+        .protocol
+        .unwrap_or_else(|| stream_proxy::StreamProtocol::detect(&config.url));
+    println!(
+        "🚀 启动流媒体 (完整配置): {} (协议: {})",
+        config.url,
+        protocol.name()
+    );
+
+    let generation = DECODER_GENERATION.fetch_add(1, Ordering::SeqCst);
+
+    let proxy_state = app.state::<ProxyState>();
+    proxy_state
+        .proxy
+        .start_with_config(config, Some(video_channel), Some(audio_channel));
+
+    Ok(format!(
+        "{} 流已启动 (Gen: {})",
+        protocol.name(),
+        generation
+    ))
 }
 
 // ==================== 设备和模型配置命令 ====================
@@ -399,8 +465,8 @@ fn main() {
         }
     }));
 
-    // 初始化 RTSP 代理
-    let proxy = Arc::new(rtsp_proxy::RtspProxy::new());
+    // 初始化流媒体代理 (支持 RTSP/RTMP/HLS/HTTP-FLV 等)
+    let proxy = Arc::new(stream_proxy::StreamProxy::new());
     // let proxy_clone = proxy.clone();
 
     // 在后台启动 WebSocket 服务器 (已切换为 IPC)
@@ -418,6 +484,9 @@ fn main() {
             has_new_frame,
             mark_frame_processed,
             start_rtsp_stream,
+            start_stream_with_config,
+            detect_stream_protocol,
+            get_supported_protocols,
             log_frontend,
             read_text_file,
             get_rtsp_history,

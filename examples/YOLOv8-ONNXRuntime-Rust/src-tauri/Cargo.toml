@@ -18,9 +18,12 @@ serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = "0.20"
 futures-util = "0.3"
-retina = "0.4"                                       # 纯 Rust RTSP 客户端 (无 FFmpeg 依赖!)
-url = "2"                                            # URL 解析
+# retina = "0.4"                                     # 仅 RTSP (已弃用)
+url = "2"            # URL 解析
 parking_lot = "0.12"
+
+# FFmpeg - 支持所有流媒体协议 (RTSP/RTMP/HLS/HTTP-FLV/文件等)
+ffmpeg-next = "7"
 crossbeam-channel = "0.5"
 
 # ONNX Runtime - 直接引入，不依赖主项目 (避免 FFmpeg 链接)
