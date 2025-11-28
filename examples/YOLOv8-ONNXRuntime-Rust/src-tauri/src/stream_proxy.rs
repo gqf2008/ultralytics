@@ -2,8 +2,10 @@
 //!
 //! 根据 URL 协议自动选择最佳后端：
 //! - RTSP: retina (纯 Rust，极快)
-//! - FLV/MP4/RTMP/其他: FFmpeg (通用，已优化)
+//! - HTTP-FLV: 纯 Rust FLV 解析器 (极快)
+//! - MP4/RTMP/其他: FFmpeg (通用，已优化)
 
+use crate::flv_demuxer::{avcc_to_annexb, FlvDemuxer, VideoCodec};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -75,6 +77,8 @@ impl StreamProxy {
         // 根据 URL 选择后端
         let url_lower = url.to_lowercase();
         let use_retina = url_lower.starts_with("rtsp://") || url_lower.starts_with("rtsps://");
+        let use_flv =
+            url_lower.contains(".flv") || url_lower.contains("flv?") || url_lower.contains("/flv/");
 
         if use_retina {
             println!("🚀 使用 retina 后端 (RTSP)");
@@ -90,8 +94,22 @@ impl StreamProxy {
                     }
                 });
             });
+        } else if use_flv {
+            println!("🚀 使用纯 Rust FLV 后端 (HTTP-FLV)");
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("Failed to create tokio runtime");
+
+                rt.block_on(async move {
+                    if let Err(e) = run_flv_stream(url, running, packet_count, on_data).await {
+                        eprintln!("❌ FLV 流错误: {}", e);
+                    }
+                });
+            });
         } else {
-            println!("🚀 使用 FFmpeg 后端 (FLV/MP4/RTMP/其他)");
+            println!("🚀 使用 FFmpeg 后端 (MP4/RTMP/其他)");
             std::thread::spawn(move || {
                 if let Err(e) = run_ffmpeg_stream(url, running, packet_count, on_data) {
                     eprintln!("❌ FFmpeg 流错误: {}", e);
@@ -272,7 +290,227 @@ async fn run_retina_stream(
     Ok(())
 }
 
-// ==================== FFmpeg 后端 (FLV/MP4/RTMP/其他) ====================
+// ==================== 纯 Rust FLV 后端 (HTTP-FLV) ====================
+
+async fn run_flv_stream(
+    url: String,
+    running: Arc<AtomicBool>,
+    packet_count: Arc<AtomicU64>,
+    on_data: Channel<InvokeResponseBody>,
+) -> Result<(), String> {
+    // 自动重连循环
+    let mut reconnect_count = 0;
+    const MAX_RECONNECTS: u32 = 100; // 最多重连 100 次
+
+    while running.load(Ordering::Relaxed) && reconnect_count < MAX_RECONNECTS {
+        if reconnect_count > 0 {
+            println!("🔄 [FLV] 第 {} 次重连...", reconnect_count);
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        }
+
+        match run_flv_stream_once(&url, &running, &packet_count, &on_data).await {
+            Ok(()) => {
+                // 正常结束（用户停止）
+                break;
+            }
+            Err(e) => {
+                if !running.load(Ordering::Relaxed) {
+                    // 用户主动停止
+                    break;
+                }
+                eprintln!("⚠️ [FLV] 连接断开: {}", e);
+                reconnect_count += 1;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// FLV 流单次连接
+async fn run_flv_stream_once(
+    url: &str,
+    running: &Arc<AtomicBool>,
+    packet_count: &Arc<AtomicU64>,
+    on_data: &Channel<InvokeResponseBody>,
+) -> Result<(), String> {
+    println!("🔌 [FLV] 连接: {}", url);
+
+    // 使用 reqwest 获取 HTTP 流
+    // 注意：不要设置 read_timeout，它会导致 chunked 流中断！
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10)) // 只设置连接超时
+        .pool_idle_timeout(std::time::Duration::from_secs(90))
+        .tcp_keepalive(std::time::Duration::from_secs(30))
+        // 不设置 timeout 和 read_timeout！流式传输需要持续读取
+        .build()
+        .map_err(|e| format!("创建 HTTP 客户端失败: {}", e))?;
+
+    let response = client
+        .get(url)
+        .header("Connection", "keep-alive")
+        .header("Accept", "*/*")
+        // 模拟常见播放器的 User-Agent
+        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+        .header("Referer", url)  // 有些服务器检查 Referer
+        .send()
+        .await
+        .map_err(|e| format!("HTTP 请求失败: {}", e))?;
+
+    if !response.status().is_success() {
+        return Err(format!("HTTP 状态码: {}", response.status()));
+    }
+
+    // 打印响应头以便调试 chunked
+    let is_chunked = response
+        .headers()
+        .get("transfer-encoding")
+        .map(|v| v.to_str().unwrap_or("").contains("chunked"))
+        .unwrap_or(false);
+
+    println!(
+        "✅ [FLV] HTTP 连接成功, chunked={}, Content-Type: {:?}",
+        is_chunked,
+        response.headers().get("content-type")
+    );
+
+    let mut stream = response.bytes_stream();
+    let mut demuxer = FlvDemuxer::new();
+    let mut metadata_sent = false;
+    let start_time = std::time::Instant::now();
+    let mut last_data_time = std::time::Instant::now();
+
+    println!("▶️ [FLV] 开始接收...");
+
+    while running.load(Ordering::Relaxed) {
+        use futures_util::StreamExt;
+
+        // 使用较长的超时，只是为了检测连接是否真的断开
+        match tokio::time::timeout(tokio::time::Duration::from_secs(30), stream.next()).await {
+            Ok(Some(Ok(chunk))) => {
+                last_data_time = std::time::Instant::now();
+                demuxer.feed(&chunk);
+
+                // 解析所有可用的视频帧
+                while let Some(frame) = demuxer.next_video_frame() {
+                    // 发送元数据 (只发一次)
+                    if !metadata_sent && demuxer.metadata().width > 0 {
+                        let meta = demuxer.metadata();
+                        let codec_str = match meta.video_codec {
+                            Some(VideoCodec::AVC) => "avc1.640028".to_string(),
+                            Some(VideoCodec::HEVC) => "hvc1.1.6.L93.B0".to_string(),
+                            _ => "unknown".to_string(),
+                        };
+
+                        send_metadata(
+                            &on_data,
+                            &StreamMetadata {
+                                codec: codec_str,
+                                width: meta.width,
+                                height: meta.height,
+                                fps: if meta.fps > 0.0 { meta.fps } else { 25.0 },
+                                extradata: meta.extradata.clone(),
+                            },
+                        );
+                        metadata_sent = true;
+                    }
+
+                    // 跳过序列头帧 (已经通过 metadata 发送了)
+                    if frame.is_sequence_header {
+                        continue;
+                    }
+
+                    let count = packet_count.fetch_add(1, Ordering::Relaxed) + 1;
+
+                    // AVCC 转 Annex-B
+                    let annexb_data = avcc_to_annexb(&frame.data, 4);
+
+                    if count <= 5 || count % 100 == 0 {
+                        // 调试：检查前几个字节
+                        let preview_before: Vec<u8> = frame.data.iter().take(16).cloned().collect();
+                        let preview_after: Vec<u8> = annexb_data.iter().take(16).cloned().collect();
+                        println!(
+                            "📦 [FLV] #{}: keyframe={}, {} -> {} bytes, pts={}",
+                            count,
+                            frame.is_keyframe,
+                            frame.data.len(),
+                            annexb_data.len(),
+                            frame.pts
+                        );
+                        if count <= 3 {
+                            println!("   原始前16字节: {:02x?}", preview_before);
+                            println!("   转换后前16字节: {:02x?}", preview_after);
+                        }
+                    }
+
+                    send_packet(
+                        &on_data,
+                        &EncodedPacket {
+                            data: annexb_data,
+                            is_keyframe: frame.is_keyframe,
+                            pts: frame.pts,
+                            dts: frame.dts,
+                            packet_id: count,
+                        },
+                    );
+                }
+            }
+            Ok(Some(Err(e))) => {
+                let err_str = e.to_string();
+                let elapsed = start_time.elapsed().as_secs_f32();
+                let count = packet_count.load(Ordering::Relaxed);
+
+                // 区分正常结束和异常
+                if err_str.contains("decoding response body")
+                    || err_str.contains("connection closed")
+                    || err_str.contains("reset by peer")
+                    || err_str.contains("end of file")
+                {
+                    println!("📴 [FLV] 连接关闭 (已运行 {:.1}s, {} 包)", elapsed, count);
+                    // 返回错误触发重连
+                    return Err("连接关闭".to_string());
+                } else {
+                    eprintln!(
+                        "❌ [FLV] 读取错误: {} (已运行 {:.1}s, {} 包)",
+                        e, elapsed, count
+                    );
+                    return Err(err_str);
+                }
+            }
+            Ok(None) => {
+                let elapsed = start_time.elapsed().as_secs_f32();
+                let idle_secs = last_data_time.elapsed().as_secs_f32();
+                println!(
+                    "📴 [FLV] 流结束 (已运行 {:.1}s, 最后数据 {:.1}s 前)",
+                    elapsed, idle_secs
+                );
+                // 流结束也触发重连（直播流可能暂时中断）
+                return Err("流结束".to_string());
+            }
+            Err(_) => {
+                let elapsed = start_time.elapsed().as_secs_f32();
+                let idle_secs = last_data_time.elapsed().as_secs_f32();
+                eprintln!(
+                    "⏱ [FLV] 读取超时 30s (已运行 {:.1}s, 最后数据 {:.1}s 前)",
+                    elapsed, idle_secs
+                );
+                return Err("读取超时".to_string());
+            }
+        }
+    }
+
+    // 用户主动停止
+    let total_time = start_time.elapsed().as_secs_f32();
+    println!(
+        "🛑 [FLV] 用户停止，共 {} 包，运行 {:.1}s",
+        packet_count.load(Ordering::Relaxed),
+        total_time
+    );
+
+    Ok(())
+}
+
+// ==================== FFmpeg 后端 (MP4/RTMP/其他) ====================
 
 use ffmpeg_next as ffmpeg;
 
