@@ -1,23 +1,22 @@
 // Prevents additional console window on Windows in release
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod demuxer;
 mod llm_inference;
+mod stream_proxy;
 mod xbus;
 
-use demuxer::{DemuxerConfig, DemuxerHandle, EncodedPacket, StreamMetadata};
 use llm_inference::{LlmConfig, LlmInferenceState};
 use parking_lot::RwLock;
 use serde::Serialize;
 use std::panic;
-use std::sync::Arc;
+use stream_proxy::{StreamConfig, StreamProxy};
 use tauri::ipc::{Channel, InvokeBody, InvokeResponseBody, Request};
 use tauri::window::Color;
 use tauri::{AppHandle, Manager};
 
-/// 解复用器状态
-pub struct DemuxerState {
-    pub handle: RwLock<DemuxerHandle>,
+/// 流代理状态
+pub struct StreamState {
+    pub proxy: RwLock<StreamProxy>,
 }
 
 // ==================== 数据包消息 (发送给前端 WebCodecs) ====================
@@ -51,112 +50,47 @@ pub enum StreamMessage {
     Data(VideoDataMessage),
 }
 
-// ==================== RTSP 流命令 (WebCodecs 模式) ====================
+// ==================== 视频流命令 (WebCodecs 模式) ====================
 
-/// 启动 RTSP 流 (WebCodecs 模式)
+/// 启动视频流
 ///
-/// 后端只做解复用，发送编码数据给前端，由前端 WebCodecs 解码
-/// 使用 InvokeResponseBody 支持高效传输：
-/// - Json: 视频配置等结构化数据
-/// - Raw: 编码视频数据包 (避免 JSON 序列化开销)
+/// 后端自动选择最佳后端：
+/// - RTSP: retina (纯 Rust，极快)
+/// - FLV/MP4/RTMP/其他: FFmpeg (通用，已优化)
 #[tauri::command]
-async fn start_rtsp_stream(
+async fn start_stream(
     app: AppHandle,
     url: String,
     on_data: Channel<InvokeResponseBody>,
 ) -> Result<String, String> {
-    println!("🚀 启动 RTSP 流 (WebCodecs 模式): {}", url);
+    println!("🚀 启动流: {}", url);
 
-    let demuxer_state = app.state::<DemuxerState>();
+    let stream_state = app.state::<StreamState>();
 
-    // 元数据回调：发送视频配置 (JSON)
-    let on_data_meta = on_data.clone();
-    let metadata_callback = Arc::new(move |meta: StreamMetadata| {
-        println!(
-            "📹 视频流元数据: {} {}x{} @ {:.2} fps",
-            meta.codec, meta.width, meta.height, meta.fps
-        );
-        let config_msg = VideoConfigMessage {
-            r#type: "video_config".to_string(),
-            codec: meta.codec,
-            width: meta.width,
-            height: meta.height,
-            extradata: meta.extradata,
-        };
-        // 配置信息用 JSON 发送
-        let _ = on_data_meta.send(InvokeResponseBody::Json(
-            serde_json::to_string(&config_msg).unwrap_or_default(),
-        ));
-    });
+    let config = StreamConfig { url: url.clone() };
 
-    // 数据包回调：发送编码数据 (Raw 二进制)
-    let packet_callback = Arc::new(move |packet: EncodedPacket| {
-        // 构建高效的二进制包格式:
-        // [0]     : type (1=video, 2=audio)
-        // [1]     : is_keyframe (0/1)
-        // [2..10] : pts (i64, little-endian)
-        // [10..18]: dts (i64, little-endian)
-        // [18..26]: packet_id (u64, little-endian)
-        // [26..30]: data_len (u32, little-endian)
-        // [30..]  : data
+    stream_state.proxy.write().start(config, on_data);
 
-        let header_size = 30;
-        let total_size = header_size + packet.data.len();
-        let mut buffer = vec![0u8; total_size];
-
-        buffer[0] = 1; // type: video
-        buffer[1] = if packet.is_keyframe { 1 } else { 0 };
-        buffer[2..10].copy_from_slice(&packet.pts.to_le_bytes());
-        buffer[10..18].copy_from_slice(&packet.dts.to_le_bytes());
-        buffer[18..26].copy_from_slice(&packet.packet_id.to_le_bytes());
-        buffer[26..30].copy_from_slice(&(packet.data.len() as u32).to_le_bytes());
-        buffer[30..].copy_from_slice(&packet.data);
-
-        // 首包打印日志
-        if packet.packet_id == 1 {
-            println!(
-                "📦 发送首个视频包: keyframe={}, size={} bytes",
-                packet.is_keyframe, total_size
-            );
-        }
-
-        // 使用 Raw 发送二进制数据，避免 JSON 序列化开销
-        let result = on_data.send(InvokeResponseBody::Raw(buffer));
-        if packet.packet_id == 1 {
-            println!("📤 Channel 发送结果: {:?}", result);
-        }
-    });
-
-    let config = DemuxerConfig {
-        url: url.clone(),
-        connect_timeout: 10,
-        read_timeout: 5,
-        metadata_callback: Some(metadata_callback),
-        packet_callback: Some(packet_callback),
-    };
-
-    demuxer_state.handle.write().start(config)?;
-
-    Ok(format!("RTSP 流已启动 (WebCodecs): {}", url))
+    Ok(format!("流已启动: {}", url))
 }
 
-/// 停止 RTSP 流
+/// 停止视频流
 #[tauri::command]
-async fn stop_rtsp_stream(app: AppHandle) -> Result<(), String> {
-    println!("⏹ 停止 RTSP 流");
+async fn stop_stream(app: AppHandle) -> Result<(), String> {
+    println!("⏹ 停止流");
 
-    let demuxer_state = app.state::<DemuxerState>();
-    demuxer_state.handle.write().stop();
+    let stream_state = app.state::<StreamState>();
+    stream_state.proxy.write().stop();
 
     Ok(())
 }
 
-/// 获取 RTSP 流状态
+/// 获取视频流状态
 #[tauri::command]
-async fn get_rtsp_status(app: AppHandle) -> Result<(bool, u64), String> {
-    let demuxer_state = app.state::<DemuxerState>();
-    let handle = demuxer_state.handle.read();
-    Ok((handle.is_running(), handle.packet_count()))
+async fn get_stream_status(app: AppHandle) -> Result<(bool, u64), String> {
+    let stream_state = app.state::<StreamState>();
+    let proxy = stream_state.proxy.read();
+    Ok((proxy.is_running(), proxy.packet_count()))
 }
 
 // ==================== 历史记录命令 ====================
@@ -343,15 +277,15 @@ fn main() {
             }
             Ok(())
         })
-        .manage(DemuxerState {
-            handle: RwLock::new(DemuxerHandle::new()),
+        .manage(StreamState {
+            proxy: RwLock::new(StreamProxy::new()),
         })
         .manage(LlmInferenceState::default())
         .invoke_handler(tauri::generate_handler![
-            // RTSP 流命令 (WebCodecs 模式)
-            start_rtsp_stream,
-            stop_rtsp_stream,
-            get_rtsp_status,
+            // 视频流命令 (WebCodecs 模式)
+            start_stream,
+            stop_stream,
+            get_stream_status,
             // 历史记录
             get_rtsp_history,
             add_rtsp_history,

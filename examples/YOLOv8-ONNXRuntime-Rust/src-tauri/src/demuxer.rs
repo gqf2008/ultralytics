@@ -178,6 +178,7 @@ fn run_demuxer_loop(
     };
 
     let is_hevc = codec_id == ffmpeg::ffi::AVCodecID::AV_CODEC_ID_HEVC;
+    let is_h264 = codec_id == ffmpeg::ffi::AVCodecID::AV_CODEC_ID_H264;
 
     let width = unsafe { (*codec_params.as_ptr()).width as u32 };
     let height = unsafe { (*codec_params.as_ptr()).height as u32 };
@@ -226,7 +227,8 @@ fn run_demuxer_loop(
         });
     }
 
-    // 解复用循环
+    // 解复用循环 - 不等待关键帧，直接发送所有包
+    // 前端 WebCodecs 有 extradata (SPS/PPS) 就能解码 P 帧
     let mut packet_id: u64 = 0;
 
     println!("[Demuxer] Starting packet loop...");
@@ -246,19 +248,17 @@ fn run_demuxer_loop(
             continue;
         }
 
-        // 检测关键帧：对于 HEVC，手动检查 NAL unit type
-        // 因为某些 RTSP 流中 FFmpeg 的 is_key() 可能不准确
-        let is_keyframe = if codec_name == "hevc" {
-            detect_hevc_keyframe(&data) || packet.is_key()
+        // 检测关键帧（用于标记，不用于过滤）
+        let is_keyframe = if is_hevc {
+            detect_hevc_keyframe(&data)
+        } else if is_h264 {
+            detect_h264_keyframe(&data)
         } else {
-            detect_h264_keyframe(&data) || packet.is_key()
+            packet.is_key()
         };
 
         let pts = packet.pts().unwrap_or(0);
         let dts = packet.dts().unwrap_or(0);
-
-        // 直接发送 Annex-B 格式数据给前端 WebCodecs
-        // 前端会进行必要的格式转换
 
         packet_id += 1;
         packet_count.fetch_add(1, Ordering::SeqCst);
@@ -282,10 +282,10 @@ fn run_demuxer_loop(
             );
         }
 
-        // 发送数据包 (原始 AVCC 格式)
+        // 发送数据包 (原始格式)
         if let Some(ref callback) = config.packet_callback {
             callback(EncodedPacket {
-                data: data, // 直接使用原始数据
+                data,
                 is_keyframe,
                 pts,
                 dts,
@@ -299,89 +299,138 @@ fn run_demuxer_loop(
 }
 
 /// 检测 HEVC (H.265) 数据中是否包含 IDR 帧 (关键帧)
-/// 支持 Annex-B 格式 (00 00 00 01 起始码)
+/// 支持 Annex-B 和 HVCC (长度前缀) 两种格式
 fn detect_hevc_keyframe(data: &[u8]) -> bool {
-    // HEVC NAL unit type 位于第一个字节的 bit 1-6
-    // IDR 帧类型:
-    // - 19 (IDR_W_RADL): IDR with RADL pictures
-    // - 20 (IDR_N_LP): IDR without leading pictures
-    // - 16-18 (BLA): Broken Link Access
-    // VPS/SPS/PPS 也算作关键帧的一部分
-    // - 32 (VPS): Video Parameter Set
-    // - 33 (SPS): Sequence Parameter Set
-    // - 34 (PPS): Picture Parameter Set
+    if data.len() < 5 {
+        return false;
+    }
 
-    let mut i = 0;
-    while i + 4 < data.len() {
-        // 查找 Annex-B 起始码
-        if data[i] == 0 && data[i + 1] == 0 {
-            let start_code_len = if data[i + 2] == 0 && data[i + 3] == 1 {
-                4
-            } else if data[i + 2] == 1 {
-                3
-            } else {
-                i += 1;
-                continue;
-            };
+    // 检查是否是 Annex-B 格式 (00 00 00 01 或 00 00 01)
+    let is_annexb = (data[0] == 0 && data[1] == 0 && data[2] == 0 && data[3] == 1)
+        || (data[0] == 0 && data[1] == 0 && data[2] == 1);
 
-            let nalu_start = i + start_code_len;
-            if nalu_start >= data.len() {
+    if is_annexb {
+        // Annex-B 格式检测
+        let mut i = 0;
+        while i + 4 < data.len() {
+            if data[i] == 0 && data[i + 1] == 0 {
+                let start_code_len = if data[i + 2] == 0 && data[i + 3] == 1 {
+                    4
+                } else if data[i + 2] == 1 {
+                    3
+                } else {
+                    i += 1;
+                    continue;
+                };
+
+                let nalu_start = i + start_code_len;
+                if nalu_start >= data.len() {
+                    break;
+                }
+
+                // HEVC NAL unit type: (byte >> 1) & 0x3F
+                let nal_type = (data[nalu_start] >> 1) & 0x3F;
+
+                // IDR 帧或参数集
+                if (nal_type >= 16 && nal_type <= 21) || (nal_type >= 32 && nal_type <= 34) {
+                    return true;
+                }
+
+                i = nalu_start;
+            }
+            i += 1;
+        }
+    } else {
+        // HVCC 格式 (4字节长度前缀)
+        let mut offset = 0;
+        while offset + 4 < data.len() {
+            let nalu_size = u32::from_be_bytes([
+                data[offset],
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
+            ]) as usize;
+
+            offset += 4;
+            if nalu_size == 0 || offset + nalu_size > data.len() {
                 break;
             }
 
-            // HEVC NAL unit type: (byte >> 1) & 0x3F
-            let nal_type = (data[nalu_start] >> 1) & 0x3F;
-
-            // IDR 帧或参数集
-            if nal_type >= 16 && nal_type <= 21 {
-                // BLA_W_LP(16), BLA_W_RADL(17), BLA_N_LP(18), IDR_W_RADL(19), IDR_N_LP(20), CRA(21)
-                return true;
-            }
-            if nal_type >= 32 && nal_type <= 34 {
-                // VPS(32), SPS(33), PPS(34)
+            let nal_type = (data[offset] >> 1) & 0x3F;
+            if (nal_type >= 16 && nal_type <= 21) || (nal_type >= 32 && nal_type <= 34) {
                 return true;
             }
 
-            i = nalu_start;
+            offset += nalu_size;
         }
-        i += 1;
     }
     false
 }
 
 /// 检测 H.264 数据中是否包含 IDR 帧 (关键帧)
+/// 支持 Annex-B 和 AVCC (长度前缀) 两种格式
 fn detect_h264_keyframe(data: &[u8]) -> bool {
-    // H.264 NAL unit type 位于第一个字节的低 5 位
-    // IDR 帧类型: 5 (IDR slice)
-    // SPS: 7, PPS: 8
+    if data.len() < 5 {
+        return false;
+    }
 
-    let mut i = 0;
-    while i + 4 < data.len() {
-        if data[i] == 0 && data[i + 1] == 0 {
-            let start_code_len = if data[i + 2] == 0 && data[i + 3] == 1 {
-                4
-            } else if data[i + 2] == 1 {
-                3
-            } else {
-                i += 1;
-                continue;
-            };
+    // 检查是否是 Annex-B 格式 (00 00 00 01 或 00 00 01)
+    let is_annexb = (data[0] == 0 && data[1] == 0 && data[2] == 0 && data[3] == 1)
+        || (data[0] == 0 && data[1] == 0 && data[2] == 1);
 
-            let nalu_start = i + start_code_len;
-            if nalu_start >= data.len() {
+    if is_annexb {
+        // Annex-B 格式检测
+        let mut i = 0;
+        while i + 4 < data.len() {
+            if data[i] == 0 && data[i + 1] == 0 {
+                let start_code_len = if data[i + 2] == 0 && data[i + 3] == 1 {
+                    4
+                } else if data[i + 2] == 1 {
+                    3
+                } else {
+                    i += 1;
+                    continue;
+                };
+
+                let nalu_start = i + start_code_len;
+                if nalu_start >= data.len() {
+                    break;
+                }
+
+                let nal_type = data[nalu_start] & 0x1F;
+                // IDR slice (5) 或 SPS (7) 或 PPS (8)
+                if nal_type == 5 || nal_type == 7 || nal_type == 8 {
+                    return true;
+                }
+
+                i = nalu_start;
+            }
+            i += 1;
+        }
+    } else {
+        // AVCC 格式 (4字节长度前缀)
+        let mut offset = 0;
+        while offset + 4 < data.len() {
+            let nalu_size = u32::from_be_bytes([
+                data[offset],
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
+            ]) as usize;
+
+            offset += 4;
+            if nalu_size == 0 || offset + nalu_size > data.len() {
                 break;
             }
 
-            let nal_type = data[nalu_start] & 0x1F;
-
+            let nal_type = data[offset] & 0x1F;
             // IDR slice (5) 或 SPS (7) 或 PPS (8)
             if nal_type == 5 || nal_type == 7 || nal_type == 8 {
                 return true;
             }
 
-            i = nalu_start;
+            offset += nalu_size;
         }
-        i += 1;
     }
     false
 }
