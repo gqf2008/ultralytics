@@ -11,8 +11,6 @@ export default defineConfig({
     rollupOptions: {
       input: {
         main: resolve(__dirname, 'ui/index.html'),
-        regionSelector: resolve(__dirname, 'ui/region-selector.html'),
-        recordingIndicator: resolve(__dirname, 'ui/recording-indicator.html'),
       },
       output: {
         manualChunks: undefined,

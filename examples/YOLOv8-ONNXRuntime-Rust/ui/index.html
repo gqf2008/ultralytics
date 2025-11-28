@@ -73,14 +73,6 @@
             background: #0a0a0f;
         }
         
-        /* 检测框叠加层 - 与 canvas 同步 */
-        #detection-overlay {
-            position: absolute;
-            pointer-events: none;
-            will-change: transform;
-            transform-origin: center center;
-        }
-        
         /* 缩放指示器 */
         #zoom-indicator {
             position: absolute;
@@ -557,6 +549,20 @@
         /* 隐藏类 */
         .hidden { display: none !important; }
         
+        /* wgpu 渲染模式 - 透明背景 */
+        body.wgpu-mode {
+            background: transparent !important;
+        }
+        
+        body.wgpu-mode html,
+        body.wgpu-mode #app {
+            background: transparent !important;
+        }
+        
+        body.wgpu-mode #canvas-container {
+            background: transparent !important;
+        }
+        
         /* 滚动条 */
         ::-webkit-scrollbar { width: 5px; }
         ::-webkit-scrollbar-track { background: transparent; }
@@ -569,7 +575,6 @@
         <!-- Canvas 容器，支持缩放和拖拽 -->
         <div id="canvas-container">
             <canvas id="canvas"></canvas>
-            <canvas id="detection-overlay"></canvas>
         </div>
         
         <!-- 缩放指示器 -->
@@ -586,7 +591,7 @@
                     <div class="logo">👁</div>
                     <div>
                         <h1>YOLO Vision</h1>
-                        <span>Real-time Detection</span>
+                        <span>LLM Inference</span>
                     </div>
                 </div>
                 <button id="toggle-btn" title="折叠">▲</button>
@@ -598,14 +603,6 @@
                     <div class="stat-item">
                         <div class="value" id="fps">0</div>
                         <div class="label">Video FPS</div>
-                    </div>
-                    <div class="stat-item">
-                        <div class="value" id="detect-fps">0</div>
-                        <div class="label">AI FPS</div>
-                    </div>
-                    <div class="stat-item">
-                        <div class="value" id="detect-count">0</div>
-                        <div class="label">Objects</div>
                     </div>
                     <div class="stat-item">
                         <div class="value" id="latency">0<small style="font-size:12px">ms</small></div>
@@ -631,7 +628,10 @@
                         </div>
                         <select id="decode-mode">
                             <option value="frontend">🌐 前端硬解 (WebCodecs)</option>
-                            <option value="backend">⚡ 后端硬解 (QSV)</option>
+                            <option value="backend">⚡ 后端硬解 (共享内存)</option>
+                            <option value="zerocopy">🚀 零拷贝 NV12 (WebGL)</option>
+                            <option value="wgpu">🎮 wgpu GPU 渲染</option>
+                            <option value="native">🖥️ 原生窗口 (wgpu)</option>
                         </select>
                     </div>
                 </div>
@@ -646,24 +646,8 @@
                     </button>
                 </div>
                 
-                <!-- AI 设置 -->
+                <!-- 音量控制 -->
                 <div class="settings-section">
-                    <div class="settings-row">
-                        <div class="settings-label">
-                            <span class="icon">🧠</span> 模型
-                        </div>
-                        <select id="model-select">
-                            <option value="">加载中...</option>
-                        </select>
-                    </div>
-                    <div class="settings-row">
-                        <div class="settings-label">
-                            <span class="icon">⚡</span> 设备
-                        </div>
-                        <select id="device-select">
-                            <option value="auto">Auto</option>
-                        </select>
-                    </div>
                     <div class="settings-row">
                         <div class="settings-label">
                             <span class="icon">🔊</span> 音量
@@ -673,16 +657,6 @@
                             <span class="slider-value" id="volume-value">1.5×</span>
                         </div>
                     </div>
-                </div>
-                
-                <!-- 检测控制 -->
-                <div class="btn-group">
-                    <button id="start-detector-btn" class="btn btn-accent">
-                        <span>🎯</span> 开启检测
-                    </button>
-                    <button id="stop-detector-btn" class="btn btn-danger hidden">
-                        <span>⏹</span> 停止检测
-                    </button>
                 </div>
                 
                 <!-- LLM 推理设置 -->

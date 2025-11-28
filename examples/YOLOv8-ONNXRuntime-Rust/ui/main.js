@@ -1,6 +1,6 @@
 import { invoke, Channel } from '@tauri-apps/api/core';
-import { FrameDetector } from './detector.js';
 import { llmManager, defaultLlmConfig } from './llmInference.js';
+import { ZeroCopyRenderer } from './zeroCopyRenderer.js';
 
 // 前端加载完成后显示窗口（避免白屏闪烁）
 invoke('show_window').catch(console.error);
@@ -401,68 +401,85 @@ class WebGLVideoRenderer {
         this.hwDecodeRunning = false;
     }
     
-    // 硬件解码模式 - 从后端轮询 RGBA 帧
-    startHardwareDecodeMode() {
+    // 硬件解码模式 - 事件驱动，收到帧就绪信号后读取数据
+    startHardwareDecodeMode(frameChannel) {
         this.isRunning = true;
         this.hwDecodeRunning = true;
-        console.log('🎬 启动硬件解码渲染模式');
-        this.pollFrames();
-    }
-    
-    async pollFrames() {
-        if (!this.hwDecodeRunning) return;
+        this.lastFrameId = 0;
+        console.log('🎬 启动后端硬解渲染模式 (事件驱动)');
         
-        try {
-            const [frameData, width, height] = await invoke('get_latest_frame');
+        // 监听帧就绪信号
+        frameChannel.onmessage = async (signal) => {
+            if (!this.hwDecodeRunning) return;
             
-            if (frameData && frameData.length > 0) {
-                // 更新 canvas 尺寸
-                if (this.canvas.width !== width || this.canvas.height !== height) {
-                    this.canvas.width = width;
-                    this.canvas.height = height;
-                    this.videoWidth = width;
-                    this.videoHeight = height;
-                    console.log(`📐 Canvas 尺寸更新: ${width}x${height}`);
+            try {
+                // 收到帧就绪信号，读取完整数据
+                const response = await invoke('get_shared_memory_frame');
+                
+                // 确保是 Uint8Array
+                let data;
+                if (response instanceof ArrayBuffer) {
+                    data = new Uint8Array(response);
+                } else if (response instanceof Uint8Array) {
+                    data = response;
+                } else if (Array.isArray(response)) {
+                    data = new Uint8Array(response);
+                } else {
+                    console.warn('未知的响应类型:', typeof response);
+                    return;
+                }
+                
+                if (data && data.length > 24) {
+                    // 解析 header: frame_id(8) + width(4) + height(4) + timestamp(8) = 24 bytes
+                    const headerView = new DataView(data.buffer, data.byteOffset, data.byteLength);
+                    const frameId = Number(headerView.getBigUint64(0, true));
+                    const width = headerView.getUint32(8, true);
+                    const height = headerView.getUint32(12, true);
                     
-                    // 同步 overlay
-                    if (typeof syncOverlayToCanvas === 'function') {
-                        syncOverlayToCanvas(width, height);
+                    // 首帧日志
+                    if (this.lastFrameId === 0) {
+                        console.log(`🎬 首帧: id=${frameId}, ${width}x${height}, 数据大小=${data.length}`);
+                    }
+                    
+                    this.lastFrameId = frameId;
+                    
+                    // 提取 RGBA 数据 (跳过 24 字节 header)
+                    const frameData = new Uint8ClampedArray(data.buffer, data.byteOffset + 24, width * height * 4);
+                    
+                    // 更新 canvas 尺寸
+                    if (this.canvas.width !== width || this.canvas.height !== height) {
+                        this.canvas.width = width;
+                        this.canvas.height = height;
+                        this.videoWidth = width;
+                        this.videoHeight = height;
+                        console.log(`📐 Canvas 尺寸更新: ${width}x${height}`);
+                        
+                        if (typeof syncOverlayToCanvas === 'function') {
+                            syncOverlayToCanvas(width, height);
+                        }
+                    }
+                    
+                    // 创建 ImageData 并绘制
+                    const imageData = new ImageData(frameData, width, height);
+                    this.ctx.putImageData(imageData, 0, 0);
+                    
+                    // 更新 FPS
+                    this.frameCount++;
+                    const now = performance.now();
+                    if (now - this.lastTime >= 1000) {
+                        this.fps = this.frameCount;
+                        this.frameCount = 0;
+                        this.lastTime = now;
+                        const fpsEl = document.getElementById('fps');
+                        if (fpsEl) fpsEl.textContent = this.fps;
                     }
                 }
-                
-                // 创建 ImageData 并绘制
-                const imageData = new ImageData(
-                    new Uint8ClampedArray(frameData),
-                    width,
-                    height
-                );
-                this.ctx.putImageData(imageData, 0, 0);
-                
-                // 更新 FPS
-                this.frameCount++;
-                const now = performance.now();
-                if (now - this.lastTime >= 1000) {
-                    this.fps = this.frameCount;
-                    this.frameCount = 0;
-                    this.lastTime = now;
-                    const fpsEl = document.getElementById('fps');
-                    if (fpsEl) fpsEl.textContent = this.fps;
+            } catch (e) {
+                if (!e.toString().includes('没有可用')) {
+                    console.warn('获取帧失败:', e);
                 }
-                
-                // 标记帧已处理
-                await invoke('mark_frame_processed');
             }
-        } catch (e) {
-            // 没有帧可用，静默忽略
-            if (!e.toString().includes('No frame available')) {
-                console.warn('获取帧失败:', e);
-            }
-        }
-        
-        // 继续轮询（约 60fps）
-        if (this.hwDecodeRunning) {
-            requestAnimationFrame(() => this.pollFrames());
-        }
+        };
     }
 }
 
@@ -597,30 +614,10 @@ class CanvasTransform {
 // 初始化变换控制（等待 DOM 加载完成）
 let canvasTransform = null;
 document.addEventListener('DOMContentLoaded', () => {
-    const detectionOverlay = document.getElementById('detection-overlay');
-    if (canvas && detectionOverlay) {
-        canvasTransform = new CanvasTransform(canvas, detectionOverlay);
+    if (canvas) {
+        canvasTransform = new CanvasTransform(canvas, null);
         window.canvasTransform = canvasTransform;
     }
-});
-
-// 初始化检测器
-const frameDetector = new FrameDetector(renderer);
-
-// 监听检测结果并在 Canvas 上绘制
-window.addEventListener('yolo-detection', (event) => {
-    const result = event.detail;
-    
-    if (result.boxes && result.boxes.length > 0) {
-        console.log(`🎯 绘制 ${result.boxes.length} 个检测框`);
-    }
-    
-    drawDetections(result.boxes);
-    
-    const detectFpsEl = document.getElementById('detect-fps');
-    const detectCountEl = document.getElementById('detect-count');
-    if (detectFpsEl) detectFpsEl.textContent = result.detect_fps?.toFixed(1) || '0';
-    if (detectCountEl) detectCountEl.textContent = result.boxes?.length || '0';
 });
 
 // UI 控制
@@ -636,89 +633,6 @@ const panelHeader = document.getElementById('panel-header');
 const toggleBtn = document.getElementById('toggle-btn');
 const volumeSlider = document.getElementById('volume-slider');
 const volumeValue = document.getElementById('volume-value');
-
-// 检测框 overlay canvas (2D context，独立于 WebGL)
-const detectionOverlay = document.getElementById('detection-overlay');
-const detectionCtx = detectionOverlay.getContext('2d');
-
-// 检测框缓存 - 用于平滑绘制
-let cachedBoxes = [];
-let drawScheduled = false;
-let overlayWidth = window.innerWidth;
-let overlayHeight = window.innerHeight;
-
-// 同步 overlay 到 canvas 尺寸
-function syncOverlayToCanvas(width, height) {
-    if (detectionOverlay.width !== width || detectionOverlay.height !== height) {
-        detectionOverlay.width = width;
-        detectionOverlay.height = height;
-        overlayWidth = width;
-        overlayHeight = height;
-        console.log(`🔄 [Overlay] 同步到 Canvas: ${width}x${height}`);
-        renderBoxesImmediate();
-    }
-}
-
-// 同步 overlay canvas 尺寸 (窗口 resize 时)
-function syncOverlaySize() {
-    const mainCanvas = document.getElementById('canvas');
-    if (mainCanvas && mainCanvas.width > 0 && mainCanvas.height > 0) {
-        if (detectionOverlay.width !== mainCanvas.width || detectionOverlay.height !== mainCanvas.height) {
-            syncOverlayToCanvas(mainCanvas.width, mainCanvas.height);
-        }
-    }
-}
-window.addEventListener('resize', syncOverlaySize);
-
-// 立即渲染检测框
-function renderBoxesImmediate() {
-    const ctx = detectionCtx;
-    const w = overlayWidth;
-    const h = overlayHeight;
-    
-    ctx.clearRect(0, 0, w, h);
-    
-    if (cachedBoxes.length === 0) return;
-    
-    ctx.strokeStyle = '#00ff00';
-    ctx.lineWidth = 3;
-    ctx.font = 'bold 16px monospace';
-    
-    cachedBoxes.forEach(box => {
-        const x1 = box.x1 * w;
-        const y1 = box.y1 * h;
-        const x2 = box.x2 * w;
-        const y2 = box.y2 * h;
-        const bw = x2 - x1;
-        const bh = y2 - y1;
-        
-        ctx.strokeRect(x1, y1, bw, bh);
-        
-        const label = `${box.class_name} ${(box.confidence * 100).toFixed(0)}%`;
-        const textWidth = ctx.measureText(label).width;
-        ctx.fillStyle = 'rgba(0, 255, 0, 0.8)';
-        ctx.fillRect(x1, y1 - 22, textWidth + 8, 22);
-        
-        ctx.fillStyle = '#000';
-        ctx.fillText(label, x1 + 4, y1 - 6);
-    });
-}
-
-// 实际渲染检测框 (在 RAF 中调用)
-function renderBoxes() {
-    renderBoxesImmediate();
-    drawScheduled = false;
-}
-
-// 更新检测框 (使用 RAF 合并绘制)
-function drawDetections(boxes) {
-    cachedBoxes = boxes || [];
-    
-    if (!drawScheduled) {
-        drawScheduled = true;
-        requestAnimationFrame(renderBoxes);
-    }
-}
 
 // 音量控制
 volumeSlider.addEventListener('input', (e) => {
@@ -855,11 +769,19 @@ function showStatus(message, duration = 3000) {
 // 解码模式选择
 const decodeModeSelect = document.getElementById('decode-mode');
 let currentDecodeMode = 'frontend'; // 默认前端解码
+let zeroCopyRenderer = null; // 零拷贝渲染器实例
+let wgpuActive = false; // wgpu 渲染状态
 
 // 监听解码模式变更
 decodeModeSelect?.addEventListener('change', (e) => {
     currentDecodeMode = e.target.value;
-    console.log(`🎬 解码模式切换为: ${currentDecodeMode === 'frontend' ? '前端硬解 (WebCodecs)' : '后端硬解 (QSV)'}`);
+    const modeNames = {
+        'frontend': '前端硬解 (WebCodecs)',
+        'backend': '后端硬解 (共享内存)',
+        'zerocopy': '零拷贝 NV12 (WebGL)',
+        'wgpu': 'wgpu GPU 渲染'
+    };
+    console.log(`🎬 解码模式切换为: ${modeNames[currentDecodeMode]}`);
 });
 
 startBtn.addEventListener('click', async () => {
@@ -869,23 +791,70 @@ startBtn.addEventListener('click', async () => {
         return;
     }
     
-    const useBackendDecode = currentDecodeMode === 'backend';
-    
     try {
         startBtn.disabled = true;
-        showStatus(`🚀 正在启动 (${useBackendDecode ? '后端 QSV 硬解' : '前端 WebCodecs 硬解'})...`);
+        const modeNames = {
+            'frontend': '前端 WebCodecs',
+            'backend': '后端共享内存',
+            'zerocopy': '零拷贝 NV12',
+            'wgpu': 'wgpu GPU',
+            'native': '原生窗口 wgpu'
+        };
+        showStatus(`🚀 正在启动 (${modeNames[currentDecodeMode]})...`);
         
-        if (useBackendDecode) {
-            // 后端 QSV 硬件解码模式
+        if (currentDecodeMode === 'native') {
+            // 原生窗口 wgpu 渲染模式 - 会弹出独立窗口
+            console.log('🖥️ 启动原生窗口 wgpu 渲染模式');
+            
+            // 启动 RTSP 流 + 原生窗口渲染
+            const result = await invoke('start_rtsp_stream_native', { url });
+            console.log(result);
+            
+            wgpuActive = true;
+            showStatus('✅ 监控已启动 (原生窗口)');
+            
+        } else if (currentDecodeMode === 'wgpu') {
+            // wgpu GPU 渲染模式
+            console.log('🎮 启动 wgpu GPU 渲染模式');
+            
+            // 隐藏 canvas，让 wgpu 渲染可见
+            canvas.style.display = 'none';
+            document.body.classList.add('wgpu-mode');
+            
+            // 启动 wgpu 渲染器
+            await invoke('start_wgpu_render');
+            
+            // 启动 RTSP 流（后端硬解 + wgpu 渲染）
+            const result = await invoke('start_rtsp_stream_wgpu', { url });
+            console.log(result);
+            
+            wgpuActive = true;
+            showStatus('✅ 监控已启动 (wgpu GPU 渲染)');
+            
+        } else if (currentDecodeMode === 'zerocopy') {
+            // 零拷贝 NV12 渲染模式
+            if (!zeroCopyRenderer) {
+                zeroCopyRenderer = new ZeroCopyRenderer(canvas);
+            }
+            await zeroCopyRenderer.start(url, 'qsv', 3840, 2160);
+            showStatus('✅ 监控已启动 (零拷贝 NV12 模式)');
+            
+        } else if (currentDecodeMode === 'backend') {
+            // 后端硬件解码 + Channel 事件驱动模式
+            const onFrame = new Channel();
+            
+            // 设置帧就绪信号处理
+            renderer.startHardwareDecodeMode(onFrame);
+            
             const result = await invoke('start_rtsp_stream', { 
                 url,
-                hardwareDecode: true
+                hardwareDecode: true,
+                onFrame  // 传入 Channel
             });
             console.log(result);
             
-            // 启动帧轮询渲染
-            renderer.startHardwareDecodeMode();
-            showStatus('✅ 监控已启动 (后端 QSV 硬解)');
+            showStatus('✅ 监控已启动 (后端硬解)');
+            
         } else {
             // 前端 WebCodecs 解码模式
             const onData = new Channel();
@@ -914,7 +883,7 @@ startBtn.addEventListener('click', async () => {
             console.log(result);
             
             renderer.start();
-            showStatus('✅ 监控已启动 (前端 WebCodecs 硬解)');
+            showStatus('✅ 监控已启动 (前端 WebCodecs)');
         }
         
         try {
@@ -940,7 +909,25 @@ stopBtn.addEventListener('click', async () => {
         await frameDetector.stopDetector();
     }
     
-    renderer.stop();
+    // 停止对应的渲染器
+    if (wgpuActive && currentDecodeMode === 'native') {
+        // 原生窗口模式
+        await invoke('stop_rtsp_stream_native');
+        wgpuActive = false;
+    } else if (wgpuActive && currentDecodeMode === 'wgpu') {
+        await invoke('stop_wgpu_render');
+        await invoke('stop_rtsp_stream');
+        wgpuActive = false;
+        
+        // 恢复 canvas 显示
+        canvas.style.display = '';
+        document.body.classList.remove('wgpu-mode');
+    } else if (zeroCopyRenderer && currentDecodeMode === 'zerocopy') {
+        await zeroCopyRenderer.stop();
+    } else {
+        renderer.stop();
+    }
+    
     stopBtn.classList.add('hidden');
     startBtn.classList.remove('hidden');
     startBtn.disabled = false;
@@ -951,112 +938,6 @@ stopBtn.addEventListener('click', async () => {
 
 // 暴露到全局方便调试
 window.renderer = renderer;
-window.frameDetector = frameDetector;
-
-// 检测器按钮事件
-const startDetectorBtn = document.getElementById('start-detector-btn');
-const stopDetectorBtn = document.getElementById('stop-detector-btn');
-const modelSelect = document.getElementById('model-select');
-const deviceSelect = document.getElementById('device-select');
-
-// 加载可用模型和设备列表
-async function loadModelsAndDevices() {
-    try {
-        const [models, devices] = await Promise.all([
-            invoke('get_available_models'),
-            invoke('get_available_devices')
-        ]);
-        
-        modelSelect.innerHTML = '';
-        models.forEach(model => {
-            const option = document.createElement('option');
-            option.value = model.path;
-            option.textContent = model.name;
-            modelSelect.appendChild(option);
-        });
-        
-        const defaultModel = models.find(m => m.name === 'yolov8n.onnx');
-        if (defaultModel) {
-            modelSelect.value = defaultModel.path;
-        }
-        
-        console.log(`📦 已加载 ${models.length} 个模型`);
-        
-        deviceSelect.innerHTML = '<option value="auto">🔄 Auto</option>';
-        devices.forEach(device => {
-            const option = document.createElement('option');
-            option.value = device.id;
-            const icon = device.id === 'cuda' ? '🎮' : (device.id === 'directml' ? '🖥️' : '💻');
-            const status = device.available ? '✅' : '❌';
-            option.textContent = `${icon} ${device.name} ${status}`;
-            option.disabled = !device.available;
-            deviceSelect.appendChild(option);
-        });
-        
-        console.log(`⚡ 已加载 ${devices.length} 个设备`);
-        
-    } catch (err) {
-        console.error('加载模型/设备列表失败:', err);
-        modelSelect.innerHTML = '<option value="">加载失败</option>';
-    }
-}
-
-loadModelsAndDevices();
-
-startDetectorBtn.addEventListener('click', async () => {
-    try {
-        startDetectorBtn.disabled = true;
-        startDetectorBtn.innerHTML = '<span>🔄</span> 加载中...';
-        
-        const selectedModel = modelSelect.value;
-        const selectedDevice = deviceSelect.value;
-        
-        if (!selectedModel) {
-            showStatus('❌ 请选择模型');
-            startDetectorBtn.disabled = false;
-            startDetectorBtn.innerHTML = '<span>🎯</span> 开启检测';
-            return;
-        }
-        
-        console.log(`🚀 启动检测: 模型=${selectedModel}, 设备=${selectedDevice}`);
-        
-        const result = await frameDetector.startDetectorWithOptions(selectedModel, selectedDevice, 'bytetrack');
-        
-        if (result) {
-            if (result.input_width) {
-                console.log(`📐 检测输入尺寸: ${result.input_width}x${result.input_width}`);
-            }
-            
-            const deviceUsed = result.device || selectedDevice;
-            showStatus(`✅ 检测器已启动 [${deviceUsed}]`);
-            
-            startDetectorBtn.classList.add('hidden');
-            stopDetectorBtn.classList.remove('hidden');
-        }
-    } catch (err) {
-        console.error('启动检测器失败:', err);
-        showStatus('❌ 检测器启动失败: ' + (err.message || err));
-        startDetectorBtn.disabled = false;
-        startDetectorBtn.innerHTML = '<span>🎯</span> 开启检测';
-    }
-});
-
-stopDetectorBtn.addEventListener('click', async () => {
-    try {
-        await frameDetector.stopDetector();
-        
-        detectionCtx.clearRect(0, 0, detectionOverlay.width, detectionOverlay.height);
-        
-        stopDetectorBtn.classList.add('hidden');
-        startDetectorBtn.classList.remove('hidden');
-        startDetectorBtn.disabled = false;
-        startDetectorBtn.innerHTML = '<span>🎯</span> 开启检测';
-        showStatus('⏹ 检测器已停止');
-    } catch (err) {
-        console.error('停止检测器失败:', err);
-        showStatus('❌ 停止检测器失败: ' + err);
-    }
-});
 
 // ==================== 缩放按钮事件 ====================
 
@@ -1073,10 +954,6 @@ document.getElementById('zoom-fit')?.addEventListener('click', () => {
 });
 
 console.log('WebGL renderer initialized');
-console.log('使用方法:');
-console.log('  启动检测: frameDetector.startDetector("yolov8n", "bytetrack")');
-console.log('  停止检测: frameDetector.stopDetector()');
-console.log('  调整FPS:  frameDetector.setDetectionFps(15)');
 console.log('🔍 缩放功能: 滚轮缩放, 拖拽平移, 双击重置');
 
 // ==================== LLM 视频推理 ====================

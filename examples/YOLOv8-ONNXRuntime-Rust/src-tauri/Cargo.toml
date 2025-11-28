@@ -47,12 +47,41 @@ fontdue = "0.9"
 ffmpeg-next = "7.0"
 crossbeam-skiplist = "0.1.3"
 
-# Windows 共享内存 API
+# 屏幕/窗口捕获 (跨平台)
+xcap = "0.7"
+
+# wgpu 零拷贝 GPU 渲染 (直接渲染到窗口 native handle)
+wgpu = "23"
+bytemuck = { version = "1.14", features = ["derive"] }
+pollster = "0.4"                                       # 异步阻塞等待
+raw-window-handle = "0.6"                              # 原生窗口句柄
+winit = "0.30"                                         # 独立窗口创建 (用于 wgpu 渲染窗口)
+
+# Windows 共享内存 API + Windows Graphics Capture
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.52", features = [
     "Win32_Foundation",
     "Win32_System_Memory",
     "Win32_Security",
+] }
+
+# Windows Graphics Capture API (用于窗口捕获，支持后台/遮挡窗口)
+windows = { version = "0.61", features = [
+    "Graphics_Capture",
+    "Graphics_DirectX",
+    "Graphics_DirectX_Direct3D11",
+    "Graphics_Imaging",
+    "Foundation",
+    "Foundation_Collections",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_System_WinRT",
+    "Win32_System_WinRT_Direct3D11",
+    "Win32_System_WinRT_Graphics_Capture",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Foundation",
 ] }
 
 # Unix 共享内存 (Linux/macOS)
