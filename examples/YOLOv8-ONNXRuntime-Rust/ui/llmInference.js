@@ -33,6 +33,7 @@ export class LlmInferenceManager {
         this.frameCount = 0;
         this.currentFrameId = 0;
         this.currentText = '';
+        this.frameIdCounter = 0;  // 帧ID计数器
     }
 
     /**
@@ -44,7 +45,7 @@ export class LlmInferenceManager {
 
     /**
      * 启动 LLM 推理
-     * @param {string} rtspUrl - RTSP 流地址
+     * @param {string} rtspUrl - RTSP 流地址 (可选，现在由前端直接提交帧)
      */
     async start(rtspUrl) {
         if (this.isRunning) {
@@ -52,19 +53,19 @@ export class LlmInferenceManager {
             return;
         }
 
-        // 创建结果 Channel
+        // 创建结果 Channel (接收 InvokeResponseBody)
         this.resultChannel = new Channel();
-        this.resultChannel.onmessage = (chunk) => this.handleChunk(chunk);
+        this.resultChannel.onmessage = (response) => this.handleResponse(response);
 
         try {
             const result = await invoke('start_llm_inference', {
-                rtspUrl,
                 config: this.config,
                 resultChannel: this.resultChannel
             });
 
             this.isRunning = true;
             this.frameCount = 0;
+            this.frameIdCounter = 0;
             console.log('🤖 LLM 推理已启动:', result);
             return result;
         } catch (e) {
@@ -89,7 +90,110 @@ export class LlmInferenceManager {
     }
 
     /**
-     * 处理流式推理结果
+     * 提交 RGBA 帧进行 LLM 推理
+     * @param {Uint8ClampedArray|Uint8Array} rgbaData - RGBA 像素数据
+     * @param {number} width - 图像宽度
+     * @param {number} height - 图像高度
+     */
+    async submitFrame(rgbaData, width, height) {
+        if (!this.isRunning) {
+            console.warn('LLM 推理未启动，无法提交帧');
+            return;
+        }
+
+        this.frameIdCounter++;
+        const frameId = this.frameIdCounter;
+
+        // 构建带 header 的数据包
+        // header: width(4) + height(4) + frame_id(8) = 16 bytes
+        const headerSize = 16;
+        const totalSize = headerSize + rgbaData.length;
+        const buffer = new ArrayBuffer(totalSize);
+        const view = new DataView(buffer);
+        
+        // 写入 header (little-endian)
+        view.setUint32(0, width, true);
+        view.setUint32(4, height, true);
+        // frame_id 是 u64，分两次写入
+        view.setUint32(8, frameId & 0xFFFFFFFF, true);
+        view.setUint32(12, 0, true); // 高32位为0
+
+        // 写入 RGBA 数据
+        const dataView = new Uint8Array(buffer, headerSize);
+        dataView.set(rgbaData);
+
+        try {
+            // 使用 Raw body 发送
+            await invoke('submit_frame_for_llm', {}, {
+                headers: { 'Content-Type': 'application/octet-stream' }
+            });
+            
+            // 注意：Tauri 2.0 的 invoke 暂不直接支持 Raw body
+            // 需要通过其他方式传递，这里先用普通方式
+            // 实际实现可能需要使用 fetch 或其他方法
+            
+            console.log(`📸 提交帧 #${frameId}: ${width}x${height}, ${rgbaData.length} bytes`);
+        } catch (e) {
+            console.error('提交帧失败:', e);
+        }
+    }
+
+    /**
+     * 从 Canvas 提交帧
+     * @param {HTMLCanvasElement} canvas - Canvas 元素
+     */
+    async submitFrameFromCanvas(canvas) {
+        if (!this.isRunning) return;
+
+        const ctx = canvas.getContext('2d');
+        const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        await this.submitFrame(imageData.data, canvas.width, canvas.height);
+    }
+
+    /**
+     * 从 VideoFrame 提交帧
+     * @param {VideoFrame} frame - WebCodecs VideoFrame
+     */
+    async submitFrameFromVideoFrame(frame) {
+        if (!this.isRunning) return;
+
+        const width = frame.displayWidth;
+        const height = frame.displayHeight;
+        
+        // 创建临时 canvas 转换为 RGBA
+        const canvas = new OffscreenCanvas(width, height);
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(frame, 0, 0);
+        
+        const imageData = ctx.getImageData(0, 0, width, height);
+        await this.submitFrame(imageData.data, width, height);
+    }
+
+    /**
+     * 处理后端响应 (InvokeResponseBody)
+     * @param {string|ArrayBuffer} response - JSON 字符串或二进制数据
+     */
+    handleResponse(response) {
+        // InvokeResponseBody 可能是 JSON 字符串或 Raw 二进制
+        if (typeof response === 'string') {
+            // JSON 响应
+            try {
+                const chunk = JSON.parse(response);
+                this.handleChunk(chunk);
+            } catch (e) {
+                console.error('解析 JSON 响应失败:', e, response);
+            }
+        } else if (response instanceof ArrayBuffer || response instanceof Uint8Array) {
+            // Raw 二进制响应 (如处理后的图像)
+            console.log('收到二进制响应:', response.byteLength || response.length, 'bytes');
+            // 可以在这里处理返回的图像数据
+        } else {
+            console.warn('未知响应类型:', typeof response, response);
+        }
+    }
+
+    /**
+     * 处理流式推理结果 (解析后的 chunk)
      */
     handleChunk(chunk) {
         switch (chunk.type) {

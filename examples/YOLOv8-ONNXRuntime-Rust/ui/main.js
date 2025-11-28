@@ -73,10 +73,17 @@ class WebGLVideoRenderer {
         this.maxPendingFrames = 2;
         this.lastFrameTime = 0;
         
+        // 编解码器信息
+        this.currentCodec = null;
+        this.extradata = null;  // SPS/PPS for H.264, VPS/SPS/PPS for HEVC
+        this.decoderConfigured = false;
+        this.decoderHasDescription = false;  // 是否使用了 AVCC description
+        this.waitingForKeyframe = true;
+        this.videoChunkCount = 0;  // 帧计数器
+        
         this.resizeCanvas();
         window.addEventListener('resize', () => this.resizeCanvas());
         this.initAudioContext();
-        this.initDecoder();
     }
     
     initAudioContext() {
@@ -105,17 +112,29 @@ class WebGLVideoRenderer {
         this.ctx.fillText('WAITING FOR STREAM...', w / 2, h / 2);
     }
     
-    initDecoder(codec = 'hevc', width = 3840, height = 2160) {
+    /**
+     * 初始化视频解码器
+     * @param {string} codec - 'h264' 或 'hevc'
+     * @param {number} width - 视频宽度
+     * @param {number} height - 视频高度
+     * @param {Uint8Array} extradata - SPS/PPS 数据 (可选)
+     */
+    initDecoder(codec = 'hevc', width = 3840, height = 2160, extradata = null) {
         if (!('VideoDecoder' in window)) {
             console.error("WebCodecs API not supported");
             return;
         }
 
+        // 关闭之前的解码器
         if (this.decoder && this.decoder.state !== 'closed') {
             this.decoder.close();
         }
         
         this.pendingFrames = [];
+        this.currentCodec = codec;
+        this.extradata = extradata;
+        this.decoderConfigured = false;
+        this.waitingForKeyframe = true;
 
         this.decoder = new VideoDecoder({
             output: (frame) => {
@@ -126,36 +145,267 @@ class WebGLVideoRenderer {
                 this.pendingFrames.push(frame);
                 this.processLatestFrame();
             },
-            error: (e) => console.error("Decoder error:", e),
+            error: (e) => {
+                console.error("Decoder error:", e);
+                // 解码错误时等待下一个关键帧
+                this.waitingForKeyframe = true;
+            },
         });
 
+        // 构建 codec string
         let codecString;
-        if (codec === 'h264') {
-            const level = height > 1080 ? '5.1' : '4.0';
-            codecString = `avc1.64${level === '5.1' ? '0033' : '0028'}`;
+        if (codec === 'h264' || codec === 'avc1') {
+            // H.264/AVC codec string: avc1.PPCCLL
+            // PP=profile_idc, CC=constraint_set flags, LL=level_idc
+            // 尝试从 extradata 解析 profile/level (Annex-B SPS)
+            let profile = 0x64; // 默认 High Profile (100)
+            let constraints = 0x00;
+            let level = 0x1f; // 默认 Level 3.1
+            
+            if (extradata && extradata.length >= 8) {
+                // extradata 格式: 00 00 00 01 67 [profile] [constraints] [level] ...
+                // 找到 SPS NAL unit (type 7, 即 0x67 & 0x1F = 7)
+                for (let i = 0; i < extradata.length - 4; i++) {
+                    if (extradata[i] === 0 && extradata[i+1] === 0 && 
+                        extradata[i+2] === 0 && extradata[i+3] === 1) {
+                        const nalType = extradata[i+4] & 0x1F;
+                        if (nalType === 7 && i + 7 < extradata.length) {
+                            // SPS: profile_idc, constraint_set_flags, level_idc
+                            profile = extradata[i+5];
+                            constraints = extradata[i+6];
+                            level = extradata[i+7];
+                            console.log(`📊 从 SPS 解析: profile=${profile.toString(16)}, constraints=${constraints.toString(16)}, level=${level.toString(16)}`);
+                            break;
+                        }
+                    }
+                }
+            }
+            
+            // 构建 codec string
+            codecString = `avc1.${profile.toString(16).padStart(2, '0')}${constraints.toString(16).padStart(2, '0')}${level.toString(16).padStart(2, '0')}`;
+            console.log(`📊 H.264 codec string: ${codecString}`);
+            
+        } else if (codec === 'hevc' || codec === 'hvc1' || codec === 'hev1') {
+            // HEVC/H.265 codec string
+            // hvc1.P.T.Lxx.Cx - P=profile, T=tier, Lxx=level, Cx=constraints
+            if (height > 2160) {
+                codecString = 'hvc1.1.6.L186.B0'; // Main Profile Level 6.2 (8K)
+            } else if (height > 1080) {
+                codecString = 'hvc1.1.6.L153.B0'; // Main Profile Level 5.1 (4K)
+            } else {
+                codecString = 'hvc1.1.6.L120.B0'; // Main Profile Level 4.0 (1080p)
+            }
         } else {
-            const level = height > 2160 ? 'L156' : (height > 1080 ? 'L153' : 'L120');
-            codecString = `hvc1.1.6.${level}.B0`;
+            console.error(`不支持的编解码器: ${codec}`);
+            return;
         }
         
         const config = {
             codec: codecString,
             codedWidth: width,
             codedHeight: height,
+            optimizeForLatency: true,  // 优化延迟
         };
+        
+        // 如果有 extradata，添加到配置中
+        if (extradata && extradata.length > 0) {
+            if (codec === 'h264' || codec === 'avc1') {
+                // H.264: 检查 extradata 格式：Annex-B (以 00 00 00 01 开头) 或 AVCC (version byte = 1)
+                const isAnnexB = extradata[0] === 0 && extradata[1] === 0 && 
+                                ((extradata[2] === 0 && extradata[3] === 1) || extradata[2] === 1);
+                const isAVCC = extradata[0] === 1;  // AVCC extradata 版本字节 = 1
+                
+                if (isAnnexB) {
+                    // 将 Annex-B 格式的 extradata 转换为 AVCC 格式
+                    const avccData = this.annexBToAvcc(extradata);
+                    if (avccData) {
+                        config.description = avccData;
+                        console.log(`📦 H.264 AVCC description (from Annex-B): ${avccData.length} bytes`);
+                    }
+                } else if (isAVCC) {
+                    // extradata 已经是 AVCC 格式，直接使用
+                    config.description = extradata;
+                    console.log(`📦 H.264 AVCC description (native): ${extradata.length} bytes`);
+                }
+            } else if (codec === 'hevc' || codec === 'hvc1' || codec === 'hev1') {
+                // HEVC: 检查 extradata 格式：Annex-B (以 00 00 00 01 开头) 或 HVCC (version byte = 1)
+                const isAnnexB = extradata[0] === 0 && extradata[1] === 0 && 
+                                ((extradata[2] === 0 && extradata[3] === 1) || extradata[2] === 1);
+                const isHVCC = extradata[0] === 1;  // HVCC extradata 版本字节 = 1
+                
+                if (isAnnexB) {
+                    // Annex-B 格式需要转换为 HVCC (较复杂，暂不实现)
+                    console.log(`⚠️ HEVC Annex-B extradata detected, conversion not yet implemented`);
+                    // 可以尝试不带 description 解码
+                } else if (isHVCC) {
+                    // extradata 已经是 HVCC 格式，直接使用
+                    config.description = extradata;
+                    console.log(`📦 HEVC HVCC description (native): ${extradata.length} bytes`);
+                }
+            }
+        }
         
         console.log(`🎬 Configuring decoder: ${codec.toUpperCase()} ${width}x${height}`);
         console.log(`   Codec string: ${codecString}`);
+        console.log(`   Has description: ${!!config.description}`);
+        if (extradata && extradata.length > 0) {
+            console.log(`   Extradata header: [${Array.from(extradata.slice(0, 8)).join(',')}]`);
+        }
         
         VideoDecoder.isConfigSupported(config).then((support) => {
             if (support.supported) {
                 console.log(`✅ ${codec.toUpperCase()} ${width}x${height} Decoding Supported`);
-                this.decoder.configure(config);
+                try {
+                    this.decoder.configure(config);
+                    this.decoderConfigured = true;
+                    this.decoderHasDescription = !!config.description;
+                    console.log(`✅ Decoder configured successfully (description=${this.decoderHasDescription})`);
+                } catch (e) {
+                    console.error(`❌ Decoder configure failed:`, e);
+                    this.decoderHasDescription = false;
+                }
             } else {
                 console.error(`❌ ${codec.toUpperCase()} ${width}x${height} NOT Supported`);
-                alert(`您的浏览器不支持 ${codec.toUpperCase()} ${width}x${height} 解码。`);
+                // 尝试不带 description 的配置
+                if (config.description) {
+                    console.log('🔄 Retrying without description...');
+                    delete config.description;
+                    VideoDecoder.isConfigSupported(config).then((support2) => {
+                        if (support2.supported) {
+                            this.decoder.configure(config);
+                            this.decoderConfigured = true;
+                            this.decoderHasDescription = false;
+                            console.log(`✅ Decoder configured (without description)`);
+                        }
+                    });
+                }
             }
+        }).catch(e => {
+            console.error(`❌ isConfigSupported error:`, e);
+            this.decoderHasDescription = false;
         });
+    }
+    
+    /**
+     * 将 Annex-B 格式的 SPS/PPS 转换为 AVCC 格式
+     * Annex-B: 00 00 00 01 [SPS] 00 00 00 01 [PPS]
+     * AVCC: [header] [SPS count] [SPS len] [SPS] [PPS count] [PPS len] [PPS]
+     */
+    annexBToAvcc(annexB) {
+        // 解析 Annex-B 中的 NAL units
+        const nalUnits = [];
+        let i = 0;
+        
+        while (i < annexB.length) {
+            // 查找起始码 00 00 00 01 或 00 00 01
+            if (i + 3 < annexB.length && 
+                annexB[i] === 0 && annexB[i+1] === 0 && annexB[i+2] === 0 && annexB[i+3] === 1) {
+                i += 4;
+            } else if (i + 2 < annexB.length && 
+                annexB[i] === 0 && annexB[i+1] === 0 && annexB[i+2] === 1) {
+                i += 3;
+            } else {
+                i++;
+                continue;
+            }
+            
+            // 找到下一个起始码或结束
+            let end = i;
+            while (end < annexB.length) {
+                if (end + 3 < annexB.length && 
+                    annexB[end] === 0 && annexB[end+1] === 0 && annexB[end+2] === 0 && annexB[end+3] === 1) {
+                    break;
+                }
+                if (end + 2 < annexB.length && 
+                    annexB[end] === 0 && annexB[end+1] === 0 && annexB[end+2] === 1) {
+                    break;
+                }
+                end++;
+            }
+            
+            if (end > i) {
+                nalUnits.push(annexB.slice(i, end));
+            }
+            i = end;
+        }
+        
+        // 分离 SPS 和 PPS
+        const spsList = [];
+        const ppsList = [];
+        
+        for (const nalu of nalUnits) {
+            if (nalu.length === 0) continue;
+            const nalType = nalu[0] & 0x1F;
+            if (nalType === 7) { // SPS
+                spsList.push(nalu);
+                console.log(`📊 Found SPS: ${nalu.length} bytes`);
+            } else if (nalType === 8) { // PPS
+                ppsList.push(nalu);
+                console.log(`📊 Found PPS: ${nalu.length} bytes`);
+            }
+        }
+        
+        if (spsList.length === 0 || ppsList.length === 0) {
+            console.warn('⚠️ Missing SPS or PPS in extradata');
+            return null;
+        }
+        
+        const sps = spsList[0];
+        
+        // 构建 AVCC 格式
+        // [0] version = 1
+        // [1] profile_idc
+        // [2] profile_compatibility
+        // [3] level_idc
+        // [4] 0xFF (6 bits reserved + 2 bits NAL length size - 1 = 3)
+        // [5] 0xE0 | num_sps (3 bits reserved + 5 bits SPS count)
+        // [6-7] SPS length (big-endian)
+        // [...] SPS data
+        // [n] num_pps
+        // [n+1, n+2] PPS length (big-endian)
+        // [...] PPS data
+        
+        let totalSize = 6; // header
+        for (const s of spsList) {
+            totalSize += 2 + s.length;
+        }
+        totalSize += 1; // PPS count
+        for (const p of ppsList) {
+            totalSize += 2 + p.length;
+        }
+        
+        const avcc = new Uint8Array(totalSize);
+        let offset = 0;
+        
+        // Header
+        avcc[offset++] = 1; // version
+        avcc[offset++] = sps[1]; // profile_idc
+        avcc[offset++] = sps[2]; // profile_compatibility
+        avcc[offset++] = sps[3]; // level_idc
+        avcc[offset++] = 0xFF; // NAL length size = 4
+        avcc[offset++] = 0xE0 | spsList.length; // SPS count
+        
+        // SPS entries
+        for (const s of spsList) {
+            avcc[offset++] = (s.length >> 8) & 0xFF;
+            avcc[offset++] = s.length & 0xFF;
+            avcc.set(s, offset);
+            offset += s.length;
+        }
+        
+        // PPS count
+        avcc[offset++] = ppsList.length;
+        
+        // PPS entries
+        for (const p of ppsList) {
+            avcc[offset++] = (p.length >> 8) & 0xFF;
+            avcc[offset++] = p.length & 0xFF;
+            avcc.set(p, offset);
+            offset += p.length;
+        }
+        
+        console.log(`📦 AVCC created: ${avcc.length} bytes (SPS: ${spsList.length}, PPS: ${ppsList.length})`);
+        return avcc;
     }
     
     initAudioDecoder(codec = 'aac', sampleRate = 48000, channels = 2) {
@@ -245,27 +495,260 @@ class WebGLVideoRenderer {
         this.nextAudioTime += buffer.duration;
     }
 
-    handleVideoChunk(data) {
+    handleVideoChunk(data, isKeyframe = true, pts = 0) {
         if (!this.isRunning) {
             console.warn('Received video chunk but renderer not running');
             return;
         }
-        if (!this.decoder || this.decoder.state !== 'configured') {
-            console.warn('Decoder not ready, state:', this.decoder?.state);
+        
+        if (!this.decoder) {
+            console.warn('Decoder not initialized');
             return;
         }
         
+        if (this.decoder.state !== 'configured') {
+            if (this.decoder.state === 'closed') {
+                console.warn('Decoder is closed, need re-initialization');
+                return;
+            }
+            // 等待配置完成
+            if (!this.decoderConfigured) {
+                console.warn('Decoder not configured yet, waiting...');
+                return;
+            }
+        }
+        
+        // 如果正在等待关键帧，丢弃非关键帧
+        if (this.waitingForKeyframe && !isKeyframe) {
+            if (this.videoChunkCount % 100 === 0) {
+                console.log(`⏳ Waiting for keyframe, dropped ${this.videoChunkCount} frames`);
+            }
+            this.videoChunkCount = (this.videoChunkCount || 0) + 1;
+            return;
+        }
+        
+        // 检测帧数据格式
+        const isInputAnnexB = data.length >= 4 && 
+            ((data[0] === 0 && data[1] === 0 && data[2] === 0 && data[3] === 1) ||
+             (data[0] === 0 && data[1] === 0 && data[2] === 1));
+        
+        // 检测帧中是否包含 IDR (对于 HEVC 没有 description 的情况需要这个)
+        let detectedKeyframe = isKeyframe;
+        if (!isKeyframe && isInputAnnexB) {
+            detectedKeyframe = this.detectKeyframeInAnnexB(data);
+        }
+        
+        // 收到关键帧，清除等待状态
+        if (detectedKeyframe && this.waitingForKeyframe) {
+            this.waitingForKeyframe = false;
+            const header = Array.from(data.slice(0, Math.min(16, data.length)));
+            console.log(`🔑 Keyframe detected, size=${data.length}, header=[${header.join(',')}]`);
+            console.log(`   Input format: ${isInputAnnexB ? 'Annex-B' : 'AVCC'}, hasDescription: ${this.decoderHasDescription}`);
+        }
+        
+        // 准备帧数据
+        let frameData = data;
+        
+        if (this.decoderHasDescription) {
+            // 解码器使用 AVCC/HVCC description，帧数据需要是 AVCC 格式
+            if (isInputAnnexB) {
+                frameData = this.annexBFrameToAvcc(data);
+                if (this.videoChunkCount < 3) {
+                    console.log(`🔄 Annex-B → AVCC: ${data.length} → ${frameData.length} bytes`);
+                }
+            }
+        } else {
+            // 解码器没有 description
+            // 对于关键帧，需要在前面拼接 extradata (VPS/SPS/PPS)
+            if (detectedKeyframe && this.extradata && this.extradata.length > 0 && isInputAnnexB) {
+                // 检查帧数据是否已经包含参数集
+                if (!this.hasParameterSets(data)) {
+                    // 拼接 extradata + 帧数据
+                    const combined = new Uint8Array(this.extradata.length + data.length);
+                    combined.set(this.extradata, 0);
+                    combined.set(data, this.extradata.length);
+                    frameData = combined;
+                    if (this.videoChunkCount < 5) {
+                        console.log(`📦 Prepended extradata: ${this.extradata.length} + ${data.length} = ${frameData.length} bytes`);
+                    }
+                }
+            }
+        }
+        
+        this.videoChunkCount = (this.videoChunkCount || 0) + 1;
+        
+        // 使用 pts 作为时间戳
+        const timestamp = pts > 0 ? pts : performance.now() * 1000;
+        
         const chunk = new EncodedVideoChunk({
-            type: 'key',
-            timestamp: performance.now() * 1000,
-            data: data
+            type: detectedKeyframe ? 'key' : 'delta',
+            timestamp: timestamp,
+            data: frameData
         });
         
         try {
             this.decoder.decode(chunk);
         } catch(e) {
-            console.error('Video decode error:', e);
+            console.error('Video decode error:', e, 'frame size:', frameData.length);
+            // 解码错误时等待下一个关键帧
+            this.waitingForKeyframe = true;
         }
+    }
+    
+    /**
+     * 检测 Annex-B 数据中是否包含关键帧
+     */
+    detectKeyframeInAnnexB(data) {
+        const isHevc = this.currentCodec === 'hevc' || this.currentCodec === 'hvc1' || this.currentCodec === 'hev1';
+        
+        let i = 0;
+        while (i + 4 < data.length) {
+            // 查找起始码
+            if (data[i] === 0 && data[i + 1] === 0) {
+                let startCodeLen = 0;
+                if (data[i + 2] === 0 && data[i + 3] === 1) {
+                    startCodeLen = 4;
+                } else if (data[i + 2] === 1) {
+                    startCodeLen = 3;
+                }
+                
+                if (startCodeLen > 0 && i + startCodeLen < data.length) {
+                    const nalByte = data[i + startCodeLen];
+                    
+                    if (isHevc) {
+                        // HEVC: NAL type = (byte >> 1) & 0x3F
+                        const nalType = (nalByte >> 1) & 0x3F;
+                        // IDR: 16-21, VPS/SPS/PPS: 32-34
+                        if ((nalType >= 16 && nalType <= 21) || (nalType >= 32 && nalType <= 34)) {
+                            return true;
+                        }
+                    } else {
+                        // H.264: NAL type = byte & 0x1F
+                        const nalType = nalByte & 0x1F;
+                        // IDR: 5, SPS: 7, PPS: 8
+                        if (nalType === 5 || nalType === 7 || nalType === 8) {
+                            return true;
+                        }
+                    }
+                    i += startCodeLen;
+                    continue;
+                }
+            }
+            i++;
+        }
+        return false;
+    }
+    
+    /**
+     * 检查帧数据中是否已包含参数集 (VPS/SPS/PPS)
+     */
+    hasParameterSets(data) {
+        const isHevc = this.currentCodec === 'hevc' || this.currentCodec === 'hvc1' || this.currentCodec === 'hev1';
+        
+        let i = 0;
+        while (i + 4 < data.length) {
+            if (data[i] === 0 && data[i + 1] === 0) {
+                let startCodeLen = 0;
+                if (data[i + 2] === 0 && data[i + 3] === 1) {
+                    startCodeLen = 4;
+                } else if (data[i + 2] === 1) {
+                    startCodeLen = 3;
+                }
+                
+                if (startCodeLen > 0 && i + startCodeLen < data.length) {
+                    const nalByte = data[i + startCodeLen];
+                    
+                    if (isHevc) {
+                        const nalType = (nalByte >> 1) & 0x3F;
+                        // VPS: 32, SPS: 33, PPS: 34
+                        if (nalType >= 32 && nalType <= 34) {
+                            return true;
+                        }
+                    } else {
+                        const nalType = nalByte & 0x1F;
+                        // SPS: 7, PPS: 8
+                        if (nalType === 7 || nalType === 8) {
+                            return true;
+                        }
+                    }
+                    i += startCodeLen;
+                    continue;
+                }
+            }
+            i++;
+        }
+        return false;
+    }
+    
+    /**
+     * 将 Annex-B 格式的帧数据转换为 AVCC 格式
+     * Annex-B: [00 00 00 01][NALU]... 或 [00 00 01][NALU]...
+     * AVCC: [4字节长度][NALU]...
+     */
+    annexBFrameToAvcc(annexB) {
+        const nalus = [];
+        let i = 0;
+        
+        while (i < annexB.length) {
+            // 查找起始码
+            let startCodeLen = 0;
+            if (i + 4 <= annexB.length && 
+                annexB[i] === 0 && annexB[i+1] === 0 && annexB[i+2] === 0 && annexB[i+3] === 1) {
+                startCodeLen = 4;
+            } else if (i + 3 <= annexB.length && 
+                annexB[i] === 0 && annexB[i+1] === 0 && annexB[i+2] === 1) {
+                startCodeLen = 3;
+            }
+            
+            if (startCodeLen === 0) {
+                i++;
+                continue;
+            }
+            
+            i += startCodeLen;
+            const naluStart = i;
+            
+            // 找到下一个起始码或数据结束
+            while (i < annexB.length) {
+                if (i + 4 <= annexB.length && 
+                    annexB[i] === 0 && annexB[i+1] === 0 && annexB[i+2] === 0 && annexB[i+3] === 1) {
+                    break;
+                }
+                if (i + 3 <= annexB.length && 
+                    annexB[i] === 0 && annexB[i+1] === 0 && annexB[i+2] === 1) {
+                    break;
+                }
+                i++;
+            }
+            
+            if (i > naluStart) {
+                nalus.push(annexB.slice(naluStart, i));
+            }
+        }
+        
+        // 计算总大小: 每个 NALU 有 4 字节长度前缀
+        let totalSize = 0;
+        for (const nalu of nalus) {
+            totalSize += 4 + nalu.length;
+        }
+        
+        // 构建 AVCC 格式数据
+        const avcc = new Uint8Array(totalSize);
+        let offset = 0;
+        
+        for (const nalu of nalus) {
+            // 写入 4 字节长度 (大端序)
+            const len = nalu.length;
+            avcc[offset++] = (len >> 24) & 0xFF;
+            avcc[offset++] = (len >> 16) & 0xFF;
+            avcc[offset++] = (len >> 8) & 0xFF;
+            avcc[offset++] = len & 0xFF;
+            // 写入 NALU 数据
+            avcc.set(nalu, offset);
+            offset += nalu.length;
+        }
+        
+        return avcc;
     }
     
     handleAudioChunk(data) {
@@ -766,23 +1249,8 @@ function showStatus(message, duration = 3000) {
     }, duration);
 }
 
-// 解码模式选择
-const decodeModeSelect = document.getElementById('decode-mode');
-let currentDecodeMode = 'frontend'; // 默认前端解码
-let zeroCopyRenderer = null; // 零拷贝渲染器实例
-let wgpuActive = false; // wgpu 渲染状态
-
-// 监听解码模式变更
-decodeModeSelect?.addEventListener('change', (e) => {
-    currentDecodeMode = e.target.value;
-    const modeNames = {
-        'frontend': '前端硬解 (WebCodecs)',
-        'backend': '后端硬解 (共享内存)',
-        'zerocopy': '零拷贝 NV12 (WebGL)',
-        'wgpu': 'wgpu GPU 渲染'
-    };
-    console.log(`🎬 解码模式切换为: ${modeNames[currentDecodeMode]}`);
-});
+// 解码模式：固定使用前端 WebCodecs 解码
+const currentDecodeMode = 'frontend';
 
 startBtn.addEventListener('click', async () => {
     const url = rtspInput.value.trim();
@@ -793,98 +1261,101 @@ startBtn.addEventListener('click', async () => {
     
     try {
         startBtn.disabled = true;
-        const modeNames = {
-            'frontend': '前端 WebCodecs',
-            'backend': '后端共享内存',
-            'zerocopy': '零拷贝 NV12',
-            'wgpu': 'wgpu GPU',
-            'native': '原生窗口 wgpu'
-        };
-        showStatus(`🚀 正在启动 (${modeNames[currentDecodeMode]})...`);
+        showStatus('🚀 正在启动 (WebCodecs 解码)...');
         
-        if (currentDecodeMode === 'native') {
-            // 原生窗口 wgpu 渲染模式 - 会弹出独立窗口
-            console.log('🖥️ 启动原生窗口 wgpu 渲染模式');
-            
-            // 启动 RTSP 流 + 原生窗口渲染
-            const result = await invoke('start_rtsp_stream_native', { url });
-            console.log(result);
-            
-            wgpuActive = true;
-            showStatus('✅ 监控已启动 (原生窗口)');
-            
-        } else if (currentDecodeMode === 'wgpu') {
-            // wgpu GPU 渲染模式
-            console.log('🎮 启动 wgpu GPU 渲染模式');
-            
-            // 隐藏 canvas，让 wgpu 渲染可见
-            canvas.style.display = 'none';
-            document.body.classList.add('wgpu-mode');
-            
-            // 启动 wgpu 渲染器
-            await invoke('start_wgpu_render');
-            
-            // 启动 RTSP 流（后端硬解 + wgpu 渲染）
-            const result = await invoke('start_rtsp_stream_wgpu', { url });
-            console.log(result);
-            
-            wgpuActive = true;
-            showStatus('✅ 监控已启动 (wgpu GPU 渲染)');
-            
-        } else if (currentDecodeMode === 'zerocopy') {
-            // 零拷贝 NV12 渲染模式
-            if (!zeroCopyRenderer) {
-                zeroCopyRenderer = new ZeroCopyRenderer(canvas);
+        // 前端 WebCodecs 解码模式
+        // 使用 InvokeResponseBody: Json (配置) 或 Raw (视频数据)
+        const onData = new Channel();
+        let packetCount = 0;
+        
+        onData.onmessage = (response) => {
+            // 调试：首次收到数据时打印类型
+            if (packetCount < 5) {
+                console.log(`📨 收到数据 #${packetCount}:`, typeof response, response?.constructor?.name, 
+                    response instanceof ArrayBuffer ? `ArrayBuffer(${response.byteLength})` :
+                    response instanceof Uint8Array ? `Uint8Array(${response.length})` :
+                    Array.isArray(response) ? `Array(${response.length})` :
+                    typeof response === 'string' ? `String(${response.length})` : 
+                    typeof response === 'object' ? JSON.stringify(response).slice(0, 100) : 'unknown');
             }
-            await zeroCopyRenderer.start(url, 'qsv', 3840, 2160);
-            showStatus('✅ 监控已启动 (零拷贝 NV12 模式)');
+            packetCount++;
             
-        } else if (currentDecodeMode === 'backend') {
-            // 后端硬件解码 + Channel 事件驱动模式
-            const onFrame = new Channel();
-            
-            // 设置帧就绪信号处理
-            renderer.startHardwareDecodeMode(onFrame);
-            
-            const result = await invoke('start_rtsp_stream', { 
-                url,
-                hardwareDecode: true,
-                onFrame  // 传入 Channel
-            });
-            console.log(result);
-            
-            showStatus('✅ 监控已启动 (后端硬解)');
-            
-        } else {
-            // 前端 WebCodecs 解码模式
-            const onData = new Channel();
-            onData.onmessage = (message) => {
+            // InvokeResponseBody::Json 在前端被自动解析为对象
+            if (typeof response === 'object' && response !== null && response.type) {
+                // JSON 对象响应 (视频配置等)
+                const message = response;
+                console.log('📦 收到配置:', message.type);
+                
                 if (message.type === 'video_config') {
-                    const { codec, width, height } = message;
+                    const { codec, width, height, extradata } = message;
                     console.log(`🎬 [Video Config] ${codec.toUpperCase()} ${width}x${height}`);
-                    renderer.initDecoder(codec, width, height);
-                    syncOverlayToCanvas(width, height);
+                    
+                    // 将 extradata 数组转为 Uint8Array
+                    let extradataBytes = null;
+                    if (extradata && extradata.length > 0) {
+                        extradataBytes = new Uint8Array(extradata);
+                        console.log(`📦 Extradata: ${extradataBytes.length} bytes`);
+                    }
+                    
+                    renderer.initDecoder(codec, width, height, extradataBytes);
+                    if (typeof syncOverlayToCanvas === 'function') {
+                        syncOverlayToCanvas(width, height);
+                    }
                 } else if (message.type === 'audio_config') {
                     const { codec, sample_rate, channels } = message;
                     console.log(`🎵 [Audio Config] ${codec} ${sample_rate}Hz ${channels}ch`);
                     renderer.initAudioDecoder(codec, sample_rate, channels);
-                } else if (message.type === 'video') {
-                    renderer.handleVideoChunk(message.data);
-                } else if (message.type === 'audio') {
-                    renderer.handleAudioChunk(message.data);
                 }
-            };
-            
-            const result = await invoke('start_rtsp_stream', { 
-                url, 
-                onData,
-                hardwareDecode: false
-            });
-            console.log(result);
-            
-            renderer.start();
-            showStatus('✅ 监控已启动 (前端 WebCodecs)');
-        }
+            } else if (response instanceof ArrayBuffer) {
+                // InvokeResponseBody::Raw 在前端是 ArrayBuffer
+                const data = new Uint8Array(response);
+                
+                if (data.length < 30) {
+                    console.warn('数据包太小:', data.length);
+                    return;
+                }
+                
+                const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+                const packetType = data[0]; // 1=video, 2=audio
+                const isKeyframe = data[1] === 1;
+                const pts = Number(view.getBigInt64(2, true));  // 提取 PTS
+                const dataLen = view.getUint32(26, true);
+                const encodedData = data.slice(30, 30 + dataLen);
+                
+                if (packetType === 1) {
+                    renderer.handleVideoChunk(encodedData, isKeyframe, pts);
+                } else if (packetType === 2) {
+                    renderer.handleAudioChunk(encodedData);
+                }
+            } else if (typeof response === 'string') {
+                // 字符串形式的 JSON (兼容)
+                try {
+                    const message = JSON.parse(response);
+                    console.log('📦 收到 JSON 字符串:', message.type);
+                    if (message.type === 'video_config') {
+                        const { codec, width, height, extradata } = message;
+                        let extradataBytes = extradata?.length > 0 ? new Uint8Array(extradata) : null;
+                        renderer.initDecoder(codec, width, height, extradataBytes);
+                    }
+                } catch (e) {
+                    console.error('解析 JSON 失败:', e);
+                }
+            } else {
+                console.warn('未知响应类型:', typeof response, response);
+            }
+        };
+        
+        // 启动渲染器
+        renderer.start();
+        
+        // Tauri 2.0 自动将 Rust 的 snake_case 转为 camelCase
+        const result = await invoke('start_rtsp_stream', { 
+            url, 
+            onData
+        });
+        console.log(result);
+        
+        showStatus('✅ 监控已启动 (WebCodecs)');
         
         try {
             await invoke('add_rtsp_history', { url });
@@ -896,7 +1367,6 @@ startBtn.addEventListener('click', async () => {
         startBtn.classList.add('hidden');
         stopBtn.classList.remove('hidden');
         rtspInput.disabled = true;
-        decodeModeSelect.disabled = true;
     } catch (err) {
         console.error('启动失败:', err);
         showStatus('❌ 启动失败: ' + err);
@@ -905,35 +1375,22 @@ startBtn.addEventListener('click', async () => {
 });
 
 stopBtn.addEventListener('click', async () => {
-    if (frameDetector.isDetecting) {
-        await frameDetector.stopDetector();
-    }
-    
-    // 停止对应的渲染器
-    if (wgpuActive && currentDecodeMode === 'native') {
-        // 原生窗口模式
-        await invoke('stop_rtsp_stream_native');
-        wgpuActive = false;
-    } else if (wgpuActive && currentDecodeMode === 'wgpu') {
-        await invoke('stop_wgpu_render');
-        await invoke('stop_rtsp_stream');
-        wgpuActive = false;
-        
-        // 恢复 canvas 显示
-        canvas.style.display = '';
-        document.body.classList.remove('wgpu-mode');
-    } else if (zeroCopyRenderer && currentDecodeMode === 'zerocopy') {
-        await zeroCopyRenderer.stop();
-    } else {
+    try {
+        // 停止渲染器
         renderer.stop();
+        
+        // 停止后端 RTSP 流
+        await invoke('stop_rtsp_stream');
+        
+        stopBtn.classList.add('hidden');
+        startBtn.classList.remove('hidden');
+        startBtn.disabled = false;
+        rtspInput.disabled = false;
+        showStatus('⏹ 监控已停止');
+    } catch (e) {
+        console.error('停止失败:', e);
+        showStatus('❌ 停止失败: ' + e);
     }
-    
-    stopBtn.classList.add('hidden');
-    startBtn.classList.remove('hidden');
-    startBtn.disabled = false;
-    rtspInput.disabled = false;
-    decodeModeSelect.disabled = false;
-    showStatus('⏹ 监控已停止');
 });
 
 // 暴露到全局方便调试

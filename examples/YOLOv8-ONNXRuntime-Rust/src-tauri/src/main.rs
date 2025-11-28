@@ -6,12 +6,12 @@ mod llm_inference;
 mod xbus;
 
 use demuxer::{DemuxerConfig, DemuxerHandle, EncodedPacket, StreamMetadata};
-use llm_inference::{LlmConfig, LlmInferenceState, StreamChunk};
+use llm_inference::{LlmConfig, LlmInferenceState};
 use parking_lot::RwLock;
 use serde::Serialize;
 use std::panic;
 use std::sync::Arc;
-use tauri::ipc::Channel;
+use tauri::ipc::{Channel, InvokeBody, InvokeResponseBody, Request};
 use tauri::window::Color;
 use tauri::{AppHandle, Manager};
 
@@ -56,42 +56,75 @@ pub enum StreamMessage {
 /// 启动 RTSP 流 (WebCodecs 模式)
 ///
 /// 后端只做解复用，发送编码数据给前端，由前端 WebCodecs 解码
+/// 使用 InvokeResponseBody 支持高效传输：
+/// - Json: 视频配置等结构化数据
+/// - Raw: 编码视频数据包 (避免 JSON 序列化开销)
 #[tauri::command]
 async fn start_rtsp_stream(
     app: AppHandle,
     url: String,
-    on_data: Channel<StreamMessage>,
+    on_data: Channel<InvokeResponseBody>,
 ) -> Result<String, String> {
     println!("🚀 启动 RTSP 流 (WebCodecs 模式): {}", url);
 
     let demuxer_state = app.state::<DemuxerState>();
 
-    // 元数据回调：发送视频配置
+    // 元数据回调：发送视频配置 (JSON)
     let on_data_meta = on_data.clone();
     let metadata_callback = Arc::new(move |meta: StreamMetadata| {
         println!(
             "📹 视频流元数据: {} {}x{} @ {:.2} fps",
             meta.codec, meta.width, meta.height, meta.fps
         );
-        let _ = on_data_meta.send(StreamMessage::Config(VideoConfigMessage {
+        let config_msg = VideoConfigMessage {
             r#type: "video_config".to_string(),
             codec: meta.codec,
             width: meta.width,
             height: meta.height,
             extradata: meta.extradata,
-        }));
+        };
+        // 配置信息用 JSON 发送
+        let _ = on_data_meta.send(InvokeResponseBody::Json(
+            serde_json::to_string(&config_msg).unwrap_or_default(),
+        ));
     });
 
-    // 数据包回调：发送编码数据
+    // 数据包回调：发送编码数据 (Raw 二进制)
     let packet_callback = Arc::new(move |packet: EncodedPacket| {
-        let _ = on_data.send(StreamMessage::Data(VideoDataMessage {
-            r#type: "video".to_string(),
-            data: packet.data,
-            is_keyframe: packet.is_keyframe,
-            pts: packet.pts,
-            dts: packet.dts,
-            packet_id: packet.packet_id,
-        }));
+        // 构建高效的二进制包格式:
+        // [0]     : type (1=video, 2=audio)
+        // [1]     : is_keyframe (0/1)
+        // [2..10] : pts (i64, little-endian)
+        // [10..18]: dts (i64, little-endian)
+        // [18..26]: packet_id (u64, little-endian)
+        // [26..30]: data_len (u32, little-endian)
+        // [30..]  : data
+
+        let header_size = 30;
+        let total_size = header_size + packet.data.len();
+        let mut buffer = vec![0u8; total_size];
+
+        buffer[0] = 1; // type: video
+        buffer[1] = if packet.is_keyframe { 1 } else { 0 };
+        buffer[2..10].copy_from_slice(&packet.pts.to_le_bytes());
+        buffer[10..18].copy_from_slice(&packet.dts.to_le_bytes());
+        buffer[18..26].copy_from_slice(&packet.packet_id.to_le_bytes());
+        buffer[26..30].copy_from_slice(&(packet.data.len() as u32).to_le_bytes());
+        buffer[30..].copy_from_slice(&packet.data);
+
+        // 首包打印日志
+        if packet.packet_id == 1 {
+            println!(
+                "📦 发送首个视频包: keyframe={}, size={} bytes",
+                packet.is_keyframe, total_size
+            );
+        }
+
+        // 使用 Raw 发送二进制数据，避免 JSON 序列化开销
+        let result = on_data.send(InvokeResponseBody::Raw(buffer));
+        if packet.packet_id == 1 {
+            println!("📤 Channel 发送结果: {:?}", result);
+        }
     });
 
     let config = DemuxerConfig {
@@ -205,11 +238,15 @@ async fn read_text_file(path: String) -> Result<String, String> {
 // ==================== LLM 推理命令 ====================
 
 /// 启动 LLM 视频推理
+///
+/// result_channel 使用 InvokeResponseBody 支持高效传输：
+/// - Json: 结构化数据 (StreamChunk)
+/// - Raw: 二进制数据 (如需要返回处理后的图像)
 #[tauri::command]
 async fn start_llm_inference(
     app: AppHandle,
     config: LlmConfig,
-    result_channel: Channel<StreamChunk>,
+    result_channel: Channel<InvokeResponseBody>,
 ) -> Result<String, String> {
     println!("🤖 启动 LLM 推理: model={}", config.model);
 
@@ -238,6 +275,54 @@ async fn update_llm_config(app: AppHandle, config: LlmConfig) -> Result<(), Stri
     let llm_state = app.state::<LlmInferenceState>();
     llm_state.update_config(config);
     Ok(())
+}
+/// 接收前端传来的 RGBA 视频帧进行 LLM 推理
+///
+/// 前端通过 Raw body 传递 RGBA 数据，格式：
+/// - 前 16 字节: header (width: u32, height: u32, frame_id: u64)
+/// - 剩余字节: RGBA 像素数据 (width * height * 4)
+#[tauri::command]
+async fn submit_frame_for_llm(app: AppHandle, request: Request<'_>) -> Result<(), String> {
+    match request.body() {
+        InvokeBody::Raw(data) => {
+            if data.len() < 16 {
+                return Err("数据太短，缺少 header".to_string());
+            }
+
+            // 解析 header
+            let width = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+            let height = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+            let frame_id = u64::from_le_bytes([
+                data[8], data[9], data[10], data[11], data[12], data[13], data[14], data[15],
+            ]);
+
+            let expected_size = 16 + (width * height * 4) as usize;
+            if data.len() < expected_size {
+                return Err(format!(
+                    "数据不完整: 期望 {} 字节，实际 {} 字节",
+                    expected_size,
+                    data.len()
+                ));
+            }
+
+            let rgba_data = &data[16..expected_size];
+
+            println!(
+                "📸 收到 RGBA 帧: {}x{}, frame_id={}, 数据大小={} 字节",
+                width,
+                height,
+                frame_id,
+                rgba_data.len()
+            );
+
+            // 通知 LLM 推理模块有新帧
+            let llm_state = app.state::<LlmInferenceState>();
+            llm_state.submit_frame(width, height, frame_id, rgba_data.to_vec());
+
+            Ok(())
+        }
+        InvokeBody::Json(_) => Err("请使用 Raw body 传递 RGBA 数据".to_string()),
+    }
 }
 
 // ==================== 主函数 ====================
@@ -280,6 +365,7 @@ fn main() {
             stop_llm_inference,
             get_llm_status,
             update_llm_config,
+            submit_frame_for_llm,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

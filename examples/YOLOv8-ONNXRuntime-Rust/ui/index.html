@@ -620,22 +620,6 @@
                     <div id="history-dropdown"></div>
                 </div>
                 
-                <!-- 解码模式选择 -->
-                <div class="settings-section" style="padding: 10px 14px;">
-                    <div class="settings-row">
-                        <div class="settings-label">
-                            <span class="icon">🎬</span> 解码
-                        </div>
-                        <select id="decode-mode">
-                            <option value="frontend">🌐 前端硬解 (WebCodecs)</option>
-                            <option value="backend">⚡ 后端硬解 (共享内存)</option>
-                            <option value="zerocopy">🚀 零拷贝 NV12 (WebGL)</option>
-                            <option value="wgpu">🎮 wgpu GPU 渲染</option>
-                            <option value="native">🖥️ 原生窗口 (wgpu)</option>
-                        </select>
-                    </div>
-                </div>
-                
                 <!-- 流控制按钮 -->
                 <div class="btn-group">
                     <button id="start-btn" class="btn btn-primary">

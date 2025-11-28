@@ -7,18 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tauri::ipc::Channel;
-
-use crate::xbus::{self, Subscription};
-
-/// RGBA 帧就绪事件 (用于 xbus 通信)
-#[derive(Clone, Debug)]
-pub struct RgbaFrameReadyEvent {
-    pub frame_id: u64,
-    pub width: u32,
-    pub height: u32,
-    pub timestamp: u64,
-}
+use tauri::ipc::{Channel, InvokeResponseBody};
 
 /// LLM 推理配置
 #[derive(Clone, Serialize, Deserialize)]
@@ -75,6 +64,7 @@ struct FrameBuffer {
     height: u32,
     frame_id: u64,
     timestamp: u64,
+    rgba_data: Vec<u8>,
     has_new_frame: bool,
 }
 
@@ -85,6 +75,7 @@ impl Default for FrameBuffer {
             height: 0,
             frame_id: 0,
             timestamp: 0,
+            rgba_data: Vec::new(),
             has_new_frame: false,
         }
     }
@@ -95,9 +86,8 @@ pub struct LlmInferenceState {
     running: Arc<AtomicBool>,
     frame_count: Arc<AtomicU64>,
     config: Arc<RwLock<LlmConfig>>,
-    result_channel: Arc<RwLock<Option<Channel<StreamChunk>>>>,
+    result_channel: Arc<RwLock<Option<Channel<InvokeResponseBody>>>>,
     frame_buffer: Arc<RwLock<FrameBuffer>>,
-    _subscriptions: Arc<RwLock<Vec<Subscription>>>,
     thread_handle: Arc<RwLock<Option<std::thread::JoinHandle<()>>>>,
 }
 
@@ -109,7 +99,6 @@ impl Default for LlmInferenceState {
             config: Arc::new(RwLock::new(LlmConfig::default())),
             result_channel: Arc::new(RwLock::new(None)),
             frame_buffer: Arc::new(RwLock::new(FrameBuffer::default())),
-            _subscriptions: Arc::new(RwLock::new(Vec::new())),
             thread_handle: Arc::new(RwLock::new(None)),
         }
     }
@@ -120,7 +109,7 @@ impl LlmInferenceState {
     pub fn start(
         &self,
         config: LlmConfig,
-        result_channel: Channel<StreamChunk>,
+        result_channel: Channel<InvokeResponseBody>,
     ) -> Result<String, String> {
         self.stop();
 
@@ -129,19 +118,6 @@ impl LlmInferenceState {
 
         self.running.store(true, Ordering::SeqCst);
         self.frame_count.store(0, Ordering::SeqCst);
-
-        // 订阅 RGBA 帧就绪事件
-        let frame_buffer = self.frame_buffer.clone();
-        let sub = xbus::subscribe::<RgbaFrameReadyEvent, _>(move |event| {
-            let mut buf = frame_buffer.write();
-            buf.frame_id = event.frame_id;
-            buf.width = event.width;
-            buf.height = event.height;
-            buf.timestamp = event.timestamp;
-            buf.has_new_frame = true;
-        });
-
-        *self._subscriptions.write() = vec![sub];
 
         // 启动推理线程
         let running = self.running.clone();
@@ -164,13 +140,19 @@ impl LlmInferenceState {
                 };
 
                 if should_analyze {
-                    let (frame_id, width, height, timestamp) = {
+                    let (frame_id, width, height, timestamp, rgba_data) = {
                         let mut buf = frame_buffer_arc.write();
                         buf.has_new_frame = false;
-                        (buf.frame_id, buf.width, buf.height, buf.timestamp)
+                        (
+                            buf.frame_id,
+                            buf.width,
+                            buf.height,
+                            buf.timestamp,
+                            buf.rgba_data.clone(),
+                        )
                     };
 
-                    if width == 0 || height == 0 {
+                    if width == 0 || height == 0 || rgba_data.is_empty() {
                         std::thread::sleep(Duration::from_millis(10));
                         continue;
                     }
@@ -181,34 +163,60 @@ impl LlmInferenceState {
                     if let Some(ref channel) = *result_channel_arc.read() {
                         let config = config_arc.read().clone();
 
-                        let _ = channel.send(StreamChunk {
+                        // 发送帧信息 (JSON)
+                        let frame_info = StreamChunk {
                             r#type: "frame_info".to_string(),
                             content: format!("分析帧 #{} ({}x{})", frame_id, width, height),
                             frame_id,
                             timestamp,
-                        });
+                        };
+                        let _ = channel.send(InvokeResponseBody::Json(
+                            serde_json::to_string(&frame_info).unwrap(),
+                        ));
 
-                        let _ = channel.send(StreamChunk {
+                        // 发送开始信号 (JSON)
+                        let start_chunk = StreamChunk {
                             r#type: "start".to_string(),
                             content: String::new(),
                             frame_id,
                             timestamp,
-                        });
+                        };
+                        let _ = channel.send(InvokeResponseBody::Json(
+                            serde_json::to_string(&start_chunk).unwrap(),
+                        ));
 
-                        // TODO: 实际 LLM 调用
-                        let _ = channel.send(StreamChunk {
+                        // TODO: 实际 LLM 调用，使用 rgba_data
+                        println!(
+                            "📸 正在分析帧 #{}, 大小: {}x{}, RGBA 数据: {} 字节",
+                            frame_id,
+                            width,
+                            height,
+                            rgba_data.len()
+                        );
+
+                        let chunk = StreamChunk {
                             r#type: "chunk".to_string(),
-                            content: format!("[待实现] 帧 #{}, 模型: {}", frame_id, config.model),
+                            content: format!(
+                                "[待实现 LLM 调用] 帧 #{}, 模型: {}, 图像尺寸: {}x{}",
+                                frame_id, config.model, width, height
+                            ),
                             frame_id,
                             timestamp,
-                        });
+                        };
+                        let _ = channel.send(InvokeResponseBody::Json(
+                            serde_json::to_string(&chunk).unwrap(),
+                        ));
 
-                        let _ = channel.send(StreamChunk {
+                        // 发送结束信号 (JSON)
+                        let end_chunk = StreamChunk {
                             r#type: "end".to_string(),
                             content: String::new(),
                             frame_id,
                             timestamp,
-                        });
+                        };
+                        let _ = channel.send(InvokeResponseBody::Json(
+                            serde_json::to_string(&end_chunk).unwrap(),
+                        ));
                     }
                 }
 
@@ -226,10 +234,23 @@ impl LlmInferenceState {
         ))
     }
 
+    /// 提交帧进行 LLM 推理
+    pub fn submit_frame(&self, width: u32, height: u32, frame_id: u64, rgba_data: Vec<u8>) {
+        let mut buf = self.frame_buffer.write();
+        buf.width = width;
+        buf.height = height;
+        buf.frame_id = frame_id;
+        buf.timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        buf.rgba_data = rgba_data;
+        buf.has_new_frame = true;
+    }
+
     /// 停止推理
     pub fn stop(&self) {
         self.running.store(false, Ordering::SeqCst);
-        self._subscriptions.write().clear();
 
         let mut handle = self.thread_handle.write();
         if let Some(h) = handle.take() {

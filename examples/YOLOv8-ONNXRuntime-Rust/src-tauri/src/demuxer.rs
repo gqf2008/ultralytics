@@ -177,6 +177,8 @@ fn run_demuxer_loop(
         _ => "unknown",
     };
 
+    let is_hevc = codec_id == ffmpeg::ffi::AVCodecID::AV_CODEC_ID_HEVC;
+
     let width = unsafe { (*codec_params.as_ptr()).width as u32 };
     let height = unsafe { (*codec_params.as_ptr()).height as u32 };
 
@@ -201,13 +203,16 @@ fn run_demuxer_loop(
         }
     };
 
+    // 打印 extradata 头部用于调试格式
+    let extradata_header: Vec<u8> = extradata.iter().take(16).cloned().collect();
     println!(
-        "[Demuxer] Stream opened: {} {}x{} @ {:.2} fps, extradata: {} bytes",
+        "[Demuxer] Stream opened: {} {}x{} @ {:.2} fps, extradata: {} bytes, header: {:?}",
         codec_name,
         width,
         height,
         fps,
-        extradata.len()
+        extradata.len(),
+        extradata_header
     );
 
     // 发送元数据
@@ -224,8 +229,11 @@ fn run_demuxer_loop(
     // 解复用循环
     let mut packet_id: u64 = 0;
 
+    println!("[Demuxer] Starting packet loop...");
+
     for (stream_idx, packet) in ictx.packets() {
         if !running.load(Ordering::SeqCst) {
+            println!("[Demuxer] Stop signal received");
             break;
         }
 
@@ -238,26 +246,46 @@ fn run_demuxer_loop(
             continue;
         }
 
-        let is_keyframe = packet.is_key();
+        // 检测关键帧：对于 HEVC，手动检查 NAL unit type
+        // 因为某些 RTSP 流中 FFmpeg 的 is_key() 可能不准确
+        let is_keyframe = if codec_name == "hevc" {
+            detect_hevc_keyframe(&data) || packet.is_key()
+        } else {
+            detect_h264_keyframe(&data) || packet.is_key()
+        };
+
         let pts = packet.pts().unwrap_or(0);
         let dts = packet.dts().unwrap_or(0);
 
-        // 转换为 Annex-B 格式
-        let annexb_data = if is_keyframe && !extradata.is_empty() {
-            let mut full_data = extradata_to_annexb(&extradata);
-            full_data.extend(avcc_to_annexb(&data));
-            full_data
-        } else {
-            avcc_to_annexb(&data)
-        };
+        // 直接发送 Annex-B 格式数据给前端 WebCodecs
+        // 前端会进行必要的格式转换
 
         packet_id += 1;
         packet_count.fetch_add(1, Ordering::SeqCst);
 
-        // 发送数据包
+        // 首包和关键帧打印详细信息
+        if packet_id == 1 || (is_keyframe && packet_id <= 5) {
+            let data_header: Vec<u8> = data.iter().take(16).cloned().collect();
+            println!(
+                "[Demuxer] Packet #{}: keyframe={}, size={} bytes, header: {:?}",
+                packet_id,
+                is_keyframe,
+                data.len(),
+                data_header
+            );
+        } else if packet_id % 100 == 0 {
+            println!(
+                "[Demuxer] Packet #{}: keyframe={}, size={} bytes",
+                packet_id,
+                is_keyframe,
+                data.len()
+            );
+        }
+
+        // 发送数据包 (原始 AVCC 格式)
         if let Some(ref callback) = config.packet_callback {
             callback(EncodedPacket {
-                data: annexb_data,
+                data: data, // 直接使用原始数据
                 is_keyframe,
                 pts,
                 dts,
@@ -270,13 +298,105 @@ fn run_demuxer_loop(
     Ok(())
 }
 
-/// AVCC 格式转 Annex-B 格式
-fn avcc_to_annexb(data: &[u8]) -> Vec<u8> {
+/// 检测 HEVC (H.265) 数据中是否包含 IDR 帧 (关键帧)
+/// 支持 Annex-B 格式 (00 00 00 01 起始码)
+fn detect_hevc_keyframe(data: &[u8]) -> bool {
+    // HEVC NAL unit type 位于第一个字节的 bit 1-6
+    // IDR 帧类型:
+    // - 19 (IDR_W_RADL): IDR with RADL pictures
+    // - 20 (IDR_N_LP): IDR without leading pictures
+    // - 16-18 (BLA): Broken Link Access
+    // VPS/SPS/PPS 也算作关键帧的一部分
+    // - 32 (VPS): Video Parameter Set
+    // - 33 (SPS): Sequence Parameter Set
+    // - 34 (PPS): Picture Parameter Set
+
+    let mut i = 0;
+    while i + 4 < data.len() {
+        // 查找 Annex-B 起始码
+        if data[i] == 0 && data[i + 1] == 0 {
+            let start_code_len = if data[i + 2] == 0 && data[i + 3] == 1 {
+                4
+            } else if data[i + 2] == 1 {
+                3
+            } else {
+                i += 1;
+                continue;
+            };
+
+            let nalu_start = i + start_code_len;
+            if nalu_start >= data.len() {
+                break;
+            }
+
+            // HEVC NAL unit type: (byte >> 1) & 0x3F
+            let nal_type = (data[nalu_start] >> 1) & 0x3F;
+
+            // IDR 帧或参数集
+            if nal_type >= 16 && nal_type <= 21 {
+                // BLA_W_LP(16), BLA_W_RADL(17), BLA_N_LP(18), IDR_W_RADL(19), IDR_N_LP(20), CRA(21)
+                return true;
+            }
+            if nal_type >= 32 && nal_type <= 34 {
+                // VPS(32), SPS(33), PPS(34)
+                return true;
+            }
+
+            i = nalu_start;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// 检测 H.264 数据中是否包含 IDR 帧 (关键帧)
+fn detect_h264_keyframe(data: &[u8]) -> bool {
+    // H.264 NAL unit type 位于第一个字节的低 5 位
+    // IDR 帧类型: 5 (IDR slice)
+    // SPS: 7, PPS: 8
+
+    let mut i = 0;
+    while i + 4 < data.len() {
+        if data[i] == 0 && data[i + 1] == 0 {
+            let start_code_len = if data[i + 2] == 0 && data[i + 3] == 1 {
+                4
+            } else if data[i + 2] == 1 {
+                3
+            } else {
+                i += 1;
+                continue;
+            };
+
+            let nalu_start = i + start_code_len;
+            if nalu_start >= data.len() {
+                break;
+            }
+
+            let nal_type = data[nalu_start] & 0x1F;
+
+            // IDR slice (5) 或 SPS (7) 或 PPS (8)
+            if nal_type == 5 || nal_type == 7 || nal_type == 8 {
+                return true;
+            }
+
+            i = nalu_start;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// 长度前缀格式 (AVCC/HVCC) 转 Annex-B 格式
+///
+/// AVCC/HVCC 数据包格式: [4字节长度][NALU数据][4字节长度][NALU数据]...
+/// Annex-B 格式: [0x00000001][NALU数据][0x00000001][NALU数据]...
+#[allow(dead_code)]
+fn length_prefixed_to_annexb(data: &[u8]) -> Vec<u8> {
     let mut result = Vec::with_capacity(data.len() + 32);
     let mut offset = 0;
 
     while offset + 4 <= data.len() {
-        // AVCC 使用 4 字节长度前缀
+        // 读取 4 字节长度前缀 (大端序)
         let nalu_size = u32::from_be_bytes([
             data[offset],
             data[offset + 1],
@@ -286,19 +406,24 @@ fn avcc_to_annexb(data: &[u8]) -> Vec<u8> {
 
         offset += 4;
 
-        if offset + nalu_size > data.len() {
+        if nalu_size == 0 || offset + nalu_size > data.len() {
             break;
         }
 
-        // Annex-B 使用 0x00000001 起始码
+        // 添加 Annex-B 起始码
         result.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
         result.extend_from_slice(&data[offset..offset + nalu_size]);
 
         offset += nalu_size;
     }
 
-    if result.is_empty() {
-        // 可能已经是 Annex-B 格式
+    // 如果没有解析出任何 NALU，可能已经是 Annex-B 格式
+    if result.is_empty() && !data.is_empty() {
+        // 检查是否已经有起始码
+        if data.len() >= 4 && (data[0..3] == [0, 0, 1] || data[0..4] == [0, 0, 0, 1]) {
+            return data.to_vec();
+        }
+        // 否则添加起始码
         result.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
         result.extend_from_slice(data);
     }
@@ -306,24 +431,24 @@ fn avcc_to_annexb(data: &[u8]) -> Vec<u8> {
     result
 }
 
-/// 将 extradata (AVCC 格式) 转换为 Annex-B 格式
-fn extradata_to_annexb(extradata: &[u8]) -> Vec<u8> {
+/// H.264 AVCC extradata 转 Annex-B 格式
+///
+/// AVCC extradata 格式:
+/// - [0]: version (always 1)
+/// - [1]: AVCProfileIndication
+/// - [2]: profile_compatibility  
+/// - [3]: AVCLevelIndication
+/// - [4]: lengthSizeMinusOne (NAL unit length size - 1, masked with 0x03)
+/// - [5]: numOfSPS (masked with 0x1F)
+/// - [6..]: SPS entries (each: 2-byte length + SPS data)
+/// - [...]: numOfPPS
+/// - [...]: PPS entries (each: 2-byte length + PPS data)
+fn avcc_extradata_to_annexb(extradata: &[u8]) -> Vec<u8> {
     let mut result = Vec::new();
 
     if extradata.len() < 7 {
         return result;
     }
-
-    // AVCC extradata 格式:
-    // [0] version
-    // [1] profile
-    // [2] compatibility
-    // [3] level
-    // [4] NALU length size - 1 (masked with 0x03)
-    // [5] number of SPS (masked with 0x1F)
-    // [6..] SPS data
-    // [...] number of PPS
-    // [...] PPS data
 
     let mut offset = 5;
 
@@ -371,6 +496,80 @@ fn extradata_to_annexb(extradata: &[u8]) -> Vec<u8> {
         }
     }
 
+    result
+}
+
+/// HEVC HVCC extradata 转 Annex-B 格式
+///
+/// HVCC extradata 格式:
+/// - [0]: configurationVersion (always 1)
+/// - [1-22]: 各种 profile/level 信息
+/// - [21]: lengthSizeMinusOne (NAL unit length size - 1, masked with 0x03)
+/// - [22]: numOfArrays (NALU array 数量)
+/// - [23..]: NALU arrays, each:
+///   - [0]: array_completeness(1) + reserved(1) + NAL_unit_type(6)
+///   - [1-2]: numNalus (2 bytes, big-endian)
+///   - [3..]: NALU entries (each: 2-byte length + NALU data)
+fn hvcc_extradata_to_annexb(extradata: &[u8]) -> Vec<u8> {
+    let mut result = Vec::new();
+
+    // HVCC 最小长度是 23 字节 header
+    if extradata.len() < 23 {
+        println!("[HVCC] extradata too short: {} bytes", extradata.len());
+        return result;
+    }
+
+    let num_arrays = extradata[22] as usize;
+    let mut offset = 23;
+
+    println!(
+        "[HVCC] Parsing {} NALU arrays from {} bytes extradata",
+        num_arrays,
+        extradata.len()
+    );
+
+    for array_idx in 0..num_arrays {
+        if offset + 3 > extradata.len() {
+            println!("[HVCC] Array {} truncated at offset {}", array_idx, offset);
+            break;
+        }
+
+        let nal_type = extradata[offset] & 0x3F;
+        let num_nalus = u16::from_be_bytes([extradata[offset + 1], extradata[offset + 2]]) as usize;
+        offset += 3;
+
+        println!(
+            "[HVCC] Array {}: NAL type={}, count={}",
+            array_idx, nal_type, num_nalus
+        );
+
+        for nalu_idx in 0..num_nalus {
+            if offset + 2 > extradata.len() {
+                println!("[HVCC] NALU {} length truncated", nalu_idx);
+                break;
+            }
+
+            let nalu_len = u16::from_be_bytes([extradata[offset], extradata[offset + 1]]) as usize;
+            offset += 2;
+
+            if offset + nalu_len > extradata.len() {
+                println!(
+                    "[HVCC] NALU {} data truncated: need {}, have {}",
+                    nalu_idx,
+                    nalu_len,
+                    extradata.len() - offset
+                );
+                break;
+            }
+
+            // 添加 Annex-B 起始码
+            result.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+            result.extend_from_slice(&extradata[offset..offset + nalu_len]);
+            offset += nalu_len;
+        }
+    }
+
+    println!("[HVCC] Generated {} bytes Annex-B data", result.len());
     result
 }
 
