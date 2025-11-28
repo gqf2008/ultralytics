@@ -81,40 +81,6 @@
             transform-origin: center center;
         }
         
-        /* 区域选择覆盖层 */
-        #region-select-overlay {
-            position: absolute;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background: rgba(0, 0, 0, 0.3);
-            cursor: crosshair;
-            z-index: 100;
-        }
-        #region-select-overlay.hidden {
-            display: none;
-        }
-        #region-select-box {
-            position: absolute;
-            border: 2px dashed #00ff88;
-            background: rgba(0, 255, 136, 0.1);
-            box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.5);
-            pointer-events: none;
-        }
-        #region-select-hint {
-            position: absolute;
-            bottom: 20px;
-            left: 50%;
-            transform: translateX(-50%);
-            background: rgba(0, 0, 0, 0.8);
-            color: #fff;
-            padding: 10px 20px;
-            border-radius: 8px;
-            font-size: 14px;
-            pointer-events: none;
-        }
-        
         /* 缩放指示器 */
         #zoom-indicator {
             position: absolute;
@@ -155,33 +121,6 @@
         #zoom-indicator button:hover {
             background: rgba(255, 255, 255, 0.15);
             color: var(--text-primary);
-        }
-        
-        /* ========== 录制区域闪烁框 - 已禁用 ========== */
-        #recording-region {
-            display: none !important;
-        }
-        
-        /* 区域选择按钮 */
-        .btn-region {
-            background: linear-gradient(135deg, #f59e0b, #d97706);
-            color: white;
-            box-shadow: 0 4px 16px rgba(245, 158, 11, 0.3);
-        }
-        
-        .btn-region:hover {
-            transform: translateY(-1px);
-            box-shadow: 0 6px 24px rgba(245, 158, 11, 0.4);
-        }
-        
-        .region-info {
-            font-size: 11px;
-            color: var(--text-muted);
-            padding: 6px 10px;
-            background: rgba(255, 255, 255, 0.03);
-            border-radius: 6px;
-            margin-top: 8px;
-            font-family: monospace;
         }
         
         /* ========== 现代控制面板 ========== */
@@ -618,43 +557,6 @@
         /* 隐藏类 */
         .hidden { display: none !important; }
         
-        /* ========== Tab 切换样式 ========== */
-        .tab-container {
-            margin-bottom: 8px;
-        }
-        
-        .tabs {
-            display: flex;
-            gap: 4px;
-            background: rgba(255, 255, 255, 0.03);
-            padding: 4px;
-            border-radius: 10px;
-        }
-        
-        .tab {
-            flex: 1;
-            padding: 10px 12px;
-            background: transparent;
-            border: none;
-            border-radius: 8px;
-            color: var(--text-secondary);
-            font-size: 12px;
-            font-weight: 500;
-            cursor: pointer;
-            transition: all 0.2s ease;
-        }
-        
-        .tab:hover {
-            background: rgba(255, 255, 255, 0.06);
-            color: var(--text-primary);
-        }
-        
-        .tab.active {
-            background: linear-gradient(135deg, var(--accent), #7c3aed);
-            color: white;
-            box-shadow: 0 2px 8px rgba(99, 102, 241, 0.3);
-        }
-        
         /* 滚动条 */
         ::-webkit-scrollbar { width: 5px; }
         ::-webkit-scrollbar-track { background: transparent; }
@@ -668,13 +570,6 @@
         <div id="canvas-container">
             <canvas id="canvas"></canvas>
             <canvas id="detection-overlay"></canvas>
-            <!-- 录制区域闪烁框 (覆盖 canvas) -->
-            <div id="recording-region"></div>
-            <!-- 区域选择覆盖层 (在视频上直接选择) -->
-            <div id="region-select-overlay" class="hidden">
-                <div id="region-select-box"></div>
-                <div id="region-select-hint">拖拽选择区域 | ESC 取消 | Enter 确认</div>
-            </div>
         </div>
         
         <!-- 缩放指示器 -->
@@ -728,6 +623,19 @@
                     <div id="history-dropdown"></div>
                 </div>
                 
+                <!-- 解码模式选择 -->
+                <div class="settings-section" style="padding: 10px 14px;">
+                    <div class="settings-row">
+                        <div class="settings-label">
+                            <span class="icon">🎬</span> 解码
+                        </div>
+                        <select id="decode-mode">
+                            <option value="frontend">🌐 前端硬解 (WebCodecs)</option>
+                            <option value="backend">⚡ 后端硬解 (QSV)</option>
+                        </select>
+                    </div>
+                </div>
+                
                 <!-- 流控制按钮 -->
                 <div class="btn-group">
                     <button id="start-btn" class="btn btn-primary">
@@ -735,61 +643,6 @@
                     </button>
                     <button id="stop-btn" class="btn btn-danger hidden">
                         <span>⏹</span> 停止推流
-                    </button>
-                </div>
-                
-                <!-- 输入源选择 Tab -->
-                <div class="tab-container">
-                    <div class="tabs">
-                        <button class="tab active" data-tab="rtsp">📡 RTSP</button>
-                        <button class="tab" data-tab="camera">📷 摄像头</button>
-                        <button class="tab" data-tab="screen">🖥️ 桌面</button>
-                        <button class="tab" data-tab="window">🪟 窗口</button>
-                    </div>
-                </div>
-                
-                <!-- 采集设备选择 (摄像头/桌面模式) -->
-                <div id="capture-settings" class="settings-section hidden">
-                    <div class="settings-row">
-                        <div class="settings-label">
-                            <span class="icon">📹</span> 设备
-                        </div>
-                        <select id="capture-device-select">
-                            <option value="">选择设备...</option>
-                        </select>
-                    </div>
-                    <div class="settings-row">
-                        <div class="settings-label">
-                            <span class="icon">📐</span> 分辨率
-                        </div>
-                        <select id="capture-resolution">
-                            <option value="640x480">640×480</option>
-                            <option value="1280x720" selected>1280×720</option>
-                            <option value="1920x1080">1920×1080</option>
-                        </select>
-                    </div>
-                    <!-- 区域选择 (仅桌面模式) -->
-                    <div id="region-select-row" class="settings-row hidden">
-                        <div class="settings-label">
-                            <span class="icon">✂️</span> 区域
-                        </div>
-                        <button id="select-region-btn" class="btn btn-region" style="flex:1; padding: 8px 12px;">
-                            <span>🎯</span> 选择区域
-                        </button>
-                    </div>
-                    <div id="region-info" class="region-info hidden">
-                        📍 区域: <span id="region-coords">未选择</span>
-                        <button id="clear-region-btn" style="margin-left: 8px; background: none; border: none; color: var(--danger); cursor: pointer;">✕</button>
-                    </div>
-                </div>
-                
-                <!-- 采集控制按钮 -->
-                <div id="capture-controls" class="btn-group hidden">
-                    <button id="start-capture-btn" class="btn btn-primary">
-                        <span>▶</span> 开始采集
-                    </button>
-                    <button id="stop-capture-btn" class="btn btn-danger hidden">
-                        <span>⏹</span> 停止采集
                     </button>
                 </div>
                 
@@ -830,6 +683,61 @@
                     <button id="stop-detector-btn" class="btn btn-danger hidden">
                         <span>⏹</span> 停止检测
                     </button>
+                </div>
+                
+                <!-- LLM 推理设置 -->
+                <div class="settings-section" id="llm-settings">
+                    <div class="settings-row">
+                        <div class="settings-label">
+                            <span class="icon">🤖</span> LLM 推理
+                        </div>
+                        <button id="llm-config-toggle" class="btn btn-sm" style="padding: 4px 12px; font-size: 12px;">配置</button>
+                    </div>
+                    
+                    <!-- LLM 配置面板（默认隐藏） -->
+                    <div id="llm-config-panel" class="hidden" style="margin-top: 8px;">
+                        <div class="settings-row" style="flex-direction: column; align-items: stretch; gap: 8px;">
+                            <input type="text" id="llm-api-url" placeholder="API URL (如: http://localhost:11434/api/chat)" 
+                                   style="width: 100%; padding: 8px; border-radius: 6px; border: 1px solid rgba(255,255,255,0.1); background: rgba(0,0,0,0.3); color: white; font-size: 12px;">
+                            <input type="text" id="llm-model" placeholder="模型名称 (如: llava, gpt-4-vision)" 
+                                   style="width: 100%; padding: 8px; border-radius: 6px; border: 1px solid rgba(255,255,255,0.1); background: rgba(0,0,0,0.3); color: white; font-size: 12px;">
+                            <textarea id="llm-system-prompt" placeholder="系统提示词 (可选)" rows="2"
+                                      style="width: 100%; padding: 8px; border-radius: 6px; border: 1px solid rgba(255,255,255,0.1); background: rgba(0,0,0,0.3); color: white; font-size: 12px; resize: vertical;"></textarea>
+                            <textarea id="llm-user-prompt" placeholder="用户提示词 (如: 描述这张图片中的内容)" rows="2"
+                                      style="width: 100%; padding: 8px; border-radius: 6px; border: 1px solid rgba(255,255,255,0.1); background: rgba(0,0,0,0.3); color: white; font-size: 12px; resize: vertical;">描述这张监控画面中的场景和活动</textarea>
+                            <div style="display: flex; gap: 8px;">
+                                <div style="flex: 1;">
+                                    <label style="font-size: 11px; color: rgba(255,255,255,0.6);">分析间隔(秒)</label>
+                                    <input type="number" id="llm-frame-interval" value="2" min="0.5" max="60" step="0.5"
+                                           style="width: 100%; padding: 6px; border-radius: 6px; border: 1px solid rgba(255,255,255,0.1); background: rgba(0,0,0,0.3); color: white; font-size: 12px;">
+                                </div>
+                                <div style="flex: 1;">
+                                    <label style="font-size: 11px; color: rgba(255,255,255,0.6);">Temperature</label>
+                                    <input type="number" id="llm-temperature" value="0.7" min="0" max="2" step="0.1"
+                                           style="width: 100%; padding: 6px; border-radius: 6px; border: 1px solid rgba(255,255,255,0.1); background: rgba(0,0,0,0.3); color: white; font-size: 12px;">
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- LLM 控制按钮 -->
+                <div class="btn-group">
+                    <button id="start-llm-btn" class="btn" style="background: linear-gradient(135deg, #9333ea, #7c3aed);">
+                        <span>🤖</span> 开启LLM推理
+                    </button>
+                    <button id="stop-llm-btn" class="btn btn-danger hidden">
+                        <span>⏹</span> 停止LLM推理
+                    </button>
+                </div>
+                
+                <!-- LLM 推理输出 -->
+                <div id="llm-output-container" class="hidden" style="margin-top: 12px;">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+                        <span style="font-size: 12px; color: rgba(255,255,255,0.7);">🤖 LLM 分析结果</span>
+                        <button id="llm-clear-output" style="padding: 2px 8px; font-size: 11px; background: rgba(255,255,255,0.1); border: none; border-radius: 4px; color: rgba(255,255,255,0.6); cursor: pointer;">清空</button>
+                    </div>
+                    <div id="llm-output" style="max-height: 200px; overflow-y: auto; padding: 12px; background: rgba(0,0,0,0.4); border-radius: 8px; font-size: 13px; line-height: 1.6; color: rgba(255,255,255,0.9); white-space: pre-wrap; word-break: break-word;"></div>
                 </div>
             </div>
         </div>

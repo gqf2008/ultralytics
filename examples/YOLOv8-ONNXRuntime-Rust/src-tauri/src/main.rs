@@ -1,28 +1,32 @@
 // Prevents additional console window on Windows in release
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod capture;
+mod demuxer;
 mod detector_async;
-mod multi_window_capture;
+mod llm_inference;
 mod qsv_decoder;
-mod rtsp_proxy;
 mod shared_memory;
+mod video_events;
+mod xbus;
 
+use demuxer::{DemuxerConfig, DemuxerHandle, FrameCallback};
 use detector_async::AsyncDetectorState;
+use llm_inference::{LlmConfig, LlmInferenceState, StreamChunk};
 use ort::execution_providers::{
     CUDAExecutionProvider, DirectMLExecutionProvider, ExecutionProvider,
 };
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+use shared_memory::{RgbaSharedBuffer, RgbaFrameHeader};
 use std::panic;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tauri::window::Color;
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Manager, State};
 
-// Global Proxy State
-pub struct ProxyState {
-    pub proxy: Arc<rtsp_proxy::RtspProxy>,
+/// 解复用器状态
+pub struct DemuxerState {
+    pub handle: RwLock<DemuxerHandle>,
 }
 
 /// 视频帧共享状态
@@ -40,6 +44,21 @@ impl Default for VideoFrameState {
             width: Arc::new(RwLock::new(0)),
             height: Arc::new(RwLock::new(0)),
             updated: Arc::new(RwLock::new(false)),
+        }
+    }
+}
+
+/// 共享内存状态 - 用于零拷贝帧传输
+pub struct SharedMemoryState {
+    pub buffer: Arc<RwLock<Option<RgbaSharedBuffer>>>,
+    pub name: Arc<RwLock<String>>,
+}
+
+impl Default for SharedMemoryState {
+    fn default() -> Self {
+        Self {
+            buffer: Arc::new(RwLock::new(None)),
+            name: Arc::new(RwLock::new(String::new())),
         }
     }
 }
@@ -94,6 +113,64 @@ async fn mark_frame_processed(state: State<'_, VideoFrameState>) -> Result<(), S
     Ok(())
 }
 
+/// 获取共享内存信息 (用于前端零拷贝渲染)
+#[tauri::command]
+async fn get_shared_memory_info(
+    state: State<'_, SharedMemoryState>,
+) -> Result<SharedMemInfo, String> {
+    let name = state.name.read().clone();
+    let buffer = state.buffer.read();
+    
+    if let Some(ref shm) = *buffer {
+        let header = shm.header();
+        Ok(SharedMemInfo {
+            name,
+            frame_id: header.write_frame_id.load(Ordering::Acquire),
+            width: header.width,
+            height: header.height,
+            max_width: header.max_width,
+            max_height: header.max_height,
+            timestamp: header.timestamp.load(Ordering::Acquire),
+        })
+    } else {
+        Err("共享内存未初始化".to_string())
+    }
+}
+
+/// 共享内存信息结构
+#[derive(Serialize)]
+pub struct SharedMemInfo {
+    pub name: String,
+    pub frame_id: u64,
+    pub width: u32,
+    pub height: u32,
+    pub max_width: u32,
+    pub max_height: u32,
+    pub timestamp: u64,
+}
+
+/// 从共享内存读取当前帧 (IPC 回退方案)
+#[tauri::command]
+async fn get_shared_memory_frame(
+    state: State<'_, SharedMemoryState>,
+) -> Result<(Vec<u8>, u32, u32, u64), String> {
+    let buffer = state.buffer.read();
+    
+    if let Some(ref shm) = *buffer {
+        let header = shm.header();
+        let frame_id = header.write_frame_id.load(Ordering::Acquire);
+        let width = header.width;
+        let height = header.height;
+        
+        // 读取当前帧数据
+        let frame_data = shm.current_read_buffer().to_vec();
+        
+        Ok((frame_data, width, height, frame_id))
+    } else {
+        Err("共享内存未初始化".to_string())
+    }
+}
+
 /// 前端日志透传
 #[tauri::command]
 async fn log_frontend(msg: String) {
@@ -129,7 +206,7 @@ async fn get_rtsp_history() -> Result<Vec<String>, String> {
                 .collect();
             Ok(urls)
         }
-        Err(_) => Ok(Vec::new()), // 文件不存在返回空数组
+        Err(_) => Ok(Vec::new()),
     }
 }
 
@@ -138,7 +215,6 @@ async fn get_rtsp_history() -> Result<Vec<String>, String> {
 async fn add_rtsp_history(url: String) -> Result<(), String> {
     let path = "rtsp_history.txt";
 
-    // 读取现有记录
     let mut urls = match std::fs::read_to_string(path) {
         Ok(content) => content
             .lines()
@@ -149,18 +225,13 @@ async fn add_rtsp_history(url: String) -> Result<(), String> {
         Err(_) => Vec::new(),
     };
 
-    // 如果 URL已存在,先移除(保证最新的在最前面)
     urls.retain(|u| u != &url);
-
-    // 添加到最前面
     urls.insert(0, url);
 
-    // 限制最多保留 20 条记录
     if urls.len() > 20 {
         urls.truncate(20);
     }
 
-    // 写回文件
     let content = urls.join("\n");
     std::fs::write(path, content).map_err(|e| format!("Failed to write history: {}", e))
 }
@@ -173,26 +244,94 @@ async fn clear_rtsp_history() -> Result<(), String> {
 }
 
 /// 启动 RTSP 流
+///
+/// # 参数
+/// * `url` - RTSP URL
+/// * `hardware_decode` - 是否使用硬件解码 (false 则使用 WebCodecs)
+/// * `video_channel` - 视频帧输出通道
 #[tauri::command]
 async fn start_rtsp_stream(
     app: AppHandle,
     url: String,
-    video_channel: tauri::ipc::Channel,
-    audio_channel: tauri::ipc::Channel,
+    hardware_decode: Option<bool>,
 ) -> Result<String, String> {
-    println!("🚀 启动 RTSP 流: {}", url);
+    let hw = hardware_decode.unwrap_or(true);
+    println!("🚀 启动 RTSP 流: {} (硬件解码: {})", url, hw);
 
-    // 增加解码器代数
     let generation = DECODER_GENERATION.fetch_add(1, Ordering::SeqCst);
     println!("📌 新解码器代数: {}", generation);
 
-    // 启动 RTSP 代理 (用于前端显示)
-    let proxy_state = app.state::<ProxyState>();
-    proxy_state
-        .proxy
-        .start(url.clone(), Some(video_channel), Some(audio_channel));
+    let demuxer_state = app.state::<DemuxerState>();
+    let shm_state = app.state::<SharedMemoryState>();
+    let video_state = app.state::<VideoFrameState>();
 
-    Ok(format!("RTSP 流已启动 (Gen: {})", generation))
+    // 创建共享内存 (4K 尺寸预分配)
+    let shm_name = format!("yolo_rgba_{}", std::process::id());
+    let shm_buffer = RgbaSharedBuffer::create(&shm_name, 3840, 2160)
+        .map_err(|e| format!("创建共享内存失败: {}", e))?;
+    
+    *shm_state.name.write() = shm_name.clone();
+    *shm_state.buffer.write() = Some(shm_buffer);
+    
+    println!("✅ 创建共享内存: {}", shm_name);
+
+    // 创建帧回调，将帧数据写入共享内存
+    let shm_buffer_arc = shm_state.buffer.clone();
+    // 同时保留 IPC 回退 (用于兼容)
+    let buffer = video_state.buffer.clone();
+    let width_state = video_state.width.clone();
+    let height_state = video_state.height.clone();
+    let updated = video_state.updated.clone();
+
+    let frame_callback: FrameCallback = Arc::new(move |frame| {
+        // 写入共享内存 (零拷贝)
+        if let Some(ref mut shm) = *shm_buffer_arc.write() {
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            shm.write_frame(&frame.data, frame.width, frame.height, timestamp);
+        }
+        
+        // IPC 回退 (保留兼容性)
+        *buffer.write() = frame.data;
+        *width_state.write() = frame.width;
+        *height_state.write() = frame.height;
+        *updated.write() = true;
+    });
+
+    let config = DemuxerConfig {
+        url: url.clone(),
+        use_hw_decode: hw,
+        hw_type: "qsv".to_string(),
+        output_rgba: true,
+        shm_name_prefix: "yolo_frame".to_string(),
+        connect_timeout: 10,
+        read_timeout: 5,
+        frame_callback: Some(frame_callback),
+    };
+
+    demuxer_state.handle.write().start(config)?;
+
+    Ok(format!("RTSP 流已启动: {}", url))
+}
+
+/// 停止 RTSP 流
+#[tauri::command]
+async fn stop_rtsp_stream(app: AppHandle) -> Result<(), String> {
+    println!("⏹ 停止 RTSP 流");
+    
+    // 停止解码器
+    let demuxer_state = app.state::<DemuxerState>();
+    demuxer_state.handle.write().stop();
+    
+    // 清理共享内存
+    let shm_state = app.state::<SharedMemoryState>();
+    *shm_state.buffer.write() = None;
+    *shm_state.name.write() = String::new();
+    println!("🗑️ 共享内存已释放");
+    
+    Ok(())
 }
 
 // ==================== 设备和模型配置命令 ====================
@@ -210,7 +349,6 @@ pub struct DeviceInfo {
 async fn get_available_devices() -> Result<Vec<DeviceInfo>, String> {
     let mut devices = Vec::new();
 
-    // 检查 CUDA
     let cuda = CUDAExecutionProvider::default();
     let cuda_available = cuda.is_available().unwrap_or(false);
     devices.push(DeviceInfo {
@@ -219,7 +357,6 @@ async fn get_available_devices() -> Result<Vec<DeviceInfo>, String> {
         available: cuda_available,
     });
 
-    // 检查 DirectML
     let dml = DirectMLExecutionProvider::default();
     let dml_available = dml.is_available().unwrap_or(false);
     devices.push(DeviceInfo {
@@ -228,7 +365,6 @@ async fn get_available_devices() -> Result<Vec<DeviceInfo>, String> {
         available: dml_available,
     });
 
-    // CPU 始终可用
     devices.push(DeviceInfo {
         id: "cpu".to_string(),
         name: "CPU".to_string(),
@@ -268,7 +404,6 @@ async fn get_available_models() -> Result<Vec<ModelInfo>, String> {
         ("yolov11n", "YOLOv11 Nano", "~5MB"),
     ];
 
-    // 只返回存在的模型
     let models: Vec<ModelInfo> = model_configs
         .iter()
         .filter_map(|(id, name, size)| {
@@ -314,18 +449,13 @@ async fn start_detector(
 
     let detector_state = app.state::<AsyncDetectorState>();
 
-    // 获取模型路径
-    // 如果 model 已经是完整路径（包含路径分隔符或 .onnx 后缀），直接使用
-    // 否则在 models 目录下查找
     let model_path = if model.contains(std::path::MAIN_SEPARATOR)
         || model.contains('/')
         || model.ends_with(".onnx")
     {
-        // 可能是完整路径
         if std::path::Path::new(&model).exists() {
             std::path::PathBuf::from(&model)
         } else {
-            // 可能只是文件名，在 models 目录下查找
             std::env::current_exe()
                 .map_err(|e| format!("获取当前exe路径失败: {}", e))?
                 .parent()
@@ -333,7 +463,6 @@ async fn start_detector(
                 .unwrap_or_else(|| std::path::PathBuf::from("models").join(&model))
         }
     } else {
-        // 简单模型名，添加 .onnx 后缀
         let model_filename = format!("{}.onnx", model);
         std::env::current_exe()
             .map_err(|e| format!("获取当前exe路径失败: {}", e))?
@@ -345,7 +474,6 @@ async fn start_detector(
     let model_path_str = model_path.to_string_lossy().to_string();
     println!("📁 模型路径: {}", model_path_str);
 
-    // 启动异步检测器 - 传入结果 Channel 和设备选择
     let (input_width, input_height, actual_device) =
         detector_state.start_with_device(&model_path_str, &device, result_channel)?;
 
@@ -371,7 +499,6 @@ async fn stop_detector(app: AppHandle) -> Result<String, String> {
 /// 发送帧到检测线程 (非阻塞，使用 Raw Request 避免 JSON 序列化)
 #[tauri::command]
 async fn detect_frame(app: AppHandle, request: tauri::ipc::Request<'_>) -> Result<(), String> {
-    // 从 Raw Body 获取帧数据 (避免 JSON 序列化 400KB)
     let rgba_data = match request.body() {
         tauri::ipc::InvokeBody::Raw(data) => data.clone(),
         tauri::ipc::InvokeBody::Json(_) => {
@@ -379,7 +506,6 @@ async fn detect_frame(app: AppHandle, request: tauri::ipc::Request<'_>) -> Resul
         }
     };
 
-    // 从 headers 获取尺寸 (header 名可能被转为小写)
     let headers = request.headers();
     let width: u32 = headers
         .get("x-width")
@@ -394,7 +520,6 @@ async fn detect_frame(app: AppHandle, request: tauri::ipc::Request<'_>) -> Resul
         .and_then(|s| s.parse().ok())
         .unwrap_or(640);
 
-    // 调试日志
     if width != 640 || height != 640 {
         println!("⚠️ detect_frame: 收到 {}x{} (期望 640x640)", width, height);
     }
@@ -403,518 +528,46 @@ async fn detect_frame(app: AppHandle, request: tauri::ipc::Request<'_>) -> Resul
     detector_state.send_frame(rgba_data, width, height)
 }
 
-// ==================== 零拷贝共享内存渲染 ====================
+// ==================== LLM 推理命令 ====================
 
-use shared_memory::{FrameInfo, SharedMemoryInfo, ZeroCopyRendererState};
-
-/// 启动零拷贝解码 (共享内存)
+/// 启动 LLM 视频推理
 #[tauri::command]
-async fn start_zerocopy_stream(
-    zerocopy_state: State<'_, ZeroCopyRendererState>,
-    url: String,
-    hardware: String,
-    width: u32,
-    height: u32,
-) -> Result<SharedMemoryInfo, String> {
-    let hw_accel = match hardware.as_str() {
-        "cuda" | "nvidia" => qsv_decoder::HardwareAccel::Cuda,
-        "qsv" | "intel" => qsv_decoder::HardwareAccel::Qsv,
-        _ => qsv_decoder::HardwareAccel::Qsv,
-    };
-
-    println!(
-        "🚀 启动零拷贝解码: {} ({}) @ {}x{}",
-        url, hardware, width, height
-    );
-
-    zerocopy_state.start(url, hw_accel, width, height)
-}
-
-/// 停止零拷贝解码
-#[tauri::command]
-async fn stop_zerocopy_stream(
-    zerocopy_state: State<'_, ZeroCopyRendererState>,
+async fn start_llm_inference(
+    app: AppHandle,
+    config: LlmConfig,
+    result_channel: tauri::ipc::Channel<StreamChunk>,
 ) -> Result<String, String> {
-    zerocopy_state.stop();
-    println!("🛑 零拷贝解码已停止");
-    Ok("零拷贝解码已停止".to_string())
+    println!("🤖 启动 LLM 推理: model={}", config.model);
+
+    let llm_state = app.state::<LlmInferenceState>();
+    // LLM 推理订阅 xbus 事件，不需要 RTSP URL
+    llm_state.start(config, result_channel)
 }
 
-/// 获取当前帧信息 (用于 JS 端轮询)
+/// 停止 LLM 推理
 #[tauri::command]
-async fn get_zerocopy_frame_info(
-    zerocopy_state: State<'_, ZeroCopyRendererState>,
-) -> Result<Option<FrameInfo>, String> {
-    Ok(zerocopy_state.get_frame_info())
+async fn stop_llm_inference(app: AppHandle) -> Result<String, String> {
+    let llm_state = app.state::<LlmInferenceState>();
+    llm_state.stop();
+    Ok("LLM 推理已停止".to_string())
 }
 
-/// 读取当前帧 NV12 数据 (当无法使用共享内存时的回退方案)
-/// 使用 Raw Response 避免 Base64 编码
+/// 获取 LLM 推理状态
 #[tauri::command]
-async fn read_zerocopy_frame(
-    zerocopy_state: State<'_, ZeroCopyRendererState>,
-) -> Result<tauri::ipc::Response, String> {
-    match zerocopy_state.read_current_frame() {
-        Some((y_data, uv_data, info)) => {
-            // 打包: [header(20)] [y_data] [uv_data]
-            // header: frame_id(8) width(4) height(4) y_stride(4) uv_stride(4) = 24 bytes
-            let y_len = y_data.len();
-            let uv_len = uv_data.len();
-            let total_len = 24 + y_len + uv_len;
-
-            let mut buf = Vec::with_capacity(total_len);
-
-            // Header
-            buf.extend_from_slice(&info.frame_id.to_le_bytes());
-            buf.extend_from_slice(&info.width.to_le_bytes());
-            buf.extend_from_slice(&info.height.to_le_bytes());
-            buf.extend_from_slice(&info.y_stride.to_le_bytes());
-            buf.extend_from_slice(&info.uv_stride.to_le_bytes());
-
-            // Data
-            buf.extend_from_slice(&y_data);
-            buf.extend_from_slice(&uv_data);
-
-            Ok(tauri::ipc::Response::new(buf))
-        }
-        None => Err("没有可用的帧".to_string()),
-    }
+async fn get_llm_status(app: AppHandle) -> Result<(bool, u64), String> {
+    let llm_state = app.state::<LlmInferenceState>();
+    Ok(llm_state.get_status())
 }
 
-// ==================== 摄像头/桌面采集 ====================
-
-use capture::{CaptureDevice, CaptureDeviceType, CaptureState};
-use shared_memory::{RgbaFrameInfo, RgbaSharedMemoryInfo};
-
-/// 列出所有可用的采集设备 (摄像头 + 屏幕)
+/// 更新 LLM 配置
 #[tauri::command]
-async fn list_capture_devices(
-    capture_state: State<'_, CaptureState>,
-) -> Result<Vec<CaptureDevice>, String> {
-    Ok(capture_state.list_devices())
-}
-
-/// 采集区域
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct CaptureRegionParam {
-    pub x: i32, // 支持负数（多显示器）
-    pub y: i32,
-    pub width: u32,
-    pub height: u32,
-}
-
-/// 启动采集 (摄像头或桌面) - 返回共享内存信息
-#[tauri::command]
-async fn start_capture(
-    app: AppHandle,
-    capture_state: State<'_, CaptureState>,
-    device_id: String,
-    device_type: String,
-    width: u32,
-    height: u32,
-    fps: u32,
-    region: Option<CaptureRegionParam>,
-) -> Result<RgbaSharedMemoryInfo, String> {
-    let dtype = match device_type.as_str() {
-        "camera" => CaptureDeviceType::Camera,
-        "screen" => CaptureDeviceType::Screen,
-        "window" => CaptureDeviceType::Window,
-        _ => return Err(format!("未知设备类型: {}", device_type)),
-    };
-
-    // 转换 region 参数
-    let capture_region = region.map(|r| capture::CaptureRegion {
-        x: r.x,
-        y: r.y,
-        width: r.width,
-        height: r.height,
-    });
-
-    println!(
-        "🎥 启动采集: {} ({:?}) @ {}x{} {}fps, region: {:?}",
-        device_id, dtype, width, height, fps, capture_region
-    );
-
-    let result = capture_state.start(&device_id, dtype, width, height, fps, capture_region);
-
-    // 只有桌面采集才需要录制指示器，窗口采集不需要
-    if result.is_ok() && dtype == CaptureDeviceType::Screen {
-        if let Some(indicator) = app.get_webview_window("recording-indicator") {
-            let _ = indicator.emit(
-                "capture-state-changed",
-                serde_json::json!({ "recording": true }),
-            );
-        }
-    }
-
-    result
-}
-
-/// 停止采集
-#[tauri::command]
-async fn stop_capture(
-    app: AppHandle,
-    capture_state: State<'_, CaptureState>,
-) -> Result<String, String> {
-    capture_state.stop();
-
-    // 通知录制指示器切换到待机状态
-    if let Some(indicator) = app.get_webview_window("recording-indicator") {
-        let _ = indicator.emit(
-            "capture-state-changed",
-            serde_json::json!({ "recording": false }),
-        );
-    }
-
-    println!("🛑 采集已停止");
-    Ok("采集已停止".to_string())
-}
-
-/// 获取采集帧信息 (用于 JS 轮询)
-#[tauri::command]
-async fn get_capture_frame_info(
-    capture_state: State<'_, CaptureState>,
-) -> Result<Option<RgbaFrameInfo>, String> {
-    Ok(capture_state.get_frame_info())
-}
-
-/// 读取采集帧 (回退方案，当共享内存不可用时)
-#[tauri::command]
-async fn read_capture_frame(
-    capture_state: State<'_, CaptureState>,
-) -> Result<tauri::ipc::Response, String> {
-    match capture_state.read_current_frame() {
-        Some((rgba_data, info)) => {
-            // 打包: [header(24)] [rgba_data]
-            // header: frame_id(8) width(4) height(4) timestamp(8) = 24 bytes
-            let total_len = 24 + rgba_data.len();
-            let mut buf = Vec::with_capacity(total_len);
-
-            buf.extend_from_slice(&info.frame_id.to_le_bytes());
-            buf.extend_from_slice(&info.width.to_le_bytes());
-            buf.extend_from_slice(&info.height.to_le_bytes());
-            buf.extend_from_slice(&info.timestamp.to_le_bytes());
-            buf.extend_from_slice(&rgba_data);
-
-            Ok(tauri::ipc::Response::new(buf))
-        }
-        None => Err("没有可用的帧".to_string()),
-    }
-}
-
-/// 动态更新采集区域 (录制指示器拖动/调整大小时调用)
-#[tauri::command]
-async fn update_capture_region(
-    capture_state: State<'_, CaptureState>,
-    x: i32,
-    y: i32,
-    width: u32,
-    height: u32,
-) -> Result<(), String> {
-    println!(
-        "🔄 [update_capture_region] 收到更新请求: ({}, {}) {}x{}",
-        x, y, width, height
-    );
-    capture_state.update_region_full(x, y, width, height);
-    println!("✅ [update_capture_region] 区域已更新");
+async fn update_llm_config(app: AppHandle, config: LlmConfig) -> Result<(), String> {
+    let llm_state = app.state::<LlmInferenceState>();
+    llm_state.update_config(config);
     Ok(())
-}
-
-/// 打开全屏区域选择窗口
-#[tauri::command]
-async fn open_region_selector(app: AppHandle) -> Result<(), String> {
-    use tauri::WebviewUrl;
-    use tauri::WebviewWindowBuilder;
-
-    // 先最小化主窗口
-    if let Some(main_window) = app.get_webview_window("main") {
-        main_window.minimize().map_err(|e| e.to_string())?;
-    }
-
-    // 等待一小段时间让窗口最小化完成
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
-    // 获取主显示器尺寸
-    let monitors = app.available_monitors().map_err(|e| e.to_string())?;
-    let primary = monitors.into_iter().next().ok_or("No monitor found")?;
-
-    let size = primary.size();
-    let position = primary.position();
-
-    // 创建全屏半透明窗口
-    let _selector_window = WebviewWindowBuilder::new(
-        &app,
-        "region-selector",
-        WebviewUrl::App("region-selector.html".into()),
-    )
-    .title("选择区域")
-    .position(position.x as f64, position.y as f64)
-    .inner_size(size.width as f64, size.height as f64)
-    .decorations(false)
-    .transparent(true) // 启用透明背景
-    .always_on_top(true)
-    .skip_taskbar(true)
-    .resizable(false)
-    .focused(true)
-    .visible(false)
-    .build()
-    .map_err(|e| e.to_string())?;
-
-    Ok(())
-}
-
-/// 显示区域选择窗口 (页面加载完成后调用)
-#[tauri::command]
-async fn show_region_selector(app: AppHandle) -> Result<(), String> {
-    if let Some(window) = app.get_webview_window("region-selector") {
-        window.show().map_err(|e| e.to_string())?;
-        window.set_focus().map_err(|e| e.to_string())?;
-    }
-    Ok(())
-}
-
-/// 关闭区域选择窗口
-#[tauri::command]
-async fn close_region_selector(app: AppHandle) -> Result<(), String> {
-    // 关闭选择器窗口
-    if let Some(window) = app.get_webview_window("region-selector") {
-        window.close().map_err(|e| e.to_string())?;
-    }
-
-    // 恢复主窗口
-    if let Some(main_window) = app.get_webview_window("main") {
-        main_window.unminimize().map_err(|e| e.to_string())?;
-        main_window.set_focus().map_err(|e| e.to_string())?;
-    }
-    Ok(())
-}
-
-/// 录制区域参数
-#[derive(Clone, Serialize, Deserialize)]
-pub struct RecordingRegionParam {
-    pub x: i32,
-    pub y: i32,
-    pub width: u32,
-    pub height: u32,
-}
-
-/// 打开录制指示器窗口 (在屏幕采集区域显示闪烁边框)
-#[tauri::command]
-async fn open_recording_indicator(
-    app: AppHandle,
-    region: Option<RecordingRegionParam>,
-) -> Result<(), String> {
-    use tauri::WebviewUrl;
-    use tauri::WebviewWindowBuilder;
-
-    // 如果已存在，先关闭
-    if let Some(window) = app.get_webview_window("recording-indicator") {
-        let _ = window.close();
-        // 等待窗口关闭
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-    }
-
-    // 默认区域：屏幕中央 640x480
-    let (x, y, width, height) = match region {
-        Some(r) => (r.x, r.y, r.width, r.height),
-        None => {
-            // 获取屏幕尺寸
-            let monitors = app.available_monitors().map_err(|e| e.to_string())?;
-            let primary = monitors.into_iter().next().ok_or("No monitor found")?;
-            let size = primary.size();
-            let pos = primary.position();
-
-            // 默认 640x480，居中
-            let default_w = 640;
-            let default_h = 480;
-            let center_x = pos.x + (size.width as i32 - default_w) / 2;
-            let center_y = pos.y + (size.height as i32 - default_h) / 2;
-            (center_x, center_y, default_w as u32, default_h as u32)
-        }
-    };
-
-    // 创建透明窗口覆盖在采集区域上
-    let _indicator_window = WebviewWindowBuilder::new(
-        &app,
-        "recording-indicator",
-        WebviewUrl::App("recording-indicator.html".into()),
-    )
-    .title("录制中")
-    .position(x as f64, y as f64)
-    .inner_size(width as f64, height as f64)
-    .decorations(false)
-    .transparent(true)
-    .always_on_top(true)
-    .skip_taskbar(true)
-    .resizable(true) // 允许调整大小，通过 JS 手柄控制
-    .focused(false)
-    .visible(false)
-    // 窗口不响应鼠标事件，让事件穿透到下层
-    .build()
-    .map_err(|e| e.to_string())?;
-
-    Ok(())
-}
-
-/// 显示录制指示器窗口 (页面加载完成后调用)
-#[tauri::command]
-async fn show_recording_indicator(app: AppHandle) -> Result<(), String> {
-    if let Some(window) = app.get_webview_window("recording-indicator") {
-        window.show().map_err(|e| e.to_string())?;
-        // 注意：不再设置 WS_EX_TRANSPARENT，这样 REC 标签可以接收鼠标事件进行拖动
-        // 但 HTML/CSS 中的 pointer-events: none 仍会让边框区域穿透
-    }
-    Ok(())
-}
-
-/// 关闭录制指示器窗口
-#[tauri::command]
-async fn close_recording_indicator(app: AppHandle) -> Result<(), String> {
-    if let Some(window) = app.get_webview_window("recording-indicator") {
-        window.close().map_err(|e| e.to_string())?;
-    }
-    Ok(())
-}
-
-/// 移动录制指示器窗口位置
-#[tauri::command]
-async fn move_recording_indicator(
-    app: AppHandle,
-    capture_state: State<'_, CaptureState>,
-    x: i32,
-    y: i32,
-) -> Result<(), String> {
-    if let Some(window) = app.get_webview_window("recording-indicator") {
-        window
-            .set_position(tauri::Position::Physical(tauri::PhysicalPosition { x, y }))
-            .map_err(|e| e.to_string())?;
-
-        // 同时更新采集区域位置
-        capture_state.update_region(x, y);
-    }
-    Ok(())
-}
-
-/// 调整录制指示器窗口大小和位置
-#[tauri::command]
-async fn resize_recording_indicator(
-    app: AppHandle,
-    capture_state: State<'_, CaptureState>,
-    x: i32,
-    y: i32,
-    width: u32,
-    height: u32,
-) -> Result<(), String> {
-    if let Some(window) = app.get_webview_window("recording-indicator") {
-        // 更新窗口位置和大小
-        window
-            .set_position(tauri::Position::Physical(tauri::PhysicalPosition { x, y }))
-            .map_err(|e| e.to_string())?;
-        window
-            .set_size(tauri::Size::Physical(tauri::PhysicalSize { width, height }))
-            .map_err(|e| e.to_string())?;
-
-        // 同时更新采集区域
-        capture_state.update_region_full(x, y, width, height);
-    }
-    Ok(())
-}
-
-/// 获取录制指示器窗口的当前位置和大小
-#[tauri::command]
-async fn get_recording_indicator_region(
-    app: AppHandle,
-) -> Result<Option<RecordingRegionParam>, String> {
-    if let Some(window) = app.get_webview_window("recording-indicator") {
-        let pos = window.outer_position().map_err(|e| e.to_string())?;
-        let size = window.inner_size().map_err(|e| e.to_string())?;
-        Ok(Some(RecordingRegionParam {
-            x: pos.x,
-            y: pos.y,
-            width: size.width,
-            height: size.height,
-        }))
-    } else {
-        Ok(None)
-    }
-}
-
-// ==================== 多窗口捕获命令 ====================
-
-use multi_window_capture::{MultiWindowCaptureState, WindowCaptureInfo};
-
-/// 开始捕获一个窗口 (支持同时捕获多个)
-#[tauri::command]
-async fn start_multi_window_capture(
-    state: State<'_, MultiWindowCaptureState>,
-    window_id: u32,
-    fps: Option<u32>,
-) -> Result<WindowCaptureInfo, String> {
-    let fps = fps.unwrap_or(30);
-    state.start_capture(window_id, fps)
-}
-
-/// 停止捕获一个窗口
-#[tauri::command]
-async fn stop_multi_window_capture(
-    state: State<'_, MultiWindowCaptureState>,
-    window_id: u32,
-) -> Result<(), String> {
-    state.stop_capture(window_id)
-}
-
-/// 停止所有窗口捕获
-#[tauri::command]
-async fn stop_all_multi_window_capture(
-    state: State<'_, MultiWindowCaptureState>,
-) -> Result<(), String> {
-    state.stop_all();
-    Ok(())
-}
-
-/// 获取窗口的帧信息
-#[tauri::command]
-async fn get_multi_window_frame_info(
-    state: State<'_, MultiWindowCaptureState>,
-    window_id: u32,
-) -> Result<Option<RgbaFrameInfo>, String> {
-    Ok(state.get_frame_info(window_id))
-}
-
-/// 读取窗口的当前帧
-#[tauri::command]
-async fn read_multi_window_frame(
-    state: State<'_, MultiWindowCaptureState>,
-    window_id: u32,
-) -> Result<tauri::ipc::Response, String> {
-    match state.read_frame(window_id) {
-        Some((rgba_data, info)) => {
-            // 打包: [header(24)] [rgba_data]
-            let total_len = 24 + rgba_data.len();
-            let mut buf = Vec::with_capacity(total_len);
-
-            buf.extend_from_slice(&info.frame_id.to_le_bytes());
-            buf.extend_from_slice(&info.width.to_le_bytes());
-            buf.extend_from_slice(&info.height.to_le_bytes());
-            buf.extend_from_slice(&info.timestamp.to_le_bytes());
-            buf.extend_from_slice(&rgba_data);
-
-            Ok(tauri::ipc::Response::new(buf))
-        }
-        None => Err(format!("窗口 {} 没有可用的帧", window_id)),
-    }
-}
-
-/// 获取所有正在捕获的窗口 ID
-#[tauri::command]
-async fn get_active_window_captures(
-    state: State<'_, MultiWindowCaptureState>,
-) -> Result<Vec<u32>, String> {
-    Ok(state.get_active_captures())
 }
 
 fn main() {
-    // 添加 panic hook 以捕获 Rust 层面的崩溃
     panic::set_hook(Box::new(|info| {
         println!("🔥 程序发生严重错误 (Panic): {:?}", info);
         if let Some(s) = info.payload().downcast_ref::<&str>() {
@@ -922,62 +575,29 @@ fn main() {
         }
     }));
 
-    // 初始化 RTSP 代理
-    let proxy = Arc::new(rtsp_proxy::RtspProxy::new());
-    // let proxy_clone = proxy.clone();
-
-    // 在后台启动 WebSocket 服务器 (已切换为 IPC)
-    // tauri::async_runtime::spawn(async move {
-    //     proxy_clone.run_server(9001).await;
-    // });
-
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .setup(|app| {
-            // 设置窗口背景色为黑色
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.set_background_color(Some(Color(10, 10, 15, 255)));
-
-                // 🔧 Windows: 禁用 WebView2 的可见性节流
-                // 这样即使窗口被遮挡，WebView2 也会继续渲染
-                #[cfg(windows)]
-                {
-                    use tauri::WebviewWindow;
-                    // Tauri 2.x: 设置 WebView 不暂停渲染
-                    // WebView2 默认在窗口不可见时会降低渲染频率
-                    println!("🔧 配置 WebView2 在遮挡时继续渲染...");
-                }
-
-                // 监听主窗口关闭事件，关闭所有子窗口
-                let app_handle = app.handle().clone();
-                window.on_window_event(move |event| {
-                    if let tauri::WindowEvent::CloseRequested { .. } = event {
-                        // 关闭录制指示器窗口
-                        if let Some(indicator) =
-                            app_handle.get_webview_window("recording-indicator")
-                        {
-                            let _ = indicator.close();
-                        }
-                        // 关闭区域选择窗口
-                        if let Some(selector) = app_handle.get_webview_window("region-selector") {
-                            let _ = selector.close();
-                        }
-                    }
-                });
             }
             Ok(())
         })
         .manage(VideoFrameState::default())
-        .manage(ProxyState { proxy })
+        .manage(SharedMemoryState::default())
+        .manage(DemuxerState {
+            handle: RwLock::new(DemuxerHandle::new()),
+        })
         .manage(AsyncDetectorState::default())
-        .manage(ZeroCopyRendererState::default())
-        .manage(CaptureState::default())
-        .manage(multi_window_capture::MultiWindowCaptureState::default())
+        .manage(LlmInferenceState::default())
         .invoke_handler(tauri::generate_handler![
             get_latest_frame,
             has_new_frame,
             mark_frame_processed,
+            get_shared_memory_info,
+            get_shared_memory_frame,
             start_rtsp_stream,
+            stop_rtsp_stream,
             log_frontend,
             show_window,
             read_text_file,
@@ -991,36 +611,11 @@ fn main() {
             start_detector,
             stop_detector,
             detect_frame,
-            // 零拷贝共享内存命令
-            start_zerocopy_stream,
-            stop_zerocopy_stream,
-            get_zerocopy_frame_info,
-            read_zerocopy_frame,
-            // 摄像头/桌面采集命令
-            list_capture_devices,
-            start_capture,
-            stop_capture,
-            get_capture_frame_info,
-            read_capture_frame,
-            update_capture_region,
-            // 区域选择命令
-            open_region_selector,
-            show_region_selector,
-            close_region_selector,
-            // 录制指示器命令
-            open_recording_indicator,
-            show_recording_indicator,
-            close_recording_indicator,
-            move_recording_indicator,
-            resize_recording_indicator,
-            get_recording_indicator_region,
-            // 多窗口捕获命令
-            start_multi_window_capture,
-            stop_multi_window_capture,
-            stop_all_multi_window_capture,
-            get_multi_window_frame_info,
-            read_multi_window_frame,
-            get_active_window_captures,
+            // LLM 推理命令
+            start_llm_inference,
+            stop_llm_inference,
+            get_llm_status,
+            update_llm_config,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
