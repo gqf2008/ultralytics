@@ -92,6 +92,103 @@ class WebGLVideoRenderer {
         console.log('🔊 Audio Context initialized:', this.audioContext.sampleRate, 'Hz');
     }
     
+    /**
+     * 在画布上显示错误信息，并创建可点击的安装按钮
+     */
+    showErrorMessage(lines, showInstallButton = false) {
+        const w = this.canvas.width;
+        const h = this.canvas.height;
+        
+        this.ctx.fillStyle = '#1a1a1a';
+        this.ctx.fillRect(0, 0, w, h);
+        
+        this.ctx.textAlign = 'center';
+        this.ctx.textBaseline = 'middle';
+        
+        const lineHeight = 30;
+        const startY = h / 2 - (lines.length * lineHeight) / 2 - 30;
+        
+        lines.forEach((line, i) => {
+            if (i === 0) {
+                this.ctx.fillStyle = '#ff4444';
+                this.ctx.font = 'bold 24px monospace';
+            } else {
+                this.ctx.fillStyle = '#cccccc';
+                this.ctx.font = '18px monospace';
+            }
+            this.ctx.fillText(line, w / 2, startY + i * lineHeight);
+        });
+        
+        // 创建安装 HEVC 按钮
+        if (showInstallButton) {
+            this.createInstallHEVCButton(w / 2, startY + lines.length * lineHeight + 40);
+        }
+    }
+    
+    /**
+     * 创建安装 HEVC 扩展的按钮
+     */
+    createInstallHEVCButton(x, y) {
+        // 移除已存在的按钮
+        const existingBtn = document.getElementById('hevc-install-btn');
+        if (existingBtn) existingBtn.remove();
+        
+        const btn = document.createElement('button');
+        btn.id = 'hevc-install-btn';
+        btn.textContent = '📦 打开 Microsoft Store 安装 HEVC 扩展';
+        btn.style.cssText = `
+            position: fixed;
+            left: ${x}px;
+            top: ${y}px;
+            transform: translateX(-50%);
+            padding: 12px 24px;
+            font-size: 16px;
+            font-weight: bold;
+            color: white;
+            background: linear-gradient(135deg, #0078d4, #106ebe);
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            box-shadow: 0 4px 12px rgba(0, 120, 212, 0.4);
+            transition: all 0.2s;
+            z-index: 1000;
+        `;
+        
+        btn.onmouseenter = () => {
+            btn.style.transform = 'translateX(-50%) scale(1.05)';
+            btn.style.boxShadow = '0 6px 16px rgba(0, 120, 212, 0.5)';
+        };
+        btn.onmouseleave = () => {
+            btn.style.transform = 'translateX(-50%) scale(1)';
+            btn.style.boxShadow = '0 4px 12px rgba(0, 120, 212, 0.4)';
+        };
+        
+        btn.onclick = () => {
+            // 打开 Microsoft Store 的 HEVC 扩展页面
+            // ms-windows-store://pdp/?ProductId=9n4wgh0z6vhq - 免费版 (OEM)
+            // ms-windows-store://pdp/?ProductId=9nmzlz57r3t7 - 付费版
+            const storeUrl = 'ms-windows-store://pdp/?ProductId=9n4wgh0z6vhq';
+            console.log('🏪 打开 Microsoft Store:', storeUrl);
+            
+            // 使用 Tauri 的 shell 打开
+            if (window.__TAURI__) {
+                import('@tauri-apps/plugin-shell').then(({ open }) => {
+                    open(storeUrl).catch(e => {
+                        console.error('打开 Store 失败:', e);
+                        // 回退到网页版
+                        window.open('https://apps.microsoft.com/detail/9n4wgh0z6vhq', '_blank');
+                    });
+                }).catch(() => {
+                    window.open('https://apps.microsoft.com/detail/9n4wgh0z6vhq', '_blank');
+                });
+            } else {
+                window.open('https://apps.microsoft.com/detail/9n4wgh0z6vhq', '_blank');
+            }
+        };
+        
+        document.body.appendChild(btn);
+    }
+    
     resizeCanvas() {
         const w = window.innerWidth;
         const h = window.innerHeight;
@@ -277,6 +374,34 @@ class WebGLVideoRenderer {
                 }
             } else {
                 console.error(`❌ ${codec.toUpperCase()} ${width}x${height} NOT Supported`);
+                
+                // 检测是否是 HEVC 不支持的情况
+                if (isHEVC) {
+                    console.error('❌ ========================================');
+                    console.error('❌ HEVC/H.265 解码不受支持！');
+                    console.error('❌ 可能的原因:');
+                    console.error('❌ 1. Windows N/KN 版本缺少媒体功能包');
+                    console.error('❌ 2. 未安装 "HEVC视频扩展" (Microsoft Store)');
+                    console.error('❌ 3. WebView2/Edge 版本过旧');
+                    console.error('❌ ');
+                    console.error('❌ 解决方案:');
+                    console.error('❌ 1. 在 Microsoft Store 搜索安装 "HEVC视频扩展"');
+                    console.error('❌    或者搜索 "HEVC Video Extensions from Device Manufacturer" (免费)');
+                    console.error('❌ 2. 更新 Windows 和 Edge 浏览器到最新版本');
+                    console.error('❌ 3. 如果是 Windows N/KN 版，安装媒体功能包');
+                    console.error('❌ ========================================');
+                    
+                    // 显示错误提示在画面上，带安装按钮
+                    this.showErrorMessage([
+                        '❌ HEVC/H.265 解码不受支持',
+                        '',
+                        '您的系统未安装 HEVC 视频编解码器',
+                        '',
+                        '请点击下方按钮安装免费的 HEVC 扩展',
+                        '安装完成后重启本程序即可'
+                    ], true);  // true = 显示安装按钮
+                }
+                
                 // 尝试不带 description 的配置
                 if (config.description) {
                     console.log('🔄 Retrying without description...');
@@ -287,6 +412,8 @@ class WebGLVideoRenderer {
                             this.decoderConfigured = true;
                             this.decoderHasDescription = false;
                             console.log(`✅ Decoder configured (without description)`);
+                        } else if (isHEVC) {
+                            console.error('❌ HEVC 完全不支持，即使不带 description');
                         }
                     });
                 }
