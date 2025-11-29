@@ -126,7 +126,24 @@ class WebGLVideoRenderer {
     }
     
     /**
-     * 创建安装 HEVC 扩展的按钮
+     * 检测当前运行平台
+     * @returns {'windows'|'macos'|'linux'}
+     */
+    detectPlatform() {
+        const ua = navigator.userAgent.toLowerCase();
+        const platform = navigator.platform.toLowerCase();
+        
+        if (platform.includes('win') || ua.includes('windows')) {
+            return 'windows';
+        } else if (platform.includes('mac') || ua.includes('macintosh')) {
+            return 'macos';
+        } else {
+            return 'linux';
+        }
+    }
+    
+    /**
+     * 创建安装 HEVC 扩展的按钮 (仅 Windows)
      */
     createInstallHEVCButton(x, y) {
         // 移除已存在的按钮
@@ -377,29 +394,63 @@ class WebGLVideoRenderer {
                 
                 // 检测是否是 HEVC 不支持的情况
                 if (isHEVC) {
+                    const platform = this.detectPlatform();
                     console.error('❌ ========================================');
                     console.error('❌ HEVC/H.265 解码不受支持！');
-                    console.error('❌ 可能的原因:');
-                    console.error('❌ 1. Windows N/KN 版本缺少媒体功能包');
-                    console.error('❌ 2. 未安装 "HEVC视频扩展" (Microsoft Store)');
-                    console.error('❌ 3. WebView2/Edge 版本过旧');
-                    console.error('❌ ');
-                    console.error('❌ 解决方案:');
-                    console.error('❌ 1. 在 Microsoft Store 搜索安装 "HEVC视频扩展"');
-                    console.error('❌    或者搜索 "HEVC Video Extensions from Device Manufacturer" (免费)');
-                    console.error('❌ 2. 更新 Windows 和 Edge 浏览器到最新版本');
-                    console.error('❌ 3. 如果是 Windows N/KN 版，安装媒体功能包');
-                    console.error('❌ ========================================');
+                    console.error(`❌ 检测到平台: ${platform}`);
                     
-                    // 显示错误提示在画面上，带安装按钮
-                    this.showErrorMessage([
-                        '❌ HEVC/H.265 解码不受支持',
-                        '',
-                        '您的系统未安装 HEVC 视频编解码器',
-                        '',
-                        '请点击下方按钮安装免费的 HEVC 扩展',
-                        '安装完成后重启本程序即可'
-                    ], true);  // true = 显示安装按钮
+                    if (platform === 'windows') {
+                        console.error('❌ 可能的原因:');
+                        console.error('❌ 1. Windows N/KN 版本缺少媒体功能包');
+                        console.error('❌ 2. 未安装 "HEVC视频扩展" (Microsoft Store)');
+                        console.error('❌ 3. WebView2/Edge 版本过旧');
+                        console.error('❌ ');
+                        console.error('❌ 解决方案:');
+                        console.error('❌ 1. 在 Microsoft Store 搜索安装 "HEVC视频扩展"');
+                        console.error('❌    或者搜索 "HEVC Video Extensions from Device Manufacturer" (免费)');
+                        console.error('❌ 2. 更新 Windows 和 Edge 浏览器到最新版本');
+                        console.error('❌ 3. 如果是 Windows N/KN 版，安装媒体功能包');
+                        console.error('❌ ========================================');
+                        
+                        // Windows: 显示安装按钮
+                        this.showErrorMessage([
+                            '❌ HEVC/H.265 解码不受支持',
+                            '',
+                            '您的系统未安装 HEVC 视频编解码器',
+                            '',
+                            '请点击下方按钮安装免费的 HEVC 扩展',
+                            '安装完成后重启本程序即可'
+                        ], true);  // true = 显示安装按钮
+                    } else if (platform === 'macos') {
+                        console.error('❌ macOS 通常原生支持 HEVC，但当前检测不支持');
+                        console.error('❌ 可能的原因:');
+                        console.error('❌ 1. macOS 版本过旧 (需要 10.13+)');
+                        console.error('❌ 2. 使用的浏览器/WebView 不支持');
+                        console.error('❌ 解决方案: 更新 macOS 到最新版本');
+                        console.error('❌ ========================================');
+                        
+                        this.showErrorMessage([
+                            '❌ HEVC/H.265 解码不受支持',
+                            '',
+                            'macOS 通常原生支持 HEVC',
+                            '',
+                            '请尝试更新 macOS 到最新版本',
+                            '或检查系统偏好设置中的安全性设置'
+                        ], false);
+                    } else {
+                        console.error('❌ Linux 系统可能需要安装额外的编解码器');
+                        console.error('❌ 解决方案: 安装 ffmpeg 或 gstreamer HEVC 插件');
+                        console.error('❌ ========================================');
+                        
+                        this.showErrorMessage([
+                            '❌ HEVC/H.265 解码不受支持',
+                            '',
+                            'Linux 系统需要安装 HEVC 编解码器',
+                            '',
+                            '请安装: sudo apt install gstreamer1.0-libav',
+                            '或安装完整的 ffmpeg 支持'
+                        ], false);
+                    }
                 }
                 
                 // 尝试不带 description 的配置
