@@ -195,12 +195,14 @@ class WebGLVideoRenderer {
         } else if (isHEVC) {
             // HEVC/H.265 codec string
             // hvc1.P.T.Lxx.Cx - P=profile, T=tier, Lxx=level, Cx=constraints
-            if (height > 2160) {
+            // 如果分辨率未知，默认使用 Level 5.1 (4K 兼容)
+            const effectiveHeight = height > 0 ? height : 1080;
+            if (effectiveHeight > 2160) {
                 codecString = 'hvc1.1.6.L186.B0'; // Main Profile Level 6.2 (8K)
-            } else if (height > 1080) {
+            } else if (effectiveHeight > 1080) {
                 codecString = 'hvc1.1.6.L153.B0'; // Main Profile Level 5.1 (4K)
             } else {
-                codecString = 'hvc1.1.6.L120.B0'; // Main Profile Level 4.0 (1080p)
+                codecString = 'hvc1.1.6.L153.B0'; // Main Profile Level 5.1 (默认兼容 4K)
             }
         } else {
             console.error(`不支持的编解码器: ${codec}`);
@@ -209,8 +211,10 @@ class WebGLVideoRenderer {
         
         const config = {
             codec: codecString,
-            codedWidth: width,
-            codedHeight: height,
+            // 如果分辨率未知，使用 1920x1080 作为默认值
+            // WebCodecs 解码器会从视频流中自动检测实际分辨率
+            codedWidth: width > 0 ? width : 1920,
+            codedHeight: height > 0 ? height : 1080,
             optimizeForLatency: true,  // 优化延迟
         };
         

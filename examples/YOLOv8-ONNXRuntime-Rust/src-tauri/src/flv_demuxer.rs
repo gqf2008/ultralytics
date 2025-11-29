@@ -36,7 +36,10 @@ pub enum VideoCodec {
     VP6Alpha = 5,
     ScreenVideo2 = 6,
     AVC = 7,   // H.264
-    HEVC = 12, // H.265 (非标准扩展)
+    HEVC = 12, // H.265 (Enhanced FLV, 或部分厂商扩展)
+    // Enhanced FLV (ISO 14496-12 FourCC)
+    EnhancedHEVC = 0x68766331, // 'hvc1'
+    EnhancedAV1 = 0x61763031,  // 'av01'
 }
 
 impl TryFrom<u8> for VideoCodec {
@@ -261,6 +264,14 @@ impl FlvDemuxer {
         let frame_type_val = (first_byte >> 4) & 0x0F;
         let codec_id = first_byte & 0x0F;
 
+        // Enhanced FLV 检测 (帧类型为 5 = ExVideoTagHeader)
+        // 或者检测 codec_id = 0 + FourCC
+        let is_enhanced_flv = frame_type_val == 5 || (codec_id == 0 && tag.data.len() >= 5);
+
+        if is_enhanced_flv {
+            return self.parse_enhanced_video_tag(tag);
+        }
+
         let frame_type = FrameType::try_from(frame_type_val).ok()?;
         let codec = VideoCodec::try_from(codec_id).ok()?;
         let is_keyframe = frame_type == FrameType::Keyframe;
@@ -281,7 +292,7 @@ impl FlvDemuxer {
             let video_data = tag.data[5..].to_vec();
 
             if avc_packet_type == AvcPacketType::SequenceHeader as u8 {
-                // 这是 SPS/PPS 数据 (AVCC 格式)
+                // 这是 SPS/PPS 数据 (AVCC/HVCC 格式)
                 self.metadata.extradata = video_data.clone();
                 self.metadata.video_codec = Some(codec);
 
@@ -327,6 +338,139 @@ impl FlvDemuxer {
         }
 
         None
+    }
+
+    /// 解析 Enhanced FLV 视频 Tag (支持 HEVC/AV1)
+    fn parse_enhanced_video_tag(&mut self, tag: &FlvTag) -> Option<VideoFrame> {
+        if tag.data.len() < 5 {
+            return None;
+        }
+
+        let first_byte = tag.data[0];
+        let frame_type_val = (first_byte >> 4) & 0x0F;
+        let packet_type = first_byte & 0x0F;
+
+        // Enhanced FLV: 第 2-5 字节是 FourCC
+        let fourcc = &tag.data[1..5];
+        let fourcc_str = String::from_utf8_lossy(fourcc);
+
+        // 判断编码类型
+        let codec = if fourcc == b"hvc1" || fourcc == b"hev1" {
+            VideoCodec::HEVC
+        } else if fourcc == b"avc1" {
+            VideoCodec::AVC
+        } else if fourcc == b"av01" {
+            println!("⚠️ AV1 编码暂不支持");
+            return None;
+        } else {
+            println!("⚠️ 未知 FourCC: {} ({:02x?})", fourcc_str, fourcc);
+            return None;
+        };
+
+        let is_keyframe = frame_type_val == 1; // 1 = keyframe
+        let frame_type = if is_keyframe {
+            FrameType::Keyframe
+        } else {
+            FrameType::InterFrame
+        };
+
+        // Enhanced FLV packet types:
+        // 0 = PacketTypeSequenceStart (类似 SequenceHeader)
+        // 1 = PacketTypeCodedFrames
+        // 2 = PacketTypeSequenceEnd
+        // 3 = PacketTypeCodedFramesX (没有 CompositionTime)
+        // 4 = PacketTypeMetadata
+        // 5 = PacketTypeMPEG2TSSequenceStart
+
+        match packet_type {
+            0 => {
+                // SequenceStart - 包含配置记录 (HVCC/AVCC)
+                let config_data = tag.data[5..].to_vec();
+
+                self.metadata.extradata = config_data.clone();
+                self.metadata.video_codec = Some(codec);
+
+                // 解析 HVCC 获取分辨率
+                if codec == VideoCodec::HEVC {
+                    if let Some((w, h)) = parse_hvcc_resolution(&config_data) {
+                        self.metadata.width = w;
+                        self.metadata.height = h;
+                    }
+                } else if let Some((w, h)) = parse_avcc_resolution(&config_data, codec) {
+                    self.metadata.width = w;
+                    self.metadata.height = h;
+                }
+
+                println!(
+                    "📦 收到 Enhanced FLV {} 序列头: {} bytes, {}x{}, FourCC={}",
+                    if codec == VideoCodec::HEVC {
+                        "HEVC"
+                    } else {
+                        "AVC"
+                    },
+                    self.metadata.extradata.len(),
+                    self.metadata.width,
+                    self.metadata.height,
+                    fourcc_str
+                );
+
+                Some(VideoFrame {
+                    codec,
+                    frame_type,
+                    is_keyframe: true,
+                    pts: tag.timestamp,
+                    dts: tag.timestamp,
+                    data: config_data,
+                    is_sequence_header: true,
+                })
+            }
+            1 => {
+                // CodedFrames - 包含 CompositionTime (3 bytes) + 数据
+                if tag.data.len() < 8 {
+                    return None;
+                }
+
+                let composition_time =
+                    i32::from_be_bytes([0, tag.data[5], tag.data[6], tag.data[7]]);
+                let video_data = tag.data[8..].to_vec();
+
+                let pts = tag.timestamp + composition_time as i64;
+                let dts = tag.timestamp;
+
+                Some(VideoFrame {
+                    codec,
+                    frame_type,
+                    is_keyframe,
+                    pts,
+                    dts,
+                    data: video_data,
+                    is_sequence_header: false,
+                })
+            }
+            3 => {
+                // CodedFramesX - 没有 CompositionTime
+                let video_data = tag.data[5..].to_vec();
+
+                Some(VideoFrame {
+                    codec,
+                    frame_type,
+                    is_keyframe,
+                    pts: tag.timestamp,
+                    dts: tag.timestamp,
+                    data: video_data,
+                    is_sequence_header: false,
+                })
+            }
+            2 => {
+                // SequenceEnd
+                println!("📼 Enhanced FLV: 序列结束");
+                None
+            }
+            _ => {
+                println!("⚠️ Enhanced FLV: 未知 packet_type={}", packet_type);
+                None
+            }
+        }
     }
 
     /// 解析 Script Data (onMetaData) - 使用 amf 库
@@ -460,10 +604,182 @@ fn parse_avcc_resolution(data: &[u8], codec: VideoCodec) -> Option<(u32, u32)> {
         );
 
         parse_h264_sps_resolution(sps)
+    } else if codec == VideoCodec::HEVC {
+        parse_hvcc_resolution(data)
     } else {
-        // HEVC HVCC 格式更复杂，暂不解析
         None
     }
+}
+
+/// 从 HVCC extradata 解析 HEVC 分辨率
+fn parse_hvcc_resolution(data: &[u8]) -> Option<(u32, u32)> {
+    // HVCC 格式比 AVCC 更复杂
+    // https://github.com/niclet/HEVCBitstreamAnalyzer
+
+    if data.len() < 23 {
+        println!("⚠️ HVCC extradata 太短: {} bytes", data.len());
+        return None;
+    }
+
+    let preview: Vec<u8> = data.iter().take(24.min(data.len())).cloned().collect();
+    println!(
+        "🔍 HVCC extradata 前{}字节: {:02x?}",
+        preview.len(),
+        preview
+    );
+
+    // HVCC header:
+    // [0] configurationVersion
+    // [1] general_profile_space (2) + general_tier_flag (1) + general_profile_idc (5)
+    // [2-5] general_profile_compatibility_flags
+    // [6-11] general_constraint_indicator_flags
+    // [12] general_level_idc
+    // [13-14] min_spatial_segmentation_idc (12 bits)
+    // [15] parallelismType (2 bits)
+    // [16] chroma_format_idc (2 bits)
+    // [17] bit_depth_luma_minus8 (3 bits)
+    // [18] bit_depth_chroma_minus8 (3 bits)
+    // [19-20] avgFrameRate
+    // [21] constantFrameRate (2) + numTemporalLayers (3) + temporalIdNested (1) + lengthSizeMinusOne (2)
+    // [22] numOfArrays
+
+    let num_arrays = data[22];
+    let mut pos = 23;
+
+    // 遍历 NAL 单元数组，找到 SPS
+    for _ in 0..num_arrays {
+        if pos + 3 > data.len() {
+            break;
+        }
+
+        let nal_type = data[pos] & 0x3F;
+        let num_nalus = u16::from_be_bytes([data[pos + 1], data[pos + 2]]) as usize;
+        pos += 3;
+
+        for _ in 0..num_nalus {
+            if pos + 2 > data.len() {
+                break;
+            }
+
+            let nal_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+            pos += 2;
+
+            if pos + nal_len > data.len() {
+                break;
+            }
+
+            // SPS NAL type = 33
+            if nal_type == 33 && nal_len > 2 {
+                let sps_data = &data[pos..pos + nal_len];
+                if let Some(res) = parse_hevc_sps_resolution(sps_data) {
+                    return Some(res);
+                }
+            }
+
+            pos += nal_len;
+        }
+    }
+
+    println!("⚠️ HVCC 未找到 SPS");
+    None
+}
+
+/// 解析 HEVC SPS 获取分辨率 (简化版)
+fn parse_hevc_sps_resolution(sps: &[u8]) -> Option<(u32, u32)> {
+    // HEVC SPS 解析比较复杂
+    // NAL header: 2 bytes
+    if sps.len() < 15 {
+        println!("⚠️ HEVC SPS 太短: {} bytes", sps.len());
+        return None;
+    }
+
+    let sps_preview: Vec<u8> = sps.iter().take(20.min(sps.len())).cloned().collect();
+    println!("🔍 HEVC SPS 数据: {:02x?}", sps_preview);
+
+    // 移除 emulation prevention bytes (00 00 03 -> 00 00)
+    let rbsp = remove_emulation_prevention(&sps[2..]); // 跳过 2 字节 NAL header
+
+    let mut reader = BitReader::new(&rbsp);
+
+    // sps_video_parameter_set_id (4 bits)
+    reader.read_bits(4)?;
+    // sps_max_sub_layers_minus1 (3 bits)
+    let max_sub_layers = reader.read_bits(3)? as usize;
+    // sps_temporal_id_nesting_flag (1 bit)
+    reader.read_bits(1)?;
+
+    // profile_tier_level(sps_max_sub_layers_minus1)
+    // general_profile_space (2) + general_tier_flag (1) + general_profile_idc (5)
+    reader.read_bits(8)?;
+    // general_profile_compatibility_flag[32]
+    reader.read_bits(32)?;
+    // general_progressive_source_flag + general_interlaced_source_flag +
+    // general_non_packed_constraint_flag + general_frame_only_constraint_flag +
+    // general_max_12bit_constraint_flag + ... (48 bits total for general constraints)
+    reader.read_bits(32)?;
+    reader.read_bits(16)?;
+    // general_level_idc (8)
+    reader.read_bits(8)?;
+
+    // sub_layer_profile_present_flag[i] and sub_layer_level_present_flag[i]
+    // 每个 sub layer 2 bits
+    if max_sub_layers > 0 {
+        for _ in 0..max_sub_layers {
+            reader.read_bits(2)?; // profile_present + level_present flags
+        }
+        // 填充到 8 的倍数
+        if max_sub_layers < 8 {
+            for _ in max_sub_layers..8 {
+                reader.read_bits(2)?; // reserved_zero_2bits
+            }
+        }
+    }
+
+    // 对于每个 sub_layer (如果 profile/level present)
+    // 这里简化跳过，因为通常 max_sub_layers = 0 或 1
+
+    // sps_seq_parameter_set_id
+    reader.read_exp_golomb()?;
+    // chroma_format_idc
+    let chroma_format = reader.read_exp_golomb()?;
+    if chroma_format == 3 {
+        reader.read_bits(1)?; // separate_colour_plane_flag
+    }
+
+    // pic_width_in_luma_samples
+    let width = reader.read_exp_golomb()?;
+    // pic_height_in_luma_samples
+    let height = reader.read_exp_golomb()?;
+
+    if width > 0 && height > 0 && width < 16384 && height < 16384 {
+        println!("📐 HEVC SPS 解析成功: {}x{}", width, height);
+        Some((width, height))
+    } else {
+        println!("⚠️ HEVC SPS 解析得到无效分辨率: {}x{}", width, height);
+        None
+    }
+}
+
+/// 移除 emulation prevention bytes (00 00 03 -> 00 00)
+/// H.264/HEVC 码流中为了避免起始码冲突，会在 00 00 后插入 03
+fn remove_emulation_prevention(data: &[u8]) -> Vec<u8> {
+    let mut result = Vec::with_capacity(data.len());
+    let mut i = 0;
+
+    while i < data.len() {
+        // 检测 00 00 03 序列
+        if i + 2 < data.len() && data[i] == 0x00 && data[i + 1] == 0x00 && data[i + 2] == 0x03 {
+            // 写入 00 00，跳过 03
+            result.push(0x00);
+            result.push(0x00);
+            i += 3;
+        } else {
+            result.push(data[i]);
+            i += 1;
+        }
+    }
+
+    result
 }
 
 /// H.264 SPS 分辨率解析 (使用 Exp-Golomb)
@@ -719,7 +1035,6 @@ pub fn avcc_extradata_to_annexb(extradata: &[u8]) -> Vec<u8> {
     // [4] lengthSizeMinusOne (NAL length size - 1, 低 2 位)
     // [5] numOfSequenceParameterSets (低 5 位)
 
-    let nal_length_size = (extradata[4] & 0x03) + 1;
     let num_sps = extradata[5] & 0x1F;
 
     let mut pos = 6;
@@ -760,6 +1075,51 @@ pub fn avcc_extradata_to_annexb(extradata: &[u8]) -> Vec<u8> {
             result.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
             result.extend_from_slice(&extradata[pos..pos + pps_len]);
             pos += pps_len;
+        }
+    }
+
+    result
+}
+
+/// HVCC extradata 转 Annex-B (VPS/SPS/PPS)
+pub fn hvcc_extradata_to_annexb(extradata: &[u8]) -> Vec<u8> {
+    if extradata.len() < 23 {
+        return Vec::new();
+    }
+
+    let mut result = Vec::new();
+
+    // HVCC header 长度为 22 bytes + numOfArrays
+    // [22] numOfArrays
+    let num_arrays = extradata[22];
+    let mut pos = 23;
+
+    for _ in 0..num_arrays {
+        if pos + 3 > extradata.len() {
+            break;
+        }
+
+        // array_completeness (1) + reserved (1) + NAL_unit_type (6)
+        let _nal_type = extradata[pos] & 0x3F;
+        let num_nalus = u16::from_be_bytes([extradata[pos + 1], extradata[pos + 2]]) as usize;
+        pos += 3;
+
+        for _ in 0..num_nalus {
+            if pos + 2 > extradata.len() {
+                break;
+            }
+
+            let nal_len = u16::from_be_bytes([extradata[pos], extradata[pos + 1]]) as usize;
+            pos += 2;
+
+            if pos + nal_len > extradata.len() {
+                break;
+            }
+
+            // 添加 Annex-B 起始码
+            result.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+            result.extend_from_slice(&extradata[pos..pos + nal_len]);
+            pos += nal_len;
         }
     }
 
