@@ -1,5 +1,5 @@
-// 保留控制台窗口便于调试 (注释掉下面这行可隐藏控制台)
-// #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// Release 版本隐藏控制台窗口
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod flv_demuxer;
 mod llm_inference;
