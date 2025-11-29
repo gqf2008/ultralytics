@@ -48,6 +48,7 @@ window.addEventListener('unhandledrejection', (event) => {
 class WebGLVideoRenderer {
     constructor(canvas) {
         this.canvas = canvas;
+        // 使用默认设置，让浏览器自动处理色彩空间
         this.ctx = canvas.getContext('2d');
         
         this.frameCount = 0;
@@ -940,14 +941,23 @@ class WebGLVideoRenderer {
             this.videoHeight = frame.displayHeight;
             console.log(`[Video Source] ${this.videoWidth}x${this.videoHeight}`);
             console.log(`[Canvas Size] ${this.canvas.width}x${this.canvas.height}`);
+            // 打印帧的色彩空间信息
+            console.log(`[Frame ColorSpace] format=${frame.format}, colorSpace=${JSON.stringify(frame.colorSpace)}`);
         }
 
+        // 应用色彩校正滤镜（修复 WebView2 色彩偏白问题）
+        // fullRange BT.709 在 WebView2 中渲染偏白，需要增加对比度和饱和度
+        this.ctx.filter = 'contrast(1.2) saturate(1.3)';
+        
         this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
         this.ctx.drawImage(
             frame, 
             0, 0, frame.displayWidth, frame.displayHeight,
             0, 0, this.canvas.width, this.canvas.height
         );
+        
+        // 重置滤镜
+        this.ctx.filter = 'none';
 
         this.frameCount++;
         if (now - this.lastTime >= 1000) {
@@ -1140,8 +1150,10 @@ class CanvasTransform {
         const transform = `translate(${this.offsetX}px, ${this.offsetY}px) scale(${this.scale})`;
         this.canvas.style.transform = transform;
         this.canvas.style.transformOrigin = '0 0';
-        this.overlayCanvas.style.transform = transform;
-        this.overlayCanvas.style.transformOrigin = '0 0';
+        if (this.overlayCanvas) {
+            this.overlayCanvas.style.transform = transform;
+            this.overlayCanvas.style.transformOrigin = '0 0';
+        }
     }
     
     updateZoomDisplay() {
@@ -1180,8 +1192,9 @@ class CanvasTransform {
 // 初始化变换控制（等待 DOM 加载完成）
 let canvasTransform = null;
 document.addEventListener('DOMContentLoaded', () => {
+    const overlayCanvas = document.getElementById('overlay-canvas');
     if (canvas) {
-        canvasTransform = new CanvasTransform(canvas, null);
+        canvasTransform = new CanvasTransform(canvas, overlayCanvas);
         window.canvasTransform = canvasTransform;
     }
 });

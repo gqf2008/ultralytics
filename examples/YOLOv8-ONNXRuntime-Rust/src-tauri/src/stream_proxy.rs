@@ -525,30 +525,29 @@ fn run_ffmpeg_stream(
     // 初始化 FFmpeg
     ffmpeg::init().map_err(|e| format!("FFmpeg 初始化失败: {}", e))?;
 
+    let url_lower = url.to_lowercase();
+
     // 优化选项，加快连接速度
     let mut options = ffmpeg::Dictionary::new();
 
-    // 超时设置
-    options.set("timeout", "5000000"); // 5秒超时 (微秒)
-    options.set("stimeout", "5000000"); // socket 超时
-
     // 关键优化：减少分析时间！
-    options.set("analyzeduration", "500000"); // 500ms 而不是默认 5s
-    options.set("probesize", "32768"); // 只分析 32KB
+    options.set("analyzeduration", "1000000"); // 1s
+    options.set("probesize", "65536"); // 64KB
 
     // 低延迟设置
-    options.set("fflags", "nobuffer+discardcorrupt");
-    options.set("flags", "low_delay");
-    options.set("buffer_size", "16777216");
+    options.set("fflags", "nobuffer");
 
     // 协议特定设置
-    let url_lower = url.to_lowercase();
     if url_lower.contains(".flv") || url_lower.contains("flv?") {
         options.set("flv_metadata", "1");
     }
-    if url_lower.starts_with("rtmp://") {
-        options.set("rtmp_live", "live");
+    if url_lower.starts_with("rtsp://") {
+        options.set("rtsp_transport", "tcp");
+        options.set("stimeout", "5000000");
     }
+    // RTMP: 不设置额外选项，使用 FFmpeg 默认行为
+
+    println!("🔗 [FFmpeg] 打开: {}", url);
 
     // 打开输入
     let mut ictx = ffmpeg::format::input_with_dictionary(&url, options)

@@ -20,7 +20,7 @@
                 "fullscreen": false,
                 "decorations": true,
                 "devtools": true,
-                "transparent": true,
+                "transparent": false,
                 "visible": false
             }
         ],
