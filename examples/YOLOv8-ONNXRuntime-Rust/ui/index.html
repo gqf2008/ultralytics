@@ -568,6 +568,249 @@
         ::-webkit-scrollbar-track { background: transparent; }
         ::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.15); border-radius: 3px; }
         ::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.25); }
+        
+        /* ========== 流信息面板 ========== */
+        #stream-info-panel {
+            position: absolute;
+            top: 20px;
+            right: 20px;
+            width: 300px;
+            background: var(--glass-bg);
+            backdrop-filter: blur(24px) saturate(180%);
+            -webkit-backdrop-filter: blur(24px) saturate(180%);
+            border: 1px solid var(--glass-border);
+            border-radius: 16px;
+            z-index: 100;
+            overflow: hidden;
+            transition: all 0.4s cubic-bezier(0.16, 1, 0.3, 1);
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5),
+                        0 0 1px rgba(255, 255, 255, 0.1) inset;
+        }
+        
+        #stream-info-panel.collapsed {
+            width: auto;
+        }
+        
+        .info-panel-header {
+            padding: 12px 16px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            border-bottom: 1px solid var(--glass-border);
+            cursor: move;
+            user-select: none;
+        }
+        
+        .info-panel-title {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 13px;
+            font-weight: 600;
+        }
+        
+        .info-panel-title .icon {
+            font-size: 16px;
+        }
+        
+        #info-toggle-btn {
+            width: 24px;
+            height: 24px;
+            background: rgba(255, 255, 255, 0.06);
+            border: none;
+            border-radius: 6px;
+            color: var(--text-secondary);
+            cursor: pointer;
+            font-size: 10px;
+            transition: all 0.2s ease;
+        }
+        
+        #stream-info-panel.collapsed #info-toggle-btn {
+            transform: rotate(180deg);
+        }
+        
+        #stream-info-body {
+            padding: 12px;
+            max-height: 500px;
+            overflow-y: auto;
+            transition: all 0.4s cubic-bezier(0.16, 1, 0.3, 1);
+        }
+        
+        #stream-info-panel.collapsed #stream-info-body {
+            max-height: 0;
+            padding: 0;
+            opacity: 0;
+            pointer-events: none;
+        }
+        
+        .info-section {
+            background: rgba(255, 255, 255, 0.02);
+            border: 1px solid var(--glass-border);
+            border-radius: 10px;
+            padding: 10px 12px;
+            margin-bottom: 8px;
+        }
+        
+        .info-section:last-child {
+            margin-bottom: 0;
+        }
+        
+        .info-section-title {
+            font-size: 11px;
+            font-weight: 600;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 8px;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        
+        .info-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 4px 0;
+            font-size: 12px;
+        }
+        
+        .info-row .label {
+            color: var(--text-muted);
+        }
+        
+        .info-row .value {
+            color: var(--text-primary);
+            font-weight: 500;
+            font-family: 'JetBrains Mono', monospace;
+        }
+        
+        .info-row .value.highlight {
+            color: var(--accent-light);
+        }
+        
+        .info-row .value.success {
+            color: var(--success);
+        }
+        
+        .info-row .value.warning {
+            color: var(--warning);
+        }
+        
+        .info-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            padding: 2px 8px;
+            background: rgba(99, 102, 241, 0.2);
+            border-radius: 4px;
+            font-size: 11px;
+            font-weight: 600;
+            color: var(--accent-light);
+        }
+        
+        .info-badge.green {
+            background: rgba(16, 185, 129, 0.2);
+            color: var(--success);
+        }
+        
+        .info-badge.orange {
+            background: rgba(245, 158, 11, 0.2);
+            color: var(--warning);
+        }
+        
+        /* ========== 开关样式 ========== */
+        .toggle-switch {
+            position: relative;
+            display: inline-block;
+            width: 44px;
+            height: 24px;
+        }
+        
+        .toggle-switch input {
+            opacity: 0;
+            width: 0;
+            height: 0;
+        }
+        
+        .toggle-slider {
+            position: absolute;
+            cursor: pointer;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(255, 255, 255, 0.1);
+            transition: 0.3s;
+            border-radius: 24px;
+        }
+        
+        .toggle-slider:before {
+            position: absolute;
+            content: "";
+            height: 18px;
+            width: 18px;
+            left: 3px;
+            bottom: 3px;
+            background: white;
+            transition: 0.3s;
+            border-radius: 50%;
+        }
+        
+        .toggle-switch input:checked + .toggle-slider {
+            background: linear-gradient(135deg, var(--accent), #7c3aed);
+        }
+        
+        .toggle-switch input:checked + .toggle-slider:before {
+            transform: translateX(20px);
+        }
+        
+        /* ========== 调色面板样式 ========== */
+        .color-slider-row {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 10px;
+        }
+        
+        .color-label {
+            font-size: 11px;
+            color: var(--text-muted);
+            min-width: 45px;
+        }
+        
+        .color-slider-row input[type="range"] {
+            flex: 1;
+            height: 4px;
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 2px;
+            outline: none;
+            -webkit-appearance: none;
+        }
+        
+        .color-slider-row input[type="range"]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            width: 14px;
+            height: 14px;
+            border-radius: 50%;
+            background: linear-gradient(135deg, var(--accent-light), var(--accent));
+            cursor: pointer;
+            box-shadow: 0 2px 6px rgba(99, 102, 241, 0.3);
+            transition: all 0.2s ease;
+        }
+        
+        .color-slider-row input[type="range"]::-webkit-slider-thumb:hover {
+            transform: scale(1.15);
+        }
+        
+        .color-value {
+            font-size: 11px;
+            font-weight: 600;
+            color: var(--accent-light);
+            min-width: 42px;
+            text-align: right;
+            font-family: 'JetBrains Mono', monospace;
+        }
     </style>
 </head>
 <body>
@@ -584,6 +827,111 @@
             <button id="zoom-fit" title="适应窗口">⊡</button>
         </div>
         
+        <!-- 流媒体信息面板 -->
+        <div id="stream-info-panel" class="hidden">
+            <div class="info-panel-header" id="info-panel-header">
+                <div class="info-panel-title">
+                    <span class="icon">📊</span>
+                    <span>流信息</span>
+                </div>
+                <button id="info-toggle-btn" title="折叠">▲</button>
+            </div>
+            
+            <div id="stream-info-body">
+                <!-- 连接信息 -->
+                <div class="info-section">
+                    <div class="info-section-title">
+                        <span>🔗</span> 连接
+                    </div>
+                    <div class="info-row">
+                        <span class="label">协议</span>
+                        <span class="value info-badge" id="info-protocol">-</span>
+                    </div>
+                    <div class="info-row">
+                        <span class="label">后端</span>
+                        <span class="value" id="info-backend">-</span>
+                    </div>
+                </div>
+                
+                <!-- 视频信息 -->
+                <div class="info-section">
+                    <div class="info-section-title">
+                        <span>🎬</span> 视频
+                    </div>
+                    <div class="info-row">
+                        <span class="label">编码</span>
+                        <span class="value highlight" id="info-video-codec">-</span>
+                    </div>
+                    <div class="info-row">
+                        <span class="label">分辨率</span>
+                        <span class="value" id="info-resolution">-</span>
+                    </div>
+                    <div class="info-row">
+                        <span class="label">帧率</span>
+                        <span class="value" id="info-fps">-</span>
+                    </div>
+                    <div class="info-row">
+                        <span class="label">码率</span>
+                        <span class="value" id="info-video-bitrate">-</span>
+                    </div>
+                </div>
+                
+                <!-- 音频信息 -->
+                <div class="info-section">
+                    <div class="info-section-title">
+                        <span>🎵</span> 音频
+                    </div>
+                    <div class="info-row">
+                        <span class="label">编码</span>
+                        <span class="value highlight" id="info-audio-codec">-</span>
+                    </div>
+                    <div class="info-row">
+                        <span class="label">采样率</span>
+                        <span class="value" id="info-sample-rate">-</span>
+                    </div>
+                    <div class="info-row">
+                        <span class="label">声道</span>
+                        <span class="value" id="info-channels">-</span>
+                    </div>
+                    <div class="info-row">
+                        <span class="label">码率</span>
+                        <span class="value" id="info-audio-bitrate">-</span>
+                    </div>
+                </div>
+                
+                <!-- 统计信息 -->
+                <div class="info-section">
+                    <div class="info-section-title">
+                        <span>📈</span> 统计
+                    </div>
+                    <div class="info-row">
+                        <span class="label">解码 FPS</span>
+                        <span class="value highlight" id="info-decode-fps">0</span>
+                    </div>
+                    <div class="info-row">
+                        <span class="label">延迟</span>
+                        <span class="value" id="info-latency">0 ms</span>
+                    </div>
+                    <div class="info-row">
+                        <span class="label">已接收</span>
+                        <span class="value" id="info-packets">0 包</span>
+                    </div>
+                    <div class="info-row">
+                        <span class="label">数据量</span>
+                        <span class="value" id="info-bytes">0 B</span>
+                    </div>
+                    <div class="info-row">
+                        <span class="label">关键帧</span>
+                        <span class="value success" id="info-keyframes">0</span>
+                    </div>
+                    <div class="info-row">
+                        <span class="label">运行时间</span>
+                        <span class="value" id="info-runtime">00:00:00</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
         <!-- 现代控制面板 -->
         <div id="control-panel">
             <div class="panel-header" id="panel-header">
@@ -598,18 +946,6 @@
             </div>
             
             <div id="panel-body">
-                <!-- 实时统计 -->
-                <div class="stats-card">
-                    <div class="stat-item">
-                        <div class="value" id="fps">0</div>
-                        <div class="label">Video FPS</div>
-                    </div>
-                    <div class="stat-item">
-                        <div class="value" id="latency">0<small style="font-size:12px">ms</small></div>
-                        <div class="label">Latency</div>
-                    </div>
-                </div>
-                
                 <!-- RTSP 输入 -->
                 <div class="input-group">
                     <input type="text" id="rtsp-url" placeholder="rtsp://username:password@host:port/path">
@@ -628,6 +964,75 @@
                     <button id="stop-btn" class="btn btn-danger hidden">
                         <span>⏹</span> 停止
                     </button>
+                </div>
+                
+                <!-- 显示设置 -->
+                <div class="settings-section">
+                    <div class="settings-row">
+                        <div class="settings-label">
+                            <span class="icon">📊</span> 流信息
+                        </div>
+                        <label class="toggle-switch">
+                            <input type="checkbox" id="stream-info-toggle" checked>
+                            <span class="toggle-slider"></span>
+                        </label>
+                    </div>
+                </div>
+                
+                <!-- 调色面板 -->
+                <div class="settings-section">
+                    <div class="settings-row">
+                        <div class="settings-label">
+                            <span class="icon">🎨</span> 调色
+                        </div>
+                        <button id="color-config-toggle" class="btn btn-sm" style="padding: 4px 12px; font-size: 12px;">展开</button>
+                    </div>
+                    
+                    <!-- 调色参数（默认隐藏） -->
+                    <div id="color-config-panel" class="hidden" style="margin-top: 12px;">
+                        <!-- 亮度 -->
+                        <div class="color-slider-row">
+                            <span class="color-label">亮度</span>
+                            <input type="range" id="brightness-slider" min="0.5" max="2" step="0.05" value="1">
+                            <span class="color-value" id="brightness-value">100%</span>
+                        </div>
+                        <!-- 对比度 -->
+                        <div class="color-slider-row">
+                            <span class="color-label">对比度</span>
+                            <input type="range" id="contrast-slider" min="0.5" max="2" step="0.05" value="1.2">
+                            <span class="color-value" id="contrast-value">120%</span>
+                        </div>
+                        <!-- 饱和度 -->
+                        <div class="color-slider-row">
+                            <span class="color-label">饱和度</span>
+                            <input type="range" id="saturate-slider" min="0" max="3" step="0.05" value="1.3">
+                            <span class="color-value" id="saturate-value">130%</span>
+                        </div>
+                        <!-- 色相 -->
+                        <div class="color-slider-row">
+                            <span class="color-label">色相</span>
+                            <input type="range" id="hue-slider" min="0" max="360" step="5" value="0">
+                            <span class="color-value" id="hue-value">0°</span>
+                        </div>
+                        <!-- 锐化/模糊 -->
+                        <div class="color-slider-row">
+                            <span class="color-label">模糊</span>
+                            <input type="range" id="blur-slider" min="0" max="5" step="0.5" value="0">
+                            <span class="color-value" id="blur-value">0px</span>
+                        </div>
+                        <!-- 重置按钮 -->
+                        <div style="margin-top: 10px; display: flex; gap: 8px;">
+                            <button id="color-reset-btn" class="btn btn-secondary" style="flex: 1; padding: 8px; font-size: 12px;">
+                                ⟳ 重置
+                            </button>
+                            <button id="color-preset-vivid" class="btn btn-accent" style="flex: 1; padding: 8px; font-size: 12px;">
+                                🌈 鲜艳
+                            </button>
+                            <button id="color-preset-soft" class="btn btn-secondary" style="flex: 1; padding: 8px; font-size: 12px;">
+                                🌙 柔和
+                            </button>
+                        </div>
+                    </div>
                 </div>
                 
                 <!-- 音量控制 -->

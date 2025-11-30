@@ -59,6 +59,49 @@ impl TryFrom<u8> for VideoCodec {
     }
 }
 
+/// 音频编解码器 ID
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum AudioCodec {
+    PCM = 0,
+    ADPCM = 1,
+    MP3 = 2,
+    PCM_LE = 3,
+    Nellymoser16 = 4,
+    Nellymoser8 = 5,
+    Nellymoser = 6,
+    PCM_ALAW = 7,
+    PCM_MULAW = 8,
+    Reserved = 9,
+    AAC = 10,
+    Speex = 11,
+    MP3_8kHz = 14,
+    DeviceSpecific = 15,
+}
+
+impl TryFrom<u8> for AudioCodec {
+    type Error = &'static str;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(AudioCodec::PCM),
+            1 => Ok(AudioCodec::ADPCM),
+            2 => Ok(AudioCodec::MP3),
+            3 => Ok(AudioCodec::PCM_LE),
+            4 => Ok(AudioCodec::Nellymoser16),
+            5 => Ok(AudioCodec::Nellymoser8),
+            6 => Ok(AudioCodec::Nellymoser),
+            7 => Ok(AudioCodec::PCM_ALAW),
+            8 => Ok(AudioCodec::PCM_MULAW),
+            9 => Ok(AudioCodec::Reserved),
+            10 => Ok(AudioCodec::AAC),
+            11 => Ok(AudioCodec::Speex),
+            14 => Ok(AudioCodec::MP3_8kHz),
+            15 => Ok(AudioCodec::DeviceSpecific),
+            _ => Err("Unknown audio codec"),
+        }
+    }
+}
+
 /// AVC 包类型
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum AvcPacketType {
@@ -111,7 +154,14 @@ pub struct FlvMetadata {
     pub height: u32,
     pub fps: f64,
     pub video_codec: Option<VideoCodec>,
+    pub video_bitrate: u32, // kbps
     pub extradata: Vec<u8>, // SPS/PPS (AVCC 格式)
+
+    // 音频元数据
+    pub audio_codec: Option<AudioCodec>,
+    pub audio_sample_rate: u32,
+    pub audio_channels: u8,
+    pub audio_bitrate: u32, // kbps
 }
 
 /// FLV 解复用器
@@ -522,14 +572,44 @@ impl FlvDemuxer {
                         | ("videoframerate", Amf0Value::Number(n)) => {
                             self.metadata.fps = *n;
                         }
+                        ("videodatarate", Amf0Value::Number(n)) => {
+                            self.metadata.video_bitrate = *n as u32;
+                            println!("📊 视频码率: {} kbps", *n as u32);
+                        }
+                        ("audiodatarate", Amf0Value::Number(n)) => {
+                            self.metadata.audio_bitrate = *n as u32;
+                            println!("📊 音频码率: {} kbps", *n as u32);
+                        }
+                        ("audiosamplerate", Amf0Value::Number(n)) => {
+                            self.metadata.audio_sample_rate = *n as u32;
+                            println!("📊 音频采样率: {} Hz", *n as u32);
+                        }
+                        ("audiosamplesize", Amf0Value::Number(n)) => {
+                            println!("📊 音频位深: {} bits", *n as u32);
+                        }
+                        ("stereo", Amf0Value::Boolean(b)) => {
+                            self.metadata.audio_channels = if *b { 2 } else { 1 };
+                            println!("📊 音频声道: {}", if *b { "立体声" } else { "单声道" });
+                        }
+                        ("audiochannels", Amf0Value::Number(n)) => {
+                            self.metadata.audio_channels = *n as u8;
+                        }
                         ("duration", Amf0Value::Number(n)) => {
                             println!("📊 FLV 时长: {:.2} 秒", n);
                         }
                         ("videocodecid", Amf0Value::Number(n)) => {
-                            println!("📊 视频编码: {}", *n as u32);
+                            let codec_id = *n as u8;
+                            if let Ok(codec) = VideoCodec::try_from(codec_id) {
+                                self.metadata.video_codec = Some(codec);
+                            }
+                            println!("📊 视频编码: {}", codec_id);
                         }
                         ("audiocodecid", Amf0Value::Number(n)) => {
-                            println!("📊 音频编码: {}", *n as u32);
+                            let codec_id = *n as u8;
+                            if let Ok(codec) = AudioCodec::try_from(codec_id) {
+                                self.metadata.audio_codec = Some(codec);
+                            }
+                            println!("📊 音频编码: {}", codec_id);
                         }
                         _ => {}
                     }

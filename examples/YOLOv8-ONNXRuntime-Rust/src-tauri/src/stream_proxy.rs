@@ -23,6 +23,39 @@ pub struct StreamMetadata {
     pub extradata: Vec<u8>,
 }
 
+/// 完整的流媒体信息 (显示在 UI 面板上)
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct StreamInfo {
+    // 流基本信息
+    pub protocol: String, // rtsp, http-flv, rtmp, file
+    pub backend: String,  // retina, flv_parser, ffmpeg
+    pub url: String,
+
+    // 视频信息
+    pub video_codec: String,      // H.264, HEVC, VP9 等
+    pub video_codec_full: String, // avc1.640028 完整编码字符串
+    pub video_width: u32,
+    pub video_height: u32,
+    pub video_fps: f64,
+    pub video_bitrate: u64,    // bps
+    pub video_profile: String, // High, Main, Baseline
+    pub video_level: String,   // 4.0, 5.1 等
+
+    // 音频信息
+    pub audio_codec: String,       // AAC, MP3, OPUS, PCM_ALAW 等
+    pub audio_sample_rate: u32,    // 44100, 48000 等
+    pub audio_channels: u8,        // 1=单声道, 2=立体声
+    pub audio_bits_per_sample: u8, // 16, 24, 32
+    pub audio_bitrate: u64,        // bps
+
+    // 统计信息 (实时更新)
+    pub total_packets: u64,
+    pub total_bytes: u64,
+    pub keyframes: u64,
+    pub dropped_frames: u64,
+    pub start_time: u64, // Unix 时间戳毫秒
+}
+
 /// 编码数据包
 #[derive(Clone, Debug)]
 pub struct EncodedPacket {
@@ -162,22 +195,30 @@ async fn run_retina_stream(
 
     let setup_opts = SetupOptions::default().transport(Transport::Tcp(Default::default()));
 
-    let mut session = Session::describe(parsed_url, session_opts)
+    let mut session = Session::describe(parsed_url.clone(), session_opts)
         .await
         .map_err(|e| format!("DESCRIBE 失败: {}", e))?;
 
-    // 查找视频流
+    // 查找视频流和音频流
     let mut video_idx = None;
     let mut codec_str = "unknown".to_string();
+    let mut video_codec_name = "Unknown".to_string();
     let mut width = 0u32;
     let mut height = 0u32;
     let mut extradata = Vec::new();
+    let mut fps = 25.0f64;
+
+    // 音频信息
+    let mut audio_codec = String::new();
+    let mut audio_sample_rate = 0u32;
+    let mut audio_channels = 0u8;
 
     for (idx, stream) in session.streams().iter().enumerate() {
-        if stream.media() == "video" {
+        if stream.media() == "video" && video_idx.is_none() {
             video_idx = Some(idx);
 
             let encoding = stream.encoding_name().to_uppercase();
+            video_codec_name = encoding.clone();
             codec_str = match encoding.as_str() {
                 "H264" => "avc1.640028".to_string(),
                 "H265" | "HEVC" => "hvc1.1.6.L93.B0".to_string(),
@@ -189,6 +230,10 @@ async fn run_retina_stream(
                     width = vp.pixel_dimensions().0;
                     height = vp.pixel_dimensions().1;
                     extradata = vp.extra_data().to_vec();
+                    // 尝试从 SDP 获取帧率
+                    if let Some(fr) = vp.frame_rate() {
+                        fps = fr.0 as f64 / fr.1 as f64;
+                    }
                 }
             }
 
@@ -199,23 +244,68 @@ async fn run_retina_stream(
                 height,
                 extradata.len()
             );
-            break;
+        } else if stream.media() == "audio" && audio_codec.is_empty() {
+            let encoding = stream.encoding_name().to_uppercase();
+            audio_codec = encoding.clone();
+            if let Some(params) = stream.parameters() {
+                if let retina::codec::ParametersRef::Audio(ap) = params {
+                    audio_sample_rate = ap.clock_rate();
+                    // retina 不直接提供声道数，根据编码类型猜测
+                    audio_channels = match encoding.as_str() {
+                        "PCMA" | "PCMU" => 1, // G.711 通常是单声道
+                        _ => 2,               // 默认立体声
+                    };
+                }
+            }
+            println!(
+                "🎵 [retina] 音频流: {} {}Hz {}ch",
+                audio_codec, audio_sample_rate, audio_channels
+            );
         }
     }
 
     let video_idx = video_idx.ok_or("未找到视频流")?;
 
-    // 发送元数据
+    // 发送元数据 (WebCodecs 配置)
     send_metadata(
         &on_data,
         &StreamMetadata {
-            codec: codec_str,
+            codec: codec_str.clone(),
             width,
             height,
-            fps: 25.0,
-            extradata,
+            fps,
+            extradata: extradata.clone(),
         },
     );
+
+    // 发送完整流信息 (UI 面板显示)
+    let stream_info = StreamInfo {
+        protocol: "RTSP".to_string(),
+        backend: "retina".to_string(),
+        url: url.clone(),
+        video_codec: video_codec_name,
+        video_codec_full: codec_str,
+        video_width: width,
+        video_height: height,
+        video_fps: fps,
+        video_bitrate: 0, // RTSP 通常不提供码率信息
+        video_profile: String::new(),
+        video_level: String::new(),
+        audio_codec,
+        audio_sample_rate,
+        audio_channels,
+        audio_bits_per_sample: 16,
+        audio_bitrate: 0,
+        total_packets: 0,
+        total_bytes: 0,
+        keyframes: 0,
+        dropped_frames: 0,
+        start_time: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0),
+    };
+    send_stream_info(&on_data, &stream_info);
 
     // 设置并播放
     session
@@ -379,6 +469,7 @@ async fn run_flv_stream_once(
     let mut metadata_sent = false;
     let start_time = std::time::Instant::now();
     let mut last_data_time = std::time::Instant::now();
+    let url_for_info = url.to_string();
 
     println!("▶️ [FLV] 开始接收...");
 
@@ -396,22 +487,70 @@ async fn run_flv_stream_once(
                     // 发送元数据 (只发一次)
                     if !metadata_sent && demuxer.metadata().width > 0 {
                         let meta = demuxer.metadata();
+                        let video_codec_name = match meta.video_codec {
+                            Some(VideoCodec::AVC) => "H.264".to_string(),
+                            Some(VideoCodec::HEVC) => "HEVC".to_string(),
+                            _ => "Unknown".to_string(),
+                        };
                         let codec_str = match meta.video_codec {
                             Some(VideoCodec::AVC) => "avc1.640028".to_string(),
                             Some(VideoCodec::HEVC) => "hvc1.1.6.L93.B0".to_string(),
                             _ => "unknown".to_string(),
                         };
+                        let fps = if meta.fps > 0.0 { meta.fps } else { 25.0 };
 
                         send_metadata(
                             &on_data,
                             &StreamMetadata {
-                                codec: codec_str,
+                                codec: codec_str.clone(),
                                 width: meta.width,
                                 height: meta.height,
-                                fps: if meta.fps > 0.0 { meta.fps } else { 25.0 },
+                                fps,
                                 extradata: meta.extradata.clone(),
                             },
                         );
+
+                        // 发送完整流信息 (UI 面板显示)
+                        let audio_codec_name = match meta.audio_codec {
+                            Some(crate::flv_demuxer::AudioCodec::AAC) => "AAC".to_string(),
+                            Some(crate::flv_demuxer::AudioCodec::MP3) => "MP3".to_string(),
+                            Some(crate::flv_demuxer::AudioCodec::PCM_ALAW) => {
+                                "PCM A-Law".to_string()
+                            }
+                            Some(crate::flv_demuxer::AudioCodec::PCM_MULAW) => {
+                                "PCM μ-Law".to_string()
+                            }
+                            _ => String::new(),
+                        };
+
+                        let stream_info = StreamInfo {
+                            protocol: "HTTP-FLV".to_string(),
+                            backend: "flv_parser".to_string(),
+                            url: url_for_info.clone(),
+                            video_codec: video_codec_name,
+                            video_codec_full: codec_str,
+                            video_width: meta.width,
+                            video_height: meta.height,
+                            video_fps: fps,
+                            video_bitrate: (meta.video_bitrate * 1000) as u64,
+                            video_profile: String::new(),
+                            video_level: String::new(),
+                            audio_codec: audio_codec_name,
+                            audio_sample_rate: meta.audio_sample_rate,
+                            audio_channels: meta.audio_channels,
+                            audio_bits_per_sample: 16,
+                            audio_bitrate: (meta.audio_bitrate * 1000) as u64,
+                            total_packets: 0,
+                            total_bytes: 0,
+                            keyframes: 0,
+                            dropped_frames: 0,
+                            start_time: std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_millis() as u64)
+                                .unwrap_or(0),
+                        };
+                        send_stream_info(&on_data, &stream_info);
+
                         metadata_sent = true;
                     }
 
@@ -606,6 +745,72 @@ fn run_ffmpeg_stream(
         extradata.len()
     );
 
+    // 获取视频码率
+    let video_bitrate = unsafe { (*codec_params.as_ptr()).bit_rate as u64 };
+
+    // 查找音频流信息
+    let mut audio_codec = String::new();
+    let mut audio_sample_rate = 0u32;
+    let mut audio_channels = 0u8;
+    let mut audio_bits = 0u8;
+    let mut audio_bitrate = 0u64;
+
+    if let Some(audio_stream) = ictx.streams().best(ffmpeg::media::Type::Audio) {
+        let audio_params = audio_stream.parameters();
+        let audio_codec_id = unsafe { (*audio_params.as_ptr()).codec_id };
+        audio_sample_rate = unsafe { (*audio_params.as_ptr()).sample_rate as u32 };
+        audio_channels = unsafe { (*audio_params.as_ptr()).ch_layout.nb_channels as u8 };
+        audio_bitrate = unsafe { (*audio_params.as_ptr()).bit_rate as u64 };
+
+        // 获取音频位深
+        let sample_fmt = unsafe { (*audio_params.as_ptr()).format };
+        audio_bits = match sample_fmt {
+            0 => 8,  // AV_SAMPLE_FMT_U8
+            1 => 16, // AV_SAMPLE_FMT_S16
+            2 => 32, // AV_SAMPLE_FMT_S32
+            3 => 32, // AV_SAMPLE_FMT_FLT
+            4 => 64, // AV_SAMPLE_FMT_DBL
+            _ => 16, // 默认 16 位
+        };
+
+        audio_codec = match audio_codec_id {
+            ffmpeg::ffi::AVCodecID::AV_CODEC_ID_AAC => "AAC".to_string(),
+            ffmpeg::ffi::AVCodecID::AV_CODEC_ID_MP3 => "MP3".to_string(),
+            ffmpeg::ffi::AVCodecID::AV_CODEC_ID_OPUS => "Opus".to_string(),
+            ffmpeg::ffi::AVCodecID::AV_CODEC_ID_PCM_ALAW => "PCM A-Law".to_string(),
+            ffmpeg::ffi::AVCodecID::AV_CODEC_ID_PCM_MULAW => "PCM μ-Law".to_string(),
+            _ => format!("{:?}", audio_codec_id),
+        };
+
+        println!(
+            "🎵 [FFmpeg] 音频流: {} {}Hz {}ch {}bits {}bps",
+            audio_codec, audio_sample_rate, audio_channels, audio_bits, audio_bitrate
+        );
+    }
+
+    // 确定协议类型
+    let protocol = if url_lower.starts_with("rtsp://") {
+        "RTSP"
+    } else if url_lower.starts_with("rtmp://") {
+        "RTMP"
+    } else if url_lower.contains(".flv") || url_lower.contains("flv?") {
+        "HTTP-FLV"
+    } else if url_lower.contains(".mp4") || url_lower.contains(".mkv") || url_lower.contains(".avi")
+    {
+        "File"
+    } else {
+        "HTTP"
+    };
+
+    // 获取视频编码名称
+    let video_codec_name = if is_h264 {
+        "H.264".to_string()
+    } else if is_hevc {
+        "HEVC".to_string()
+    } else {
+        format!("{:?}", codec_id)
+    };
+
     // 发送元数据
     send_metadata(
         &on_data,
@@ -614,9 +819,38 @@ fn run_ffmpeg_stream(
             width,
             height,
             fps: fps_val,
-            extradata,
+            extradata: extradata.clone(),
         },
     );
+
+    // 发送完整流信息 (UI 面板显示)
+    let stream_info = StreamInfo {
+        protocol: protocol.to_string(),
+        backend: "FFmpeg".to_string(),
+        url: url.clone(),
+        video_codec: video_codec_name,
+        video_codec_full: codec_str,
+        video_width: width,
+        video_height: height,
+        video_fps: fps_val,
+        video_bitrate,
+        video_profile: String::new(),
+        video_level: String::new(),
+        audio_codec,
+        audio_sample_rate,
+        audio_channels,
+        audio_bits_per_sample: audio_bits,
+        audio_bitrate,
+        total_packets: 0,
+        total_bytes: 0,
+        keyframes: 0,
+        dropped_frames: 0,
+        start_time: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0),
+    };
+    send_stream_info(&on_data, &stream_info);
 
     println!("▶️ [FFmpeg] 开始接收...");
 
@@ -819,6 +1053,29 @@ fn send_metadata(channel: &Channel<InvokeResponseBody>, metadata: &StreamMetadat
         metadata.width,
         metadata.height,
         metadata.extradata.len()
+    );
+}
+
+/// 发送完整流信息 (JSON) - 用于 UI 面板显示
+fn send_stream_info(channel: &Channel<InvokeResponseBody>, info: &StreamInfo) {
+    #[derive(Serialize)]
+    struct StreamInfoMessage {
+        r#type: String,
+        #[serde(flatten)]
+        info: StreamInfo,
+    }
+
+    let msg = StreamInfoMessage {
+        r#type: "stream_info".to_string(),
+        info: info.clone(),
+    };
+
+    let json = serde_json::to_string(&msg).unwrap_or_default();
+    let _ = channel.send(InvokeResponseBody::Json(json));
+
+    println!(
+        "📤 发送流信息: {} {} {}x{}@{}fps",
+        info.protocol, info.video_codec, info.video_width, info.video_height, info.video_fps
     );
 }
 

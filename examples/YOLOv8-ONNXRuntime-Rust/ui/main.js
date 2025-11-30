@@ -43,6 +43,323 @@ window.addEventListener('unhandledrejection', (event) => {
     console.error('Unhandled Rejection:', event.reason);
 });
 
+// ==================== 流信息管理器 ====================
+
+class StreamInfoManager {
+    constructor() {
+        this.panel = document.getElementById('stream-info-panel');
+        this.toggleBtn = document.getElementById('info-toggle-btn');
+        this.header = document.getElementById('info-panel-header');
+        
+        // 信息显示元素
+        this.elements = {
+            protocol: document.getElementById('info-protocol'),
+            backend: document.getElementById('info-backend'),
+            videoCodec: document.getElementById('info-video-codec'),
+            resolution: document.getElementById('info-resolution'),
+            fps: document.getElementById('info-fps'),
+            videoBitrate: document.getElementById('info-video-bitrate'),
+            audioCodec: document.getElementById('info-audio-codec'),
+            sampleRate: document.getElementById('info-sample-rate'),
+            channels: document.getElementById('info-channels'),
+            audioBitrate: document.getElementById('info-audio-bitrate'),
+            decodeFps: document.getElementById('info-decode-fps'),
+            latency: document.getElementById('info-latency'),
+            packets: document.getElementById('info-packets'),
+            bytes: document.getElementById('info-bytes'),
+            keyframes: document.getElementById('info-keyframes'),
+            runtime: document.getElementById('info-runtime'),
+        };
+        
+        // 统计数据
+        this.stats = {
+            packets: 0,
+            bytes: 0,
+            keyframes: 0,
+            startTime: 0,
+            decodeFps: 0,
+            latency: 0,
+        };
+        
+        this.runtimeTimer = null;
+        
+        // 拖动状态
+        this.isDragging = false;
+        this.dragOffsetX = 0;
+        this.dragOffsetY = 0;
+        this.panelX = 0;
+        this.panelY = 0;
+        
+        // 面板可见性状态 (由开关控制)
+        this.isEnabled = true;
+        
+        this.setupEventListeners();
+    }
+    
+    setupEventListeners() {
+        // 折叠/展开面板 (点击折叠按钮)
+        if (this.toggleBtn) {
+            this.toggleBtn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                this.panel?.classList.toggle('collapsed');
+            });
+        }
+        
+        // 拖动功能
+        if (this.header) {
+            this.header.addEventListener('mousedown', (e) => this.startDrag(e));
+        }
+        document.addEventListener('mousemove', (e) => this.drag(e));
+        document.addEventListener('mouseup', () => this.endDrag());
+    }
+    
+    // 开始拖动
+    startDrag(e) {
+        // 忽略折叠按钮点击
+        if (e.target.closest('#info-toggle-btn')) return;
+        
+        this.isDragging = true;
+        
+        const rect = this.panel.getBoundingClientRect();
+        this.dragOffsetX = e.clientX - rect.left;
+        this.dragOffsetY = e.clientY - rect.top;
+        
+        this.panel.style.transition = 'none';
+        this.panel.style.cursor = 'grabbing';
+    }
+    
+    // 拖动中
+    drag(e) {
+        if (!this.isDragging || !this.panel) return;
+        
+        e.preventDefault();
+        
+        const newX = e.clientX - this.dragOffsetX;
+        const newY = e.clientY - this.dragOffsetY;
+        
+        // 边界限制
+        const maxX = window.innerWidth - this.panel.offsetWidth;
+        const maxY = window.innerHeight - this.panel.offsetHeight;
+        
+        this.panelX = Math.max(0, Math.min(newX, maxX));
+        this.panelY = Math.max(0, Math.min(newY, maxY));
+        
+        // 使用 left/top 定位 (替代默认的 right/top)
+        this.panel.style.right = 'auto';
+        this.panel.style.left = this.panelX + 'px';
+        this.panel.style.top = this.panelY + 'px';
+    }
+    
+    // 结束拖动
+    endDrag() {
+        if (this.isDragging) {
+            this.isDragging = false;
+            if (this.panel) {
+                this.panel.style.transition = 'all 0.4s cubic-bezier(0.16, 1, 0.3, 1)';
+                this.panel.style.cursor = '';
+            }
+        }
+    }
+    
+    // 设置面板启用状态 (由开关控制)
+    setEnabled(enabled) {
+        this.isEnabled = enabled;
+        if (!enabled) {
+            this.panel?.classList.add('hidden');
+        } else {
+            // 如果启用且流正在运行（有统计数据），立即显示面板
+            if (this.stats.startTime > 0) {
+                this.panel?.classList.remove('hidden');
+            }
+        }
+    }
+    
+    // 显示面板 (仅当开关启用时)
+    show() {
+        if (this.isEnabled) {
+            this.panel?.classList.remove('hidden');
+        }
+    }
+    
+    // 隐藏面板
+    hide() {
+        this.panel?.classList.add('hidden');
+        this.stopRuntimeTimer();
+    }
+    
+    // 重置统计数据
+    reset() {
+        this.stats = {
+            packets: 0,
+            bytes: 0,
+            keyframes: 0,
+            startTime: Date.now(),
+        };
+        this.updateStats();
+        this.startRuntimeTimer();
+    }
+    
+    // 更新流信息 (从后端接收)
+    updateStreamInfo(info) {
+        console.log('📊 更新流信息:', info);
+        
+        // 连接信息
+        if (this.elements.protocol) {
+            this.elements.protocol.textContent = info.protocol || '-';
+            // 根据协议设置徽章颜色
+            this.elements.protocol.className = 'value info-badge';
+            if (info.protocol === 'RTSP') {
+                this.elements.protocol.classList.add('green');
+            } else if (info.protocol === 'HTTP-FLV') {
+                this.elements.protocol.classList.add('orange');
+            }
+        }
+        if (this.elements.backend) {
+            this.elements.backend.textContent = info.backend || '-';
+        }
+        
+        // 视频信息
+        if (this.elements.videoCodec) {
+            this.elements.videoCodec.textContent = info.video_codec || '-';
+        }
+        if (this.elements.resolution && info.video_width && info.video_height) {
+            this.elements.resolution.textContent = `${info.video_width}×${info.video_height}`;
+        }
+        if (this.elements.fps && info.video_fps) {
+            this.elements.fps.textContent = `${info.video_fps.toFixed(2)} fps`;
+        }
+        if (this.elements.videoBitrate) {
+            this.elements.videoBitrate.textContent = this.formatBitrate(info.video_bitrate);
+        }
+        
+        // 音频信息
+        if (this.elements.audioCodec) {
+            this.elements.audioCodec.textContent = info.audio_codec || '-';
+        }
+        if (this.elements.sampleRate && info.audio_sample_rate) {
+            this.elements.sampleRate.textContent = `${info.audio_sample_rate} Hz`;
+        }
+        if (this.elements.channels) {
+            if (info.audio_channels === 1) {
+                this.elements.channels.textContent = '单声道';
+            } else if (info.audio_channels === 2) {
+                this.elements.channels.textContent = '立体声';
+            } else if (info.audio_channels > 0) {
+                this.elements.channels.textContent = `${info.audio_channels} 声道`;
+            } else {
+                this.elements.channels.textContent = '-';
+            }
+        }
+        if (this.elements.audioBitrate) {
+            this.elements.audioBitrate.textContent = this.formatBitrate(info.audio_bitrate);
+        }
+        
+        // 设置开始时间
+        if (info.start_time) {
+            this.stats.startTime = info.start_time;
+        } else {
+            this.stats.startTime = Date.now();
+        }
+        
+        this.startRuntimeTimer();
+    }
+    
+    // 更新数据包统计 (每个包调用)
+    addPacket(size, isKeyframe) {
+        this.stats.packets++;
+        this.stats.bytes += size;
+        if (isKeyframe) {
+            this.stats.keyframes++;
+        }
+        
+        // 每 100 包更新一次 UI (避免频繁更新)
+        if (this.stats.packets % 100 === 0 || this.stats.packets <= 10) {
+            this.updateStats();
+        }
+    }
+    
+    // 更新统计显示
+    updateStats() {
+        if (this.elements.packets) {
+            this.elements.packets.textContent = `${this.stats.packets.toLocaleString()} 包`;
+        }
+        if (this.elements.bytes) {
+            this.elements.bytes.textContent = this.formatBytes(this.stats.bytes);
+        }
+        if (this.elements.keyframes) {
+            this.elements.keyframes.textContent = this.stats.keyframes.toLocaleString();
+        }
+        if (this.elements.decodeFps) {
+            this.elements.decodeFps.textContent = this.stats.decodeFps;
+        }
+        if (this.elements.latency) {
+            this.elements.latency.textContent = `${this.stats.latency} ms`;
+        }
+    }
+    
+    // 更新 FPS 和 Latency (由渲染器调用)
+    updatePerformance(fps, latency) {
+        this.stats.decodeFps = fps;
+        this.stats.latency = latency;
+        if (this.elements.decodeFps) {
+            this.elements.decodeFps.textContent = fps;
+        }
+        if (this.elements.latency) {
+            this.elements.latency.textContent = `${latency} ms`;
+        }
+    }
+    
+    // 启动运行时间计时器
+    startRuntimeTimer() {
+        this.stopRuntimeTimer();
+        this.runtimeTimer = setInterval(() => {
+            const elapsed = Date.now() - this.stats.startTime;
+            if (this.elements.runtime) {
+                this.elements.runtime.textContent = this.formatDuration(elapsed);
+            }
+        }, 1000);
+    }
+    
+    // 停止运行时间计时器
+    stopRuntimeTimer() {
+        if (this.runtimeTimer) {
+            clearInterval(this.runtimeTimer);
+            this.runtimeTimer = null;
+        }
+    }
+    
+    // 格式化比特率
+    formatBitrate(bps) {
+        if (!bps || bps === 0) return '-';
+        if (bps >= 1000000) {
+            return `${(bps / 1000000).toFixed(2)} Mbps`;
+        } else if (bps >= 1000) {
+            return `${(bps / 1000).toFixed(0)} kbps`;
+        }
+        return `${bps} bps`;
+    }
+    
+    // 格式化字节数
+    formatBytes(bytes) {
+        if (bytes === 0) return '0 B';
+        const units = ['B', 'KB', 'MB', 'GB'];
+        const i = Math.floor(Math.log(bytes) / Math.log(1024));
+        return `${(bytes / Math.pow(1024, i)).toFixed(2)} ${units[i]}`;
+    }
+    
+    // 格式化持续时间
+    formatDuration(ms) {
+        const seconds = Math.floor(ms / 1000);
+        const hours = Math.floor(seconds / 3600);
+        const minutes = Math.floor((seconds % 3600) / 60);
+        const secs = seconds % 60;
+        return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+    }
+}
+
+// 全局流信息管理器实例
+let streamInfoManager = null;
+
 // ==================== WebGL 视频渲染器 ====================
 
 class WebGLVideoRenderer {
@@ -81,6 +398,9 @@ class WebGLVideoRenderer {
         this.decoderHasDescription = false;  // 是否使用了 AVCC description
         this.waitingForKeyframe = true;
         this.videoChunkCount = 0;  // 帧计数器
+        
+        // 调色滤镜 (默认值修复 WebView2 色彩偏白)
+        this.colorFilter = 'brightness(1) contrast(1.2) saturate(1.3)';
         
         this.resizeCanvas();
         window.addEventListener('resize', () => this.resizeCanvas());
@@ -1127,9 +1447,9 @@ class WebGLVideoRenderer {
             console.log(`[Frame ColorSpace] format=${frame.format}, colorSpace=${JSON.stringify(frame.colorSpace)}`);
         }
 
-        // 应用色彩校正滤镜（修复 WebView2 色彩偏白问题）
-        // fullRange BT.709 在 WebView2 中渲染偏白，需要增加对比度和饱和度
-        this.ctx.filter = 'contrast(1.2) saturate(1.3)';
+        // 应用色彩校正滤镜（使用调色面板设置）
+        // 默认值：contrast(1.2) saturate(1.3) 修复 WebView2 色彩偏白问题
+        this.ctx.filter = this.colorFilter || 'contrast(1.2) saturate(1.3)';
         
         this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
         this.ctx.drawImage(
@@ -1146,7 +1466,11 @@ class WebGLVideoRenderer {
             this.fps = this.frameCount;
             this.frameCount = 0;
             this.lastTime = now;
-            document.getElementById('fps').textContent = this.fps;
+            // 更新流信息面板的 FPS 和 Latency
+            if (streamInfoManager) {
+                const latency = Math.round(this.lastFrameTime > 0 ? (now - this.lastFrameTime) : 0);
+                streamInfoManager.updatePerformance(this.fps, latency);
+            }
         }
     }
 
@@ -1228,8 +1552,10 @@ class WebGLVideoRenderer {
                         this.fps = this.frameCount;
                         this.frameCount = 0;
                         this.lastTime = now;
-                        const fpsEl = document.getElementById('fps');
-                        if (fpsEl) fpsEl.textContent = this.fps;
+                        // 更新流信息面板
+                        if (streamInfoManager) {
+                            streamInfoManager.updatePerformance(this.fps, 0);
+                        }
                     }
                 }
             } catch (e) {
@@ -1379,6 +1705,24 @@ document.addEventListener('DOMContentLoaded', () => {
         canvasTransform = new CanvasTransform(canvas, overlayCanvas);
         window.canvasTransform = canvasTransform;
     }
+    
+    // 初始化流信息管理器
+    streamInfoManager = new StreamInfoManager();
+    console.log('📊 StreamInfoManager 已初始化');
+    
+    // 初始化调色面板
+    colorGrading = new ColorGrading(renderer);
+    console.log('🎨 ColorGrading 已初始化');
+    
+    // 流信息面板开关 (需要在 streamInfoManager 初始化后注册)
+    const streamInfoToggle = document.getElementById('stream-info-toggle');
+    streamInfoToggle?.addEventListener('change', (e) => {
+        const enabled = e.target.checked;
+        if (streamInfoManager) {
+            streamInfoManager.setEnabled(enabled);
+            console.log(`📊 流信息面板: ${enabled ? '启用' : '禁用'}`);
+        }
+    });
 });
 
 // UI 控制
@@ -1394,6 +1738,137 @@ const panelHeader = document.getElementById('panel-header');
 const toggleBtn = document.getElementById('toggle-btn');
 const volumeSlider = document.getElementById('volume-slider');
 const volumeValue = document.getElementById('volume-value');
+
+// ==================== 调色面板 ====================
+
+class ColorGrading {
+    constructor(renderer) {
+        this.renderer = renderer;
+        
+        // 默认值
+        this.defaults = {
+            brightness: 1,
+            contrast: 1.2,
+            saturate: 1.3,
+            hue: 0,
+            blur: 0
+        };
+        
+        // 当前值
+        this.values = { ...this.defaults };
+        
+        // 预设
+        this.presets = {
+            vivid: { brightness: 1.05, contrast: 1.3, saturate: 1.6, hue: 0, blur: 0 },
+            soft: { brightness: 1.1, contrast: 0.95, saturate: 0.9, hue: 0, blur: 0.5 }
+        };
+        
+        this.setupEventListeners();
+        this.updateFilter();
+    }
+    
+    setupEventListeners() {
+        // 展开/收起按钮
+        const toggleBtn = document.getElementById('color-config-toggle');
+        const panel = document.getElementById('color-config-panel');
+        toggleBtn?.addEventListener('click', () => {
+            panel?.classList.toggle('hidden');
+            toggleBtn.textContent = panel?.classList.contains('hidden') ? '展开' : '收起';
+        });
+        
+        // 滑块事件
+        this.bindSlider('brightness', '%', 100);
+        this.bindSlider('contrast', '%', 100);
+        this.bindSlider('saturate', '%', 100);
+        this.bindSlider('hue', '°', 1);
+        this.bindSlider('blur', 'px', 1);
+        
+        // 重置按钮
+        document.getElementById('color-reset-btn')?.addEventListener('click', () => {
+            this.applyPreset(this.defaults);
+        });
+        
+        // 预设按钮
+        document.getElementById('color-preset-vivid')?.addEventListener('click', () => {
+            this.applyPreset(this.presets.vivid);
+        });
+        document.getElementById('color-preset-soft')?.addEventListener('click', () => {
+            this.applyPreset(this.presets.soft);
+        });
+    }
+    
+    bindSlider(name, suffix, multiplier) {
+        const slider = document.getElementById(`${name}-slider`);
+        const valueEl = document.getElementById(`${name}-value`);
+        
+        slider?.addEventListener('input', (e) => {
+            const val = parseFloat(e.target.value);
+            this.values[name] = val;
+            
+            if (valueEl) {
+                if (suffix === '%') {
+                    valueEl.textContent = Math.round(val * multiplier) + suffix;
+                } else {
+                    valueEl.textContent = val + suffix;
+                }
+            }
+            
+            this.updateFilter();
+        });
+    }
+    
+    applyPreset(preset) {
+        this.values = { ...preset };
+        
+        // 更新滑块
+        const sliders = ['brightness', 'contrast', 'saturate', 'hue', 'blur'];
+        sliders.forEach(name => {
+            const slider = document.getElementById(`${name}-slider`);
+            const valueEl = document.getElementById(`${name}-value`);
+            if (slider) slider.value = this.values[name];
+            if (valueEl) {
+                if (name === 'hue') {
+                    valueEl.textContent = this.values[name] + '°';
+                } else if (name === 'blur') {
+                    valueEl.textContent = this.values[name] + 'px';
+                } else {
+                    valueEl.textContent = Math.round(this.values[name] * 100) + '%';
+                }
+            }
+        });
+        
+        this.updateFilter();
+        console.log('🎨 应用预设:', preset);
+    }
+    
+    updateFilter() {
+        const { brightness, contrast, saturate, hue, blur } = this.values;
+        
+        // 构建 CSS filter 字符串
+        let filter = `brightness(${brightness}) contrast(${contrast}) saturate(${saturate})`;
+        
+        if (hue !== 0) {
+            filter += ` hue-rotate(${hue}deg)`;
+        }
+        if (blur > 0) {
+            filter += ` blur(${blur}px)`;
+        }
+        
+        // 保存到渲染器
+        if (this.renderer) {
+            this.renderer.colorFilter = filter;
+        }
+        
+        console.log('🎨 滤镜:', filter);
+    }
+    
+    getFilter() {
+        return this.renderer?.colorFilter || 'none';
+    }
+}
+
+// 全局调色实例
+let colorGrading = null;
 
 // 音量控制
 volumeSlider.addEventListener('input', (e) => {
@@ -1583,6 +2058,12 @@ startBtn.addEventListener('click', async () => {
                     const { codec, sample_rate, channels } = message;
                     console.log(`🎵 [Audio Config] ${codec} ${sample_rate}Hz ${channels}ch`);
                     renderer.initAudioDecoder(codec, sample_rate, channels);
+                } else if (message.type === 'stream_info') {
+                    // 更新流信息面板
+                    if (streamInfoManager) {
+                        streamInfoManager.updateStreamInfo(message);
+                        streamInfoManager.show();
+                    }
                 }
             } else if (response instanceof ArrayBuffer) {
                 // InvokeResponseBody::Raw 在前端是 ArrayBuffer
@@ -1602,6 +2083,10 @@ startBtn.addEventListener('click', async () => {
                 
                 if (packetType === 1) {
                     renderer.handleVideoChunk(encodedData, isKeyframe, pts);
+                    // 更新流信息面板统计
+                    if (streamInfoManager) {
+                        streamInfoManager.addPacket(encodedData.length, isKeyframe);
+                    }
                 } else if (packetType === 2) {
                     renderer.handleAudioChunk(encodedData);
                 }
@@ -1625,6 +2110,11 @@ startBtn.addEventListener('click', async () => {
         
         // 启动渲染器
         renderer.start();
+        
+        // 重置流信息面板统计
+        if (streamInfoManager) {
+            streamInfoManager.reset();
+        }
         
         // Tauri 2.0 自动将 Rust 的 snake_case 转为 camelCase
         const result = await invoke('start_stream', { 
@@ -1659,6 +2149,11 @@ stopBtn.addEventListener('click', async () => {
         
         // 停止后端视频流
         await invoke('stop_stream');
+        
+        // 隐藏流信息面板
+        if (streamInfoManager) {
+            streamInfoManager.hide();
+        }
         
         stopBtn.classList.add('hidden');
         startBtn.classList.remove('hidden');
