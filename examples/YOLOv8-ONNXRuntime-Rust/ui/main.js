@@ -90,10 +90,15 @@ class StreamInfoManager {
         this.panelX = 0;
         this.panelY = 0;
         
-        // 面板可见性状态 (由开关控制)
-        this.isEnabled = true;
+        // 面板可见性状态 (由开关控制，默认关闭)
+        this.isEnabled = false;
         
         this.setupEventListeners();
+        
+        // 初始化时隐藏面板 (使用 hidden class，与 setEnabled 逻辑一致)
+        if (this.panel) {
+            this.panel.classList.add('hidden');
+        }
     }
     
     setupEventListeners() {
@@ -167,10 +172,8 @@ class StreamInfoManager {
         if (!enabled) {
             this.panel?.classList.add('hidden');
         } else {
-            // 如果启用且流正在运行（有统计数据），立即显示面板
-            if (this.stats.startTime > 0) {
-                this.panel?.classList.remove('hidden');
-            }
+            // 启用时显示面板
+            this.panel?.classList.remove('hidden');
         }
     }
     
@@ -185,6 +188,22 @@ class StreamInfoManager {
     hide() {
         this.panel?.classList.add('hidden');
         this.stopRuntimeTimer();
+    }
+    
+    // 显示错误信息
+    showError(errorMsg) {
+        // 显示面板 (如果启用)
+        this.show();
+        
+        // 设置协议为错误状态
+        if (this.elements.protocol) {
+            this.elements.protocol.textContent = '❌ 错误';
+            this.elements.protocol.className = 'value info-badge red';
+        }
+        if (this.elements.backend) {
+            this.elements.backend.textContent = errorMsg;
+            this.elements.backend.style.color = '#ff6b6b';
+        }
     }
     
     // 重置统计数据
@@ -1031,11 +1050,15 @@ class WebGLVideoRenderer {
         }
         
         // 准备帧数据 - 格式转换
+        // 后端统一发送 Annex-B 格式，前端根据解码器配置决定是否转换
         let frameData = data;
         
         if (this.decoderHasDescription) {
-            // 有 description (AVCC/HVCC): 帧数据需要 AVCC 格式 (4字节长度前缀)
+            // 有 description (AVCC/HVCC): WebCodecs 需要 AVCC 格式 (4字节长度前缀)
+            // 但实际上有些浏览器/配置也接受 Annex-B
+            // 尝试直接使用，如果失败再转换
             if (isInputAnnexB) {
+                // 尝试 AVCC 格式
                 frameData = this.annexBFrameToAvcc(data);
             }
         } else {
@@ -1047,13 +1070,14 @@ class WebGLVideoRenderer {
         
         this.videoChunkCount = (this.videoChunkCount || 0) + 1;
         
-        // 时间戳
-        const timestamp = pts > 0 ? pts : performance.now() * 1000;
+        // 时间戳 (微秒)
+        const timestamp = pts > 0 ? pts * 1000 : performance.now() * 1000;
         
-        // WebCodecs: 有 description 时，所有帧都可以用 'key' 类型
-        // 这样解码器可以从任意位置开始解码
+        // 正确设置帧类型
+        const chunkType = isKeyframe ? 'key' : 'delta';
+        
         const chunk = new EncodedVideoChunk({
-            type: 'key',
+            type: chunkType,
             timestamp: timestamp,
             data: frameData
         });
@@ -1061,9 +1085,10 @@ class WebGLVideoRenderer {
         try {
             this.decoder.decode(chunk);
         } catch(e) {
-            // 解码错误静默处理，等待下一帧
-            if (this.videoChunkCount < 10) {
-                console.warn('Decode error:', e.message);
+            // 解码错误时打印更多信息
+            if (this.videoChunkCount < 20) {
+                console.warn(`Decode error #${this.videoChunkCount}:`, e.message, 
+                    `isKeyframe=${isKeyframe}, size=${frameData.length}, isAnnexB=${isInputAnnexB}`);
             }
         }
     }
@@ -1451,11 +1476,34 @@ class WebGLVideoRenderer {
         // 默认值：contrast(1.2) saturate(1.3) 修复 WebView2 色彩偏白问题
         this.ctx.filter = this.colorFilter || 'contrast(1.2) saturate(1.3)';
         
-        this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
+        // 清空画布
+        this.ctx.fillStyle = '#0a0a0f';
+        this.ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
+        
+        // 计算等比例缩放后的目标尺寸和位置 (居中显示)
+        const canvasAspect = this.canvas.width / this.canvas.height;
+        const frameAspect = frame.displayWidth / frame.displayHeight;
+        
+        let drawWidth, drawHeight, drawX, drawY;
+        
+        if (frameAspect > canvasAspect) {
+            // 视频更宽，以宽度为准
+            drawWidth = this.canvas.width;
+            drawHeight = this.canvas.width / frameAspect;
+            drawX = 0;
+            drawY = (this.canvas.height - drawHeight) / 2;
+        } else {
+            // 视频更高，以高度为准
+            drawHeight = this.canvas.height;
+            drawWidth = this.canvas.height * frameAspect;
+            drawX = (this.canvas.width - drawWidth) / 2;
+            drawY = 0;
+        }
+        
         this.ctx.drawImage(
             frame, 
             0, 0, frame.displayWidth, frame.displayHeight,
-            0, 0, this.canvas.width, this.canvas.height
+            drawX, drawY, drawWidth, drawHeight
         );
         
         // 重置滤镜
@@ -1994,12 +2042,24 @@ document.addEventListener('click', (e) => {
     }
 });
 
-function showStatus(message, duration = 3000) {
+function showStatus(message, isError = false, duration = 5000) {
     statusDiv.textContent = message;
     statusDiv.classList.add('show');
+    
+    // 错误状态样式
+    if (isError) {
+        statusDiv.style.background = 'rgba(239, 68, 68, 0.9)';
+        statusDiv.style.borderColor = 'rgba(239, 68, 68, 0.5)';
+    } else {
+        statusDiv.style.background = '';
+        statusDiv.style.borderColor = '';
+    }
+    
     setTimeout(() => {
         statusDiv.classList.remove('show');
-    }, duration);
+        statusDiv.style.background = '';
+        statusDiv.style.borderColor = '';
+    }, isError ? 8000 : duration);  // 错误显示更长时间
 }
 
 // 解码模式：固定使用前端 WebCodecs 解码
@@ -2028,16 +2088,26 @@ startBtn.addEventListener('click', async () => {
                     response instanceof ArrayBuffer ? `ArrayBuffer(${response.byteLength})` :
                     response instanceof Uint8Array ? `Uint8Array(${response.length})` :
                     Array.isArray(response) ? `Array(${response.length})` :
-                    typeof response === 'string' ? `String(${response.length})` : 
+                    typeof response === 'string' ? `String(${response.length}): ${response.slice(0, 100)}` : 
                     typeof response === 'object' ? JSON.stringify(response).slice(0, 100) : 'unknown');
             }
             packetCount++;
             
-            // InvokeResponseBody::Json 在前端被自动解析为对象
-            if (typeof response === 'object' && response !== null && response.type) {
-                // JSON 对象响应 (视频配置等)
-                const message = response;
-                console.log('📦 收到配置:', message.type);
+            // 统一解析 JSON (字符串或对象)
+            let message = null;
+            if (typeof response === 'string') {
+                try {
+                    message = JSON.parse(response);
+                } catch (e) {
+                    console.error('解析 JSON 失败:', e);
+                }
+            } else if (typeof response === 'object' && response !== null && !(response instanceof ArrayBuffer)) {
+                message = response;
+            }
+            
+            // 处理 JSON 消息
+            if (message && message.type) {
+                console.log('📦 收到消息:', message.type);
                 
                 if (message.type === 'video_config') {
                     const { codec, width, height, extradata } = message;
@@ -2063,6 +2133,15 @@ startBtn.addEventListener('click', async () => {
                     if (streamInfoManager) {
                         streamInfoManager.updateStreamInfo(message);
                         streamInfoManager.show();
+                    }
+                } else if (message.type === 'error') {
+                    // 后端发送的错误消息
+                    const errorMsg = message.error || '未知错误';
+                    console.error('❌ 后端错误:', errorMsg);
+                    showStatus(`❌ ${errorMsg}`, true);
+                    // 显示在流信息面板
+                    if (streamInfoManager) {
+                        streamInfoManager.showError(errorMsg);
                     }
                 }
             } else if (response instanceof ArrayBuffer) {
@@ -2090,20 +2169,8 @@ startBtn.addEventListener('click', async () => {
                 } else if (packetType === 2) {
                     renderer.handleAudioChunk(encodedData);
                 }
-            } else if (typeof response === 'string') {
-                // 字符串形式的 JSON (兼容)
-                try {
-                    const message = JSON.parse(response);
-                    console.log('📦 收到 JSON 字符串:', message.type);
-                    if (message.type === 'video_config') {
-                        const { codec, width, height, extradata } = message;
-                        let extradataBytes = extradata?.length > 0 ? new Uint8Array(extradata) : null;
-                        renderer.initDecoder(codec, width, height, extradataBytes);
-                    }
-                } catch (e) {
-                    console.error('解析 JSON 失败:', e);
-                }
-            } else {
+            } else if (!message) {
+                // 非 ArrayBuffer 且非 JSON 消息
                 console.warn('未知响应类型:', typeof response, response);
             }
         };

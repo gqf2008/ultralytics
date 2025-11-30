@@ -122,8 +122,12 @@ impl StreamProxy {
                     .expect("Failed to create tokio runtime");
 
                 rt.block_on(async move {
-                    if let Err(e) = run_retina_stream(url, running, packet_count, on_data).await {
-                        eprintln!("❌ retina 流错误: {}", e);
+                    if let Err(e) =
+                        run_retina_stream(url, running, packet_count, on_data.clone()).await
+                    {
+                        let error_msg = format!("RTSP 连接失败: {}", e);
+                        eprintln!("❌ {}", error_msg);
+                        send_error(&on_data, &error_msg);
                     }
                 });
             });
@@ -136,16 +140,22 @@ impl StreamProxy {
                     .expect("Failed to create tokio runtime");
 
                 rt.block_on(async move {
-                    if let Err(e) = run_flv_stream(url, running, packet_count, on_data).await {
-                        eprintln!("❌ FLV 流错误: {}", e);
+                    if let Err(e) =
+                        run_flv_stream(url, running, packet_count, on_data.clone()).await
+                    {
+                        let error_msg = format!("FLV 连接失败: {}", e);
+                        eprintln!("❌ {}", error_msg);
+                        send_error(&on_data, &error_msg);
                     }
                 });
             });
         } else {
             println!("🚀 使用 FFmpeg 后端 (MP4/RTMP/其他)");
             std::thread::spawn(move || {
-                if let Err(e) = run_ffmpeg_stream(url, running, packet_count, on_data) {
-                    eprintln!("❌ FFmpeg 流错误: {}", e);
+                if let Err(e) = run_ffmpeg_stream(url, running, packet_count, on_data.clone()) {
+                    let error_msg = format!("FFmpeg 连接失败: {}", e);
+                    eprintln!("❌ {}", error_msg);
+                    send_error(&on_data, &error_msg);
                 }
             });
         }
@@ -390,28 +400,38 @@ async fn run_flv_stream(
 ) -> Result<(), String> {
     // 自动重连循环
     let mut reconnect_count = 0;
-    const MAX_RECONNECTS: u32 = 100; // 最多重连 100 次
+    const MAX_RECONNECTS: u32 = 5; // 最多重连 5 次
+    let mut last_error = String::new();
 
     while running.load(Ordering::Relaxed) && reconnect_count < MAX_RECONNECTS {
         if reconnect_count > 0 {
-            println!("🔄 [FLV] 第 {} 次重连...", reconnect_count);
-            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            let msg = format!("第 {} 次重连... ({})", reconnect_count, last_error);
+            println!("🔄 [FLV] {}", msg);
+            send_error(&on_data, &msg);
+            tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
         }
 
         match run_flv_stream_once(&url, &running, &packet_count, &on_data).await {
             Ok(()) => {
                 // 正常结束（用户停止）
-                break;
+                return Ok(());
             }
             Err(e) => {
                 if !running.load(Ordering::Relaxed) {
                     // 用户主动停止
-                    break;
+                    return Ok(());
                 }
+                last_error = e.clone();
                 eprintln!("⚠️ [FLV] 连接断开: {}", e);
                 reconnect_count += 1;
             }
         }
+    }
+
+    // 达到最大重连次数，返回错误
+    if reconnect_count >= MAX_RECONNECTS {
+        let msg = format!("连接失败，已重试 {} 次: {}", MAX_RECONNECTS, last_error);
+        return Err(msg);
     }
 
     Ok(())
@@ -1094,4 +1114,23 @@ fn send_packet(channel: &Channel<InvokeResponseBody>, packet: &EncodedPacket) {
     buffer[30..].copy_from_slice(&packet.data);
 
     let _ = channel.send(InvokeResponseBody::Raw(buffer));
+}
+
+/// 发送错误消息 (JSON) - 通知前端连接或解码错误
+fn send_error(channel: &Channel<InvokeResponseBody>, error: &str) {
+    #[derive(Serialize)]
+    struct ErrorMessage {
+        r#type: String,
+        error: String,
+    }
+
+    let msg = ErrorMessage {
+        r#type: "error".to_string(),
+        error: error.to_string(),
+    };
+
+    let json = serde_json::to_string(&msg).unwrap_or_default();
+    let _ = channel.send(InvokeResponseBody::Json(json));
+
+    eprintln!("📤 发送错误: {}", error);
 }
