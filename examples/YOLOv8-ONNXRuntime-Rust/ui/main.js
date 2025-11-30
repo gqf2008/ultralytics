@@ -590,6 +590,8 @@ class WebGLVideoRenderer {
         this.decoderConfigured = false;
         this.waitingForKeyframe = true;  // 将在 configure 成功后根据情况调整
         this.videoChunkCount = 0;
+        this.basePts = null;  // 重置基准时间戳
+        this.baseTime = null;
 
         this.decoder = new VideoDecoder({
             output: (frame) => {
@@ -1070,8 +1072,22 @@ class WebGLVideoRenderer {
         
         this.videoChunkCount = (this.videoChunkCount || 0) + 1;
         
-        // 时间戳 (微秒)
-        const timestamp = pts > 0 ? pts * 1000 : performance.now() * 1000;
+        // 时间戳处理 (微秒)
+        // 直播流的 PTS 可能很大（累积时间），需要转换为相对时间戳
+        if (pts > 0) {
+            // 记录第一帧的基准时间戳
+            if (!this.basePts) {
+                this.basePts = pts;
+                this.baseTime = performance.now();
+                console.log(`🕐 基准时间戳: pts=${pts}ms, 本地=${this.baseTime.toFixed(0)}ms`);
+            }
+            // 计算相对时间戳
+            const relativePts = pts - this.basePts;
+            // 转换为微秒
+            var timestamp = relativePts * 1000;
+        } else {
+            var timestamp = performance.now() * 1000;
+        }
         
         // 正确设置帧类型
         const chunkType = isKeyframe ? 'key' : 'delta';
@@ -1083,6 +1099,16 @@ class WebGLVideoRenderer {
         });
         
         try {
+            // 检查解码队列是否过大，避免阻塞
+            if (this.decoder.decodeQueueSize > 10) {
+                // 队列过大，跳过非关键帧
+                if (!isKeyframe) {
+                    if (this.videoChunkCount % 100 === 0) {
+                        console.warn(`⚠️ 解码队列过大 (${this.decoder.decodeQueueSize})，跳过非关键帧`);
+                    }
+                    return;
+                }
+            }
             this.decoder.decode(chunk);
         } catch(e) {
             // 解码错误时打印更多信息
