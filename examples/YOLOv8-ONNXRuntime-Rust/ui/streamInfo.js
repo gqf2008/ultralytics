@@ -1,8 +1,6 @@
 /**
- * 流信息管理器模块
- * 显示视频流的元数据、统计信息和解码状态
+ * 流信息管理器 - 显示 RTSP/HTTP-FLV 流的详细信息
  */
-
 export class StreamInfoManager {
     constructor() {
         this.panel = document.getElementById('stream-info-panel');
@@ -73,14 +71,13 @@ export class StreamInfoManager {
         
         this.setupEventListeners();
         
-        // 初始化时隐藏面板 (使用 hidden class，与 setEnabled 逻辑一致)
+        // 初始化时隐藏面板
         if (this.panel) {
             this.panel.classList.add('hidden');
         }
     }
     
     setupEventListeners() {
-        // 折叠/展开面板 (点击折叠按钮)
         if (this.toggleBtn) {
             this.toggleBtn.addEventListener('click', (e) => {
                 e.stopPropagation();
@@ -88,7 +85,6 @@ export class StreamInfoManager {
             });
         }
         
-        // 拖动功能
         if (this.header) {
             this.header.addEventListener('mousedown', (e) => this.startDrag(e));
         }
@@ -96,44 +92,34 @@ export class StreamInfoManager {
         document.addEventListener('mouseup', () => this.endDrag());
     }
     
-    // 开始拖动
     startDrag(e) {
-        // 忽略折叠按钮点击
         if (e.target.closest('#info-toggle-btn')) return;
         
         this.isDragging = true;
-        
         const rect = this.panel.getBoundingClientRect();
         this.dragOffsetX = e.clientX - rect.left;
         this.dragOffsetY = e.clientY - rect.top;
-        
         this.panel.style.transition = 'none';
         this.panel.style.cursor = 'grabbing';
     }
     
-    // 拖动中
     drag(e) {
         if (!this.isDragging || !this.panel) return;
-        
         e.preventDefault();
         
         const newX = e.clientX - this.dragOffsetX;
         const newY = e.clientY - this.dragOffsetY;
-        
-        // 边界限制
         const maxX = window.innerWidth - this.panel.offsetWidth;
         const maxY = window.innerHeight - this.panel.offsetHeight;
         
         this.panelX = Math.max(0, Math.min(newX, maxX));
         this.panelY = Math.max(0, Math.min(newY, maxY));
         
-        // 使用 left/top 定位 (替代默认的 right/top)
         this.panel.style.right = 'auto';
         this.panel.style.left = this.panelX + 'px';
         this.panel.style.top = this.panelY + 'px';
     }
     
-    // 结束拖动
     endDrag() {
         if (this.isDragging) {
             this.isDragging = false;
@@ -144,36 +130,28 @@ export class StreamInfoManager {
         }
     }
     
-    // 设置面板启用状态 (由开关控制)
     setEnabled(enabled) {
         this.isEnabled = enabled;
         if (!enabled) {
             this.panel?.classList.add('hidden');
         } else {
-            // 启用时显示面板
             this.panel?.classList.remove('hidden');
         }
     }
     
-    // 显示面板 (仅当开关启用时)
     show() {
         if (this.isEnabled) {
             this.panel?.classList.remove('hidden');
         }
     }
     
-    // 隐藏面板
     hide() {
         this.panel?.classList.add('hidden');
         this.stopRuntimeTimer();
     }
     
-    // 显示错误信息
     showError(errorMsg) {
-        // 显示面板 (如果启用)
         this.show();
-        
-        // 设置协议为错误状态
         if (this.elements.protocol) {
             this.elements.protocol.textContent = '❌ 错误';
             this.elements.protocol.className = 'value info-badge red';
@@ -184,11 +162,9 @@ export class StreamInfoManager {
         }
     }
     
-    // 更新解码状态
     updateDecodeStatus(status) {
         this.decodeStats = { ...this.decodeStats, ...status };
         
-        // 更新状态显示
         if (this.elements.decoderState) {
             const state = status.state || this.decodeStats.state;
             this.elements.decoderState.textContent = state;
@@ -202,21 +178,15 @@ export class StreamInfoManager {
             }
         }
         
-        // 等待关键帧状态
         if (this.elements.waitingKeyframe && status.waitingKeyframe !== undefined) {
             const waiting = status.waitingKeyframe;
             this.elements.waitingKeyframe.textContent = waiting ? '是' : '否';
             this.elements.waitingKeyframe.className = 'value info-badge';
-            if (waiting) {
-                this.elements.waitingKeyframe.classList.add('orange');
-            } else {
-                this.elements.waitingKeyframe.classList.add('green');
-            }
+            this.elements.waitingKeyframe.classList.add(waiting ? 'orange' : 'green');
         }
         
         if (this.elements.decodeQueue && status.queueSize !== undefined) {
             this.elements.decodeQueue.textContent = status.queueSize;
-            // 队列过大时变红
             this.elements.decodeQueue.style.color = status.queueSize > 5 ? '#ff6b6b' : '';
         }
         
@@ -234,14 +204,12 @@ export class StreamInfoManager {
             this.elements.decodeErrors.style.color = status.errors > 0 ? '#ff6b6b' : '';
         }
         
-        // 显示最后错误
         if (status.lastError && this.elements.lastError && this.elements.lastErrorRow) {
             this.elements.lastError.textContent = status.lastError;
             this.elements.lastErrorRow.style.display = 'flex';
         }
     }
     
-    // 重置解码状态
     resetDecodeStatus() {
         this.decodeStats = {
             state: 'idle',
@@ -258,7 +226,6 @@ export class StreamInfoManager {
         }
     }
     
-    // 重置统计数据
     reset() {
         this.stats = {
             packets: 0,
@@ -270,14 +237,11 @@ export class StreamInfoManager {
         this.startRuntimeTimer();
     }
     
-    // 更新流信息 (从后端接收)
     updateStreamInfo(info) {
         console.log('📊 更新流信息:', info);
         
-        // 连接信息
         if (this.elements.protocol) {
             this.elements.protocol.textContent = info.protocol || '-';
-            // 根据协议设置徽章颜色
             this.elements.protocol.className = 'value info-badge';
             if (info.protocol === 'RTSP') {
                 this.elements.protocol.classList.add('green');
@@ -289,7 +253,6 @@ export class StreamInfoManager {
             this.elements.backend.textContent = info.backend || '-';
         }
         
-        // 视频信息
         if (this.elements.videoCodec) {
             this.elements.videoCodec.textContent = info.video_codec || '-';
         }
@@ -303,7 +266,6 @@ export class StreamInfoManager {
             this.elements.videoBitrate.textContent = this.formatBitrate(info.video_bitrate);
         }
         
-        // 音频信息
         if (this.elements.audioCodec) {
             this.elements.audioCodec.textContent = info.audio_codec || '-';
         }
@@ -325,19 +287,11 @@ export class StreamInfoManager {
             this.elements.audioBitrate.textContent = this.formatBitrate(info.audio_bitrate);
         }
         
-        // 设置开始时间
-        if (info.start_time) {
-            this.stats.startTime = info.start_time;
-        } else {
-            this.stats.startTime = Date.now();
-        }
-        
+        this.stats.startTime = info.start_time || Date.now();
         this.startRuntimeTimer();
     }
     
-    // 更新音频信息 (当收到 audio_config 消息时)
     updateAudioInfo(codec, sampleRate, channels) {
-        // 转换 codec 显示名称
         let codecName;
         if (codec === 'mp4a.40.2') {
             codecName = 'AAC';
@@ -372,7 +326,6 @@ export class StreamInfoManager {
         console.log(`📊 流信息面板音频更新: ${codecName} ${sampleRate}Hz ${channels}ch`);
     }
     
-    // 更新数据包统计 (每个包调用)
     addPacket(size, isKeyframe) {
         this.stats.packets++;
         this.stats.bytes += size;
@@ -380,13 +333,11 @@ export class StreamInfoManager {
             this.stats.keyframes++;
         }
         
-        // 每 100 包更新一次 UI (避免频繁更新)
         if (this.stats.packets % 100 === 0 || this.stats.packets <= 10) {
             this.updateStats();
         }
     }
     
-    // 更新统计显示
     updateStats() {
         if (this.elements.packets) {
             this.elements.packets.textContent = `${this.stats.packets.toLocaleString()} 包`;
@@ -405,7 +356,6 @@ export class StreamInfoManager {
         }
     }
     
-    // 更新 FPS 和 Latency (由渲染器调用)
     updatePerformance(fps, latency) {
         this.stats.decodeFps = fps;
         this.stats.latency = latency;
@@ -417,7 +367,6 @@ export class StreamInfoManager {
         }
     }
     
-    // 启动运行时间计时器
     startRuntimeTimer() {
         this.stopRuntimeTimer();
         this.runtimeTimer = setInterval(() => {
@@ -428,7 +377,6 @@ export class StreamInfoManager {
         }, 1000);
     }
     
-    // 停止运行时间计时器
     stopRuntimeTimer() {
         if (this.runtimeTimer) {
             clearInterval(this.runtimeTimer);
@@ -436,7 +384,6 @@ export class StreamInfoManager {
         }
     }
     
-    // 格式化比特率
     formatBitrate(bps) {
         if (!bps || bps === 0) return '-';
         if (bps >= 1000000) {
@@ -447,7 +394,6 @@ export class StreamInfoManager {
         return `${bps} bps`;
     }
     
-    // 格式化字节数
     formatBytes(bytes) {
         if (bytes === 0) return '0 B';
         const units = ['B', 'KB', 'MB', 'GB'];
@@ -455,7 +401,6 @@ export class StreamInfoManager {
         return `${(bytes / Math.pow(1024, i)).toFixed(2)} ${units[i]}`;
     }
     
-    // 格式化持续时间
     formatDuration(ms) {
         const seconds = Math.floor(ms / 1000);
         const hours = Math.floor(seconds / 3600);
@@ -464,5 +409,3 @@ export class StreamInfoManager {
         return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
     }
 }
-
-export default StreamInfoManager;

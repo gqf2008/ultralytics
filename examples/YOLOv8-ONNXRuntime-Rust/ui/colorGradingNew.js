@@ -1,9 +1,8 @@
 /**
- * 调色面板模块
- * 提供视频色彩调整功能（亮度、对比度、饱和度、色相、模糊）
+ * 调色面板 - 亮度/对比度/饱和度控制
  */
 
-export class ColorGrading {
+class ColorGrading {
     constructor(renderer) {
         this.renderer = renderer;
         
@@ -59,12 +58,6 @@ export class ColorGrading {
         });
     }
     
-    /**
-     * 绑定滑块事件
-     * @param {string} name - 滑块名称
-     * @param {string} suffix - 显示后缀
-     * @param {number} multiplier - 显示乘数
-     */
     bindSlider(name, suffix, multiplier) {
         const slider = document.getElementById(`${name}-slider`);
         const valueEl = document.getElementById(`${name}-value`);
@@ -85,10 +78,6 @@ export class ColorGrading {
         });
     }
     
-    /**
-     * 应用预设
-     * @param {Object} preset - 预设配置
-     */
     applyPreset(preset) {
         this.values = { ...preset };
         
@@ -113,9 +102,6 @@ export class ColorGrading {
         console.log('🎨 应用预设:', preset);
     }
     
-    /**
-     * 更新 CSS 滤镜
-     */
     updateFilter() {
         const { brightness, contrast, saturate, hue, blur } = this.values;
         
@@ -137,30 +123,9 @@ export class ColorGrading {
         console.log('🎨 滤镜:', filter);
     }
     
-    /**
-     * 获取当前滤镜字符串
-     * @returns {string}
-     */
     getFilter() {
         return this.renderer?.colorFilter || 'none';
     }
-    
-    /**
-     * 获取当前值
-     * @returns {Object}
-     */
-    getValues() {
-        return { ...this.values };
-    }
-    
-    /**
-     * 设置值
-     * @param {Object} values - 新的值
-     */
-    setValues(values) {
-        this.values = { ...this.values, ...values };
-        this.updateFilter();
-    }
 }
 
-export default ColorGrading;
+export { ColorGrading };

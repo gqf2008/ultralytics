@@ -595,9 +595,6 @@ async fn run_flv_stream_once(
                     let annexb_data = avcc_to_annexb(&frame.data, 4);
 
                     if count <= 5 || count % 100 == 0 {
-                        // 调试：检查前几个字节
-                        let preview_before: Vec<u8> = frame.data.iter().take(16).cloned().collect();
-                        let preview_after: Vec<u8> = annexb_data.iter().take(16).cloned().collect();
                         println!(
                             "📦 [FLV] #{}: keyframe={}, {} -> {} bytes, pts={}",
                             count,
@@ -606,10 +603,6 @@ async fn run_flv_stream_once(
                             annexb_data.len(),
                             frame.pts - pts_base.unwrap_or(0)
                         );
-                        if count <= 3 {
-                            println!("   原始前16字节: {:02x?}", preview_before);
-                            println!("   转换后前16字节: {:02x?}", preview_after);
-                        }
                     }
 
                     // 使用相对时间戳（减去基准）
@@ -644,7 +637,6 @@ async fn run_flv_stream_once(
 
                     // 序列头帧：发送音频配置更新到 UI 面板
                     if audio_frame.is_sequence_header {
-                        // 发送音频配置更新消息（包含 AudioSpecificConfig 作为 description）
                         send_audio_config_update(
                             &on_data,
                             audio_codec_str,

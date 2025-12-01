@@ -1,9 +1,8 @@
-/**
- * 画布变换模块
- * 处理视频画布的缩放、平移和拖拽功能
+﻿/**
+ * 画布变换 - 缩放和拖拽功能
  */
 
-export class CanvasTransform {
+class CanvasTransform {
     constructor(canvas, overlayCanvas) {
         this.canvas = canvas;
         this.overlayCanvas = overlayCanvas;
@@ -23,7 +22,6 @@ export class CanvasTransform {
     }
     
     initEvents() {
-        // 滚轮缩放
         this.container.addEventListener('wheel', (e) => {
             e.preventDefault();
             
@@ -31,7 +29,6 @@ export class CanvasTransform {
             const mouseX = e.clientX - rect.left;
             const mouseY = e.clientY - rect.top;
             
-            // 以鼠标位置为中心缩放
             const imgX = (mouseX - this.offsetX) / this.scale;
             const imgY = (mouseY - this.offsetY) / this.scale;
             
@@ -46,10 +43,9 @@ export class CanvasTransform {
             this.updateZoomDisplay();
         }, { passive: false });
         
-        // 鼠标按下开始拖拽
         this.container.addEventListener('mousedown', (e) => {
-            if (e.button !== 0) return;  // 只响应左键
-            if (e.target.closest('#control-panel')) return;  // 忽略控制面板区域
+            if (e.button !== 0) return;
+            if (e.target.closest('#control-panel')) return;
             
             this.isDragging = true;
             this.lastMouseX = e.clientX;
@@ -57,7 +53,6 @@ export class CanvasTransform {
             this.container.style.cursor = 'grabbing';
         });
         
-        // 鼠标移动拖拽
         document.addEventListener('mousemove', (e) => {
             if (!this.isDragging) return;
             
@@ -73,7 +68,6 @@ export class CanvasTransform {
             this.updateTransform();
         });
         
-        // 鼠标松开结束拖拽
         document.addEventListener('mouseup', () => {
             if (this.isDragging) {
                 this.isDragging = false;
@@ -81,7 +75,6 @@ export class CanvasTransform {
             }
         });
         
-        // 双击重置视图
         this.container.addEventListener('dblclick', (e) => {
             if (e.target.closest('#control-panel')) return;
             this.resetView();
@@ -90,9 +83,6 @@ export class CanvasTransform {
         this.container.style.cursor = 'grab';
     }
     
-    /**
-     * 应用变换到画布
-     */
     updateTransform() {
         const transform = `translate(${this.offsetX}px, ${this.offsetY}px) scale(${this.scale})`;
         this.canvas.style.transform = transform;
@@ -103,9 +93,6 @@ export class CanvasTransform {
         }
     }
     
-    /**
-     * 更新缩放百分比显示
-     */
     updateZoomDisplay() {
         const zoomEl = document.getElementById('zoom-level');
         if (zoomEl) {
@@ -113,9 +100,6 @@ export class CanvasTransform {
         }
     }
     
-    /**
-     * 重置视图到原始状态
-     */
     resetView() {
         this.scale = 1;
         this.offsetX = 0;
@@ -125,9 +109,6 @@ export class CanvasTransform {
         console.log('🔄 视图已重置');
     }
     
-    /**
-     * 适应窗口大小
-     */
     fitToWindow() {
         const containerRect = this.container.getBoundingClientRect();
         const canvasWidth = this.canvas.width || containerRect.width;
@@ -143,24 +124,6 @@ export class CanvasTransform {
         this.updateTransform();
         this.updateZoomDisplay();
     }
-    
-    /**
-     * 设置缩放级别
-     * @param {number} scale - 缩放比例
-     */
-    setScale(scale) {
-        this.scale = Math.max(this.minScale, Math.min(this.maxScale, scale));
-        this.updateTransform();
-        this.updateZoomDisplay();
-    }
-    
-    /**
-     * 获取当前缩放级别
-     * @returns {number}
-     */
-    getScale() {
-        return this.scale;
-    }
 }
 
-export default CanvasTransform;
+export { CanvasTransform };
