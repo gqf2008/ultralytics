@@ -904,6 +904,41 @@
                     </div>
                 </div>
                 
+                <!-- 解码状态 -->
+                <div class="info-section">
+                    <div class="info-section-title">
+                        <span>⚙️</span> 解码
+                    </div>
+                    <div class="info-row">
+                        <span class="label">状态</span>
+                        <span class="value info-badge green" id="info-decoder-state">-</span>
+                    </div>
+                    <div class="info-row">
+                        <span class="label">等待关键帧</span>
+                        <span class="value info-badge" id="info-waiting-keyframe">-</span>
+                    </div>
+                    <div class="info-row">
+                        <span class="label">队列</span>
+                        <span class="value" id="info-decode-queue">0</span>
+                    </div>
+                    <div class="info-row">
+                        <span class="label">已解码</span>
+                        <span class="value highlight" id="info-decoded-frames">0</span>
+                    </div>
+                    <div class="info-row">
+                        <span class="label">跳帧</span>
+                        <span class="value" id="info-skipped-frames">0</span>
+                    </div>
+                    <div class="info-row">
+                        <span class="label">错误</span>
+                        <span class="value" id="info-decode-errors">0</span>
+                    </div>
+                    <div class="info-row" id="info-last-error-row" style="display: none;">
+                        <span class="label">最后错误</span>
+                        <span class="value error" id="info-last-error" style="font-size: 10px; word-break: break-all;">-</span>
+                    </div>
+                </div>
+                
                 <!-- 统计信息 -->
                 <div class="info-section">
                     <div class="info-section-title">
@@ -1040,7 +1075,7 @@
                     </div>
                 </div>
                 
-                <!-- 音量控制 -->
+                <!-- 音频控制 -->
                 <div class="settings-section">
                     <div class="settings-row">
                         <div class="settings-label">
@@ -1049,6 +1084,34 @@
                         <div class="slider-control">
                             <input type="range" id="volume-slider" min="0" max="5" step="0.1" value="1.5">
                             <span class="slider-value" id="volume-value">1.5×</span>
+                        </div>
+                    </div>
+                    <!-- 降噪强度 -->
+                    <div class="settings-row" style="margin-top: 8px;">
+                        <div class="settings-label">
+                            <span class="icon">🔇</span> 降噪强度
+                        </div>
+                        <div class="slider-control">
+                            <select id="noise-preset" style="flex: 1; padding: 4px 8px; border-radius: 6px; border: 1px solid rgba(255,255,255,0.1); background: rgba(0,0,0,0.3); color: white; font-size: 11px;">
+                                <option value="off">关闭</option>
+                                <option value="light">轻度 (保留更多细节)</option>
+                                <option value="normal" selected>标准</option>
+                                <option value="strong">强力 (人声优化)</option>
+                                <option value="extreme">极限 (仅保留人声)</option>
+                            </select>
+                        </div>
+                    </div>
+                    <!-- 电源噪声 -->
+                    <div class="settings-row" style="margin-top: 6px;">
+                        <div class="settings-label" style="font-size: 11px;">
+                            电源频率
+                        </div>
+                        <div class="slider-control">
+                            <select id="notch-select" style="flex: 1; padding: 4px 8px; border-radius: 6px; border: 1px solid rgba(255,255,255,0.1); background: rgba(0,0,0,0.3); color: white; font-size: 11px;">
+                                <option value="0">关闭</option>
+                                <option value="50" selected>50Hz (中国)</option>
+                                <option value="60">60Hz (美国)</option>
+                            </select>
                         </div>
                     </div>
                 </div>

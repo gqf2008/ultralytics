@@ -491,6 +491,10 @@ async fn run_flv_stream_once(
     let mut last_data_time = std::time::Instant::now();
     let url_for_info = url.to_string();
 
+    // 时间戳基准（类似 flv.js 的 _dtsBase）
+    // 取音视频中最小的时间戳作为基准，使输出从 0 开始
+    let mut pts_base: Option<i64> = None;
+
     println!("▶️ [FLV] 开始接收...");
 
     while running.load(Ordering::Relaxed) {
@@ -504,6 +508,12 @@ async fn run_flv_stream_once(
 
                 // 解析所有可用的视频帧
                 while let Some(frame) = demuxer.next_video_frame() {
+                    // 建立时间戳基准（首次收到有效帧时）
+                    if pts_base.is_none() && !frame.is_sequence_header {
+                        pts_base = Some(frame.pts);
+                        println!("🕐 [FLV] 时间戳基准建立: {}ms", frame.pts);
+                    }
+
                     // 发送元数据 (只发一次)
                     if !metadata_sent && demuxer.metadata().width > 0 {
                         let meta = demuxer.metadata();
@@ -594,7 +604,7 @@ async fn run_flv_stream_once(
                             frame.is_keyframe,
                             frame.data.len(),
                             annexb_data.len(),
-                            frame.pts
+                            frame.pts - pts_base.unwrap_or(0)
                         );
                         if count <= 3 {
                             println!("   原始前16字节: {:02x?}", preview_before);
@@ -602,15 +612,58 @@ async fn run_flv_stream_once(
                         }
                     }
 
+                    // 使用相对时间戳（减去基准）
+                    let base = pts_base.unwrap_or(0);
                     send_packet(
                         &on_data,
                         &EncodedPacket {
                             data: annexb_data,
                             is_keyframe: frame.is_keyframe,
-                            pts: frame.pts,
-                            dts: frame.dts,
+                            pts: frame.pts - base,
+                            dts: frame.dts - base,
                             packet_id: count,
                         },
+                    );
+                }
+
+                // 解析所有可用的音频帧
+                while let Some(audio_frame) = demuxer.next_audio_frame() {
+                    // 音频也需要建立时间戳基准（如果视频还没建立）
+                    if pts_base.is_none() && !audio_frame.is_sequence_header {
+                        pts_base = Some(audio_frame.pts);
+                        println!("🕐 [FLV] 时间戳基准建立(音频): {}ms", audio_frame.pts);
+                    }
+
+                    let audio_codec_str = match audio_frame.codec {
+                        crate::flv_demuxer::AudioCodec::AAC => "mp4a.40.2",
+                        crate::flv_demuxer::AudioCodec::MP3 => "mp3",
+                        crate::flv_demuxer::AudioCodec::PCM_ALAW => "pcm_alaw",
+                        crate::flv_demuxer::AudioCodec::PCM_MULAW => "pcm_mulaw",
+                        _ => "unknown",
+                    };
+
+                    // 序列头帧：发送音频配置更新到 UI 面板
+                    if audio_frame.is_sequence_header {
+                        // 发送音频配置更新消息（包含 AudioSpecificConfig 作为 description）
+                        send_audio_config_update(
+                            &on_data,
+                            audio_codec_str,
+                            audio_frame.sample_rate,
+                            audio_frame.channels,
+                            &audio_frame.data,
+                        );
+                        continue;
+                    }
+
+                    // 发送音频数据包（使用相对时间戳）
+                    let base = pts_base.unwrap_or(0);
+                    send_audio_packet(
+                        &on_data,
+                        audio_codec_str,
+                        audio_frame.sample_rate,
+                        audio_frame.channels,
+                        audio_frame.pts - base,
+                        &audio_frame.data,
                     );
                 }
             }
@@ -1114,6 +1167,94 @@ fn send_packet(channel: &Channel<InvokeResponseBody>, packet: &EncodedPacket) {
     buffer[30..].copy_from_slice(&packet.data);
 
     let _ = channel.send(InvokeResponseBody::Raw(buffer));
+}
+
+/// 发送音频数据包 (二进制)
+fn send_audio_packet(
+    channel: &Channel<InvokeResponseBody>,
+    codec: &str,
+    sample_rate: u32,
+    channels: u8,
+    pts: i64,
+    data: &[u8],
+) {
+    // 头部布局:
+    // [0]: packet_type = 2 (audio)
+    // [1]: codec_len
+    // [2..2+codec_len]: codec string
+    // [next 4 bytes]: sample_rate (u32 le)
+    // [next 1 byte]: channels
+    // [next 8 bytes]: pts (i64 le)
+    // [next 4 bytes]: data_len (u32 le)
+    // [rest]: audio data
+
+    let codec_bytes = codec.as_bytes();
+    let header_size = 1 + 1 + codec_bytes.len() + 4 + 1 + 8 + 4;
+    let total_size = header_size + data.len();
+    let mut buffer = vec![0u8; total_size];
+
+    let mut pos = 0;
+    buffer[pos] = 2; // audio packet
+    pos += 1;
+
+    buffer[pos] = codec_bytes.len() as u8;
+    pos += 1;
+
+    buffer[pos..pos + codec_bytes.len()].copy_from_slice(codec_bytes);
+    pos += codec_bytes.len();
+
+    buffer[pos..pos + 4].copy_from_slice(&sample_rate.to_le_bytes());
+    pos += 4;
+
+    buffer[pos] = channels;
+    pos += 1;
+
+    buffer[pos..pos + 8].copy_from_slice(&pts.to_le_bytes());
+    pos += 8;
+
+    buffer[pos..pos + 4].copy_from_slice(&(data.len() as u32).to_le_bytes());
+    pos += 4;
+
+    buffer[pos..].copy_from_slice(data);
+
+    let _ = channel.send(InvokeResponseBody::Raw(buffer));
+}
+
+/// 发送音频配置更新消息 (JSON) - 用于更新 UI 面板
+fn send_audio_config_update(
+    channel: &Channel<InvokeResponseBody>,
+    codec: &str,
+    sample_rate: u32,
+    channels: u8,
+    description: &[u8],
+) {
+    #[derive(Serialize)]
+    struct AudioConfigUpdate {
+        r#type: String,
+        audio_codec: String,
+        audio_sample_rate: u32,
+        audio_channels: u8,
+        description: Vec<u8>,
+    }
+
+    let msg = AudioConfigUpdate {
+        r#type: "audio_config".to_string(),
+        audio_codec: codec.to_string(),
+        audio_sample_rate: sample_rate,
+        audio_channels: channels,
+        description: description.to_vec(),
+    };
+
+    let json = serde_json::to_string(&msg).unwrap_or_default();
+    let _ = channel.send(InvokeResponseBody::Json(json));
+
+    println!(
+        "🎵 发送音频配置更新: {} {}Hz {}ch, desc={} bytes",
+        codec,
+        sample_rate,
+        channels,
+        description.len()
+    );
 }
 
 /// 发送错误消息 (JSON) - 通知前端连接或解码错误

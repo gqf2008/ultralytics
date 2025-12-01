@@ -96,10 +96,10 @@ async fn get_stream_status(app: AppHandle) -> Result<(bool, u64), String> {
 
 // ==================== 历史记录命令 ====================
 
-/// 读取 RTSP 历史记录
+/// 读取流地址历史记录
 #[tauri::command]
-async fn get_rtsp_history() -> Result<Vec<String>, String> {
-    let path = "rtsp_history.txt";
+async fn get_stream_history() -> Result<Vec<String>, String> {
+    let path = "stream_history.txt";
     match std::fs::read_to_string(path) {
         Ok(content) => {
             let urls: Vec<String> = content
@@ -114,10 +114,10 @@ async fn get_rtsp_history() -> Result<Vec<String>, String> {
     }
 }
 
-/// 添加 RTSP 历史记录
+/// 添加流地址历史记录
 #[tauri::command]
-async fn add_rtsp_history(url: String) -> Result<(), String> {
-    let path = "rtsp_history.txt";
+async fn add_stream_history(url: String) -> Result<(), String> {
+    let path = "stream_history.txt";
 
     let mut urls = match std::fs::read_to_string(path) {
         Ok(content) => content
@@ -140,10 +140,10 @@ async fn add_rtsp_history(url: String) -> Result<(), String> {
     std::fs::write(path, content).map_err(|e| format!("Failed to write history: {}", e))
 }
 
-/// 清空 RTSP 历史记录
+/// 清空流地址历史记录
 #[tauri::command]
-async fn clear_rtsp_history() -> Result<(), String> {
-    let path = "rtsp_history.txt";
+async fn clear_stream_history() -> Result<(), String> {
+    let path = "stream_history.txt";
     std::fs::write(path, "").map_err(|e| format!("Failed to clear history: {}", e))
 }
 
@@ -288,9 +288,9 @@ fn main() {
             stop_stream,
             get_stream_status,
             // 历史记录
-            get_rtsp_history,
-            add_rtsp_history,
-            clear_rtsp_history,
+            get_stream_history,
+            add_stream_history,
+            clear_stream_history,
             // 工具命令
             log_frontend,
             show_window,

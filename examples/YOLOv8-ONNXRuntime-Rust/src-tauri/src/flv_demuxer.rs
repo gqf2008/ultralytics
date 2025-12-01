@@ -147,6 +147,18 @@ pub struct VideoFrame {
     pub is_sequence_header: bool,
 }
 
+/// FLV 音频帧
+#[derive(Debug, Clone)]
+pub struct AudioFrame {
+    pub codec: AudioCodec,
+    pub sample_rate: u32,
+    pub channels: u8,
+    pub bits_per_sample: u8,
+    pub pts: i64,
+    pub data: Vec<u8>,
+    pub is_sequence_header: bool,
+}
+
 /// FLV 元数据
 #[derive(Debug, Clone, Default)]
 pub struct FlvMetadata {
@@ -170,6 +182,9 @@ pub struct FlvDemuxer {
     position: usize,
     metadata: FlvMetadata,
     header_parsed: bool,
+    // 帧队列
+    video_queue: Vec<VideoFrame>,
+    audio_queue: Vec<AudioFrame>,
 }
 
 impl FlvDemuxer {
@@ -179,6 +194,8 @@ impl FlvDemuxer {
             position: 0,
             metadata: FlvMetadata::default(),
             header_parsed: false,
+            video_queue: Vec::new(),
+            audio_queue: Vec::new(),
         }
     }
 
@@ -192,26 +209,63 @@ impl FlvDemuxer {
         self.buffer.extend_from_slice(data);
     }
 
-    /// 解析下一个视频帧
-    pub fn next_video_frame(&mut self) -> Option<VideoFrame> {
+    /// 解析缓冲区中所有可用的帧
+    fn parse_available_frames(&mut self) {
         // 解析 FLV 头
         if !self.header_parsed {
             if !self.parse_header() {
-                return None;
+                return;
             }
         }
 
-        // 循环查找视频 tag
+        // 循环解析所有 tag
         loop {
-            let tag = self.parse_tag()?;
+            let tag = match self.parse_tag() {
+                Some(t) => t,
+                None => break,
+            };
 
-            if tag.tag_type == TagType::Video {
-                return self.parse_video_tag(&tag);
-            } else if tag.tag_type == TagType::Script {
-                // 解析 script data (onMetaData)
-                self.parse_script_data(&tag.data);
+            match tag.tag_type {
+                TagType::Video => {
+                    if let Some(frame) = self.parse_video_tag(&tag) {
+                        self.video_queue.push(frame);
+                    }
+                }
+                TagType::Audio => {
+                    if let Some(frame) = self.parse_audio_tag(&tag) {
+                        self.audio_queue.push(frame);
+                    }
+                }
+                TagType::Script => {
+                    self.parse_script_data(&tag.data);
+                }
             }
-            // 跳过音频 tag
+        }
+    }
+
+    /// 解析下一个视频帧
+    pub fn next_video_frame(&mut self) -> Option<VideoFrame> {
+        // 先解析所有可用帧
+        self.parse_available_frames();
+
+        // 从队列取出
+        if !self.video_queue.is_empty() {
+            Some(self.video_queue.remove(0))
+        } else {
+            None
+        }
+    }
+
+    /// 解析下一个音频帧
+    pub fn next_audio_frame(&mut self) -> Option<AudioFrame> {
+        // 先解析所有可用帧
+        self.parse_available_frames();
+
+        // 从队列取出
+        if !self.audio_queue.is_empty() {
+            Some(self.audio_queue.remove(0))
+        } else {
+            None
         }
     }
 
@@ -300,6 +354,158 @@ impl FlvDemuxer {
             tag_type: TagType::try_from(tag_type).ok()?,
             timestamp,
             data,
+        })
+    }
+
+    /// 解析音频 Tag
+    fn parse_audio_tag(&mut self, tag: &FlvTag) -> Option<AudioFrame> {
+        if tag.data.is_empty() {
+            return None;
+        }
+
+        // 第一个字节: SoundFormat (4 bits) + SoundRate (2 bits) + SoundSize (1 bit) + SoundType (1 bit)
+        let first_byte = tag.data[0];
+        let sound_format = (first_byte >> 4) & 0x0F;
+        let sound_rate = (first_byte >> 2) & 0x03;
+        let sound_size = (first_byte >> 1) & 0x01;
+        let sound_type = first_byte & 0x01;
+
+        let codec = AudioCodec::try_from(sound_format).ok()?;
+
+        // 采样率映射
+        let sample_rate = match sound_rate {
+            0 => 5512,
+            1 => 11025,
+            2 => 22050,
+            3 => 44100,
+            _ => 44100,
+        };
+
+        // 对于 AAC，采样率在 AudioSpecificConfig 中
+        let actual_sample_rate = if codec == AudioCodec::AAC {
+            self.metadata.audio_sample_rate.max(sample_rate)
+        } else {
+            sample_rate
+        };
+
+        let bits_per_sample = if sound_size == 0 { 8 } else { 16 };
+        let channels = if sound_type == 0 { 1 } else { 2 };
+
+        // 更新元数据
+        if self.metadata.audio_codec.is_none() {
+            self.metadata.audio_codec = Some(codec);
+            self.metadata.audio_sample_rate = actual_sample_rate;
+            self.metadata.audio_channels = channels;
+            println!(
+                "🎵 检测到音频: {:?}, {}Hz, {}ch, {}bit",
+                codec, actual_sample_rate, channels, bits_per_sample
+            );
+        }
+
+        // 对于 AAC，有额外的头
+        if codec == AudioCodec::AAC {
+            if tag.data.len() < 2 {
+                return None;
+            }
+
+            let aac_packet_type = tag.data[1];
+            let audio_data = tag.data[2..].to_vec();
+
+            if aac_packet_type == 0 {
+                // AAC Sequence Header (AudioSpecificConfig)
+                // 格式 (最少 2 字节):
+                // - Bits 0-4: audioObjectType (5 bits)
+                // - Bits 5-8: samplingFrequencyIndex (4 bits)
+                // - Bits 9-12: channelConfiguration (4 bits)
+                // - Bits 13+: 依赖于 audioObjectType
+                if audio_data.len() >= 2 {
+                    // AAC AudioSpecificConfig 位布局:
+                    // byte0: [AOT4 AOT3 AOT2 AOT1 AOT0 SFI3 SFI2 SFI1]
+                    // byte1: [SFI0 CH3  CH2  CH1  CH0  ...]
+                    //
+                    // audioObjectType = (byte0 >> 3) & 0x1F  (高5位)
+                    // samplingFrequencyIndex = ((byte0 & 0x07) << 1) | ((byte1 >> 7) & 0x01)  (3+1=4位)
+                    // channelConfiguration = (byte1 >> 3) & 0x0F  (4位)
+
+                    let aot = (audio_data[0] >> 3) & 0x1F;
+                    let sample_rate_index =
+                        ((audio_data[0] & 0x07) << 1) | ((audio_data[1] >> 7) & 0x01);
+                    let aac_channels = (audio_data[1] >> 3) & 0x0F;
+
+                    let aac_sample_rate = match sample_rate_index {
+                        0 => 96000,
+                        1 => 88200,
+                        2 => 64000,
+                        3 => 48000,
+                        4 => 44100,
+                        5 => 32000,
+                        6 => 24000,
+                        7 => 22050,
+                        8 => 16000,
+                        9 => 12000,
+                        10 => 11025,
+                        11 => 8000,
+                        12 => 7350,
+                        _ => {
+                            println!(
+                                "⚠️ AAC: 未知采样率索引 {}, 使用默认 44100",
+                                sample_rate_index
+                            );
+                            44100
+                        }
+                    };
+
+                    self.metadata.audio_sample_rate = aac_sample_rate;
+                    self.metadata.audio_channels = aac_channels;
+
+                    // 打印原始字节用于调试
+                    println!(
+                        "🎵 AAC Sequence Header: raw=[{:02x} {:02x}], AOT={}, sfi={}, rate={}Hz, ch={}",
+                        audio_data[0],
+                        audio_data[1],
+                        aot,
+                        sample_rate_index,
+                        aac_sample_rate,
+                        aac_channels
+                    );
+                } else {
+                    println!("⚠️ AAC Sequence Header 太短: {} 字节", audio_data.len());
+                }
+
+                return Some(AudioFrame {
+                    codec,
+                    sample_rate: self.metadata.audio_sample_rate,
+                    channels: self.metadata.audio_channels,
+                    bits_per_sample: 16,
+                    pts: tag.timestamp,
+                    data: audio_data,
+                    is_sequence_header: true,
+                });
+            } else {
+                // AAC Raw data
+                return Some(AudioFrame {
+                    codec,
+                    sample_rate: self.metadata.audio_sample_rate,
+                    channels: self.metadata.audio_channels,
+                    bits_per_sample: 16,
+                    pts: tag.timestamp,
+                    data: audio_data,
+                    is_sequence_header: false,
+                });
+            }
+        }
+
+        // 对于其他格式 (PCM, MP3, A-Law, μ-Law 等)，直接返回数据
+        let audio_data = tag.data[1..].to_vec();
+
+        Some(AudioFrame {
+            codec,
+            sample_rate: actual_sample_rate,
+            channels,
+            bits_per_sample,
+            pts: tag.timestamp,
+            data: audio_data,
+            is_sequence_header: false,
         })
     }
 
