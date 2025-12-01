@@ -3,7 +3,7 @@
  * 支持 AAC、PCM (A-law/μ-law)、MP3 等格式解码
  */
 
-export class AudioDecoder {
+export class AudioDecoderModule {
     constructor(onDecodedCallback) {
         this.decoder = null;
         this.codec = null;
@@ -11,9 +11,14 @@ export class AudioDecoder {
         this.channels = 1;
         this.configured = false;
         this.description = null;
+        this.pendingConfig = null;  // 待重新配置的参数
         
         // 解码后的回调
         this.onDecoded = onDecodedCallback;
+        
+        // 错误计数
+        this.errorCount = 0;
+        this.maxErrors = 5;
         
         // PCM G.711 解码表
         this.alawTable = this.buildAlawTable();
@@ -48,40 +53,72 @@ export class AudioDecoder {
             return;
         }
         
-        // 关闭之前的解码器
-        if (this.decoder && this.decoder.state !== 'closed') {
-            this.decoder.close();
-        }
-        
         // 创建 WebCodecs 音频解码器
         if (!('AudioDecoder' in window)) {
             console.error('❌ WebCodecs AudioDecoder 不支持');
             return;
         }
         
+        this.createDecoder();
+    }
+    
+    /**
+     * 创建/重建解码器实例
+     */
+    createDecoder() {
+        // 关闭之前的解码器
+        if (this.decoder && this.decoder.state !== 'closed') {
+            try {
+                this.decoder.close();
+            } catch (e) {
+                // 忽略关闭错误
+            }
+        }
+        
         this.decoder = new window.AudioDecoder({
             output: (audioData) => this.handleDecodedData(audioData),
-            error: (e) => console.error('❌ 音频解码错误:', e.message)
+            error: (e) => this.handleDecoderError(e)
         });
         
         // 配置解码器
         const config = {
-            codec: this.getWebCodecsCodec(codec),
-            sampleRate: sampleRate,
-            numberOfChannels: channels
+            codec: this.getWebCodecsCodec(this.codec),
+            sampleRate: this.sampleRate,
+            numberOfChannels: this.channels
         };
         
-        if (description && description.length > 0) {
-            config.description = description;
+        if (this.description && this.description.length > 0) {
+            config.description = this.description;
         }
         
         try {
             this.decoder.configure(config);
             this.configured = true;
-            console.log(`🎵 音频解码器配置: ${codec} -> ${config.codec} ${sampleRate}Hz ${channels}ch`);
+            this.errorCount = 0;
+            console.log(`🎵 音频解码器配置: ${this.codec} -> ${config.codec} ${this.sampleRate}Hz ${this.channels}ch`);
         } catch (e) {
             console.error('❌ 音频解码器配置失败:', e);
             this.configured = false;
+        }
+    }
+    
+    /**
+     * 处理解码器错误 - 自动恢复
+     */
+    handleDecoderError(e) {
+        this.errorCount++;
+        console.error(`❌ 音频解码错误 (${this.errorCount}/${this.maxErrors}):`, e.message);
+        
+        // 超过最大错误次数，重建解码器
+        if (this.errorCount >= this.maxErrors) {
+            console.log('🔄 音频解码器错误过多，尝试重建...');
+            this.errorCount = 0;
+            // 延迟重建避免快速循环
+            setTimeout(() => {
+                if (this.codec && this.codec !== 'pcm_alaw' && this.codec !== 'pcm_mulaw') {
+                    this.createDecoder();
+                }
+            }, 100);
         }
     }
     
@@ -106,7 +143,6 @@ export class AudioDecoder {
      */
     decode(data, timestamp = 0) {
         if (!this.configured) {
-            console.warn('⚠️ 音频解码器未配置');
             return;
         }
         
@@ -123,14 +159,37 @@ export class AudioDecoder {
             return;
         }
         
-        // WebCodecs 解码
-        if (this.decoder && this.decoder.state === 'configured') {
+        // WebCodecs 解码 - 检查解码器状态
+        if (!this.decoder) {
+            return;
+        }
+        
+        // 如果解码器已关闭或出错，尝试重建
+        if (this.decoder.state === 'closed') {
+            console.log('🔄 音频解码器已关闭，尝试重建...');
+            this.createDecoder();
+            return;
+        }
+        
+        if (this.decoder.state !== 'configured') {
+            // 等待配置完成
+            return;
+        }
+        
+        try {
             const chunk = new EncodedAudioChunk({
                 type: 'key',
                 timestamp: timestamp,
                 data: data
             });
             this.decoder.decode(chunk);
+        } catch (e) {
+            this.errorCount++;
+            if (this.errorCount >= this.maxErrors) {
+                console.log('🔄 音频解码调用失败过多，重建解码器...');
+                this.errorCount = 0;
+                this.createDecoder();
+            }
         }
     }
     
@@ -209,12 +268,15 @@ export class AudioDecoder {
     
     destroy() {
         if (this.decoder && this.decoder.state !== 'closed') {
-            this.decoder.close();
+            try {
+                this.decoder.close();
+            } catch (e) {
+                // 忽略关闭错误
+            }
         }
         this.decoder = null;
         this.configured = false;
-        console.log('🎵 AudioDecoder 已释放');
+        this.errorCount = 0;
+        console.log('🎵 AudioDecoderModule 已释放');
     }
 }
-
-export default AudioDecoder;

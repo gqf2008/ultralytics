@@ -136,25 +136,43 @@ async function startStream() {
         
         const onData = new Channel();
         let packetCount = 0;
+        let lastMessageTime = Date.now();
+        
+        // 心跳检测：每5秒检查是否还在收到数据
+        const heartbeatInterval = setInterval(() => {
+            const elapsed = Date.now() - lastMessageTime;
+            if (elapsed > 10000) {
+                console.warn(`⚠️ 已 ${(elapsed / 1000).toFixed(1)}s 未收到数据`);
+            }
+        }, 5000);
+        
+        // 保存 interval 以便停止时清除
+        window._heartbeatInterval = heartbeatInterval;
         
         onData.onmessage = (response) => {
-            if (packetCount < 5) {
-                console.log(`📨 收到数据 #${packetCount}:`, typeof response);
-            }
-            packetCount++;
-            
-            // 解析 JSON 消息
-            let message = null;
-            if (typeof response === 'string') {
-                try { message = JSON.parse(response); } catch (e) { }
-            } else if (typeof response === 'object' && response !== null && !(response instanceof ArrayBuffer)) {
-                message = response;
-            }
-            
-            if (message && message.type) {
-                handleJsonMessage(message);
-            } else if (response instanceof ArrayBuffer) {
-                handleBinaryPacket(new Uint8Array(response));
+            try {
+                lastMessageTime = Date.now();
+                
+                if (packetCount < 5) {
+                    console.log(`📨 收到数据 #${packetCount}:`, typeof response);
+                }
+                packetCount++;
+                
+                // 解析 JSON 消息
+                let message = null;
+                if (typeof response === 'string') {
+                    try { message = JSON.parse(response); } catch (e) { }
+                } else if (typeof response === 'object' && response !== null && !(response instanceof ArrayBuffer)) {
+                    message = response;
+                }
+                
+                if (message && message.type) {
+                    handleJsonMessage(message);
+                } else if (response instanceof ArrayBuffer) {
+                    handleBinaryPacket(new Uint8Array(response));
+                }
+            } catch (err) {
+                console.error('❌ onmessage 处理异常:', err);
             }
         };
         
@@ -222,34 +240,38 @@ function handleBinaryPacket(data) {
     
     const packetType = data[0];
     
-    if (packetType === 1) {
-        // 视频包
-        if (data.length < 30) return;
-        const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
-        const isKeyframe = data[1] === 1;
-        const pts = Number(view.getBigInt64(2, true));
-        const dataLen = view.getUint32(26, true);
-        const encodedData = data.slice(30, 30 + dataLen);
-        
-        renderer.handleVideoChunk(encodedData, isKeyframe, pts);
-        if (streamInfoManager) streamInfoManager.addPacket(encodedData.length, isKeyframe);
-    } else if (packetType === 2) {
-        // 音频包
-        const codecLen = data[1];
-        let pos = 2;
-        const codec = new TextDecoder().decode(data.slice(pos, pos + codecLen));
-        pos += codecLen;
-        
-        const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
-        const sampleRate = view.getUint32(pos, true); pos += 4;
-        const channels = data[pos]; pos += 1;
-        const pts = Number(view.getBigInt64(pos, true)); pos += 8;
-        const audioDataLen = view.getUint32(pos, true); pos += 4;
-        const audioData = data.slice(pos, pos + audioDataLen);
-        
-        const frontendCodec = convertAudioCodec(codec);
-        renderer.initAudioDecoder(frontendCodec, sampleRate, channels);
-        renderer.handleAudioChunk(audioData, pts);
+    try {
+        if (packetType === 1) {
+            // 视频包
+            if (data.length < 30) return;
+            const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+            const isKeyframe = data[1] === 1;
+            const pts = Number(view.getBigInt64(2, true));
+            const dataLen = view.getUint32(26, true);
+            const encodedData = data.slice(30, 30 + dataLen);
+            
+            renderer.handleVideoChunk(encodedData, isKeyframe, pts);
+            if (streamInfoManager) streamInfoManager.addPacket(encodedData.length, isKeyframe);
+        } else if (packetType === 2) {
+            // 音频包
+            const codecLen = data[1];
+            let pos = 2;
+            const codec = new TextDecoder().decode(data.slice(pos, pos + codecLen));
+            pos += codecLen;
+            
+            const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+            const sampleRate = view.getUint32(pos, true); pos += 4;
+            const channels = data[pos]; pos += 1;
+            const pts = Number(view.getBigInt64(pos, true)); pos += 8;
+            const audioDataLen = view.getUint32(pos, true); pos += 4;
+            const audioData = data.slice(pos, pos + audioDataLen);
+            
+            const frontendCodec = convertAudioCodec(codec);
+            renderer.initAudioDecoder(frontendCodec, sampleRate, channels);
+            renderer.handleAudioChunk(audioData, pts);
+        }
+    } catch (e) {
+        console.error('❌ 处理数据包出错:', e);
     }
 }
 
@@ -265,6 +287,12 @@ function convertAudioCodec(codec) {
 
 async function stopStream() {
     try {
+        // 清除心跳检测
+        if (window._heartbeatInterval) {
+            clearInterval(window._heartbeatInterval);
+            window._heartbeatInterval = null;
+        }
+        
         renderer.stop();
         await invoke('stop_stream');
         if (streamInfoManager) streamInfoManager.hide();

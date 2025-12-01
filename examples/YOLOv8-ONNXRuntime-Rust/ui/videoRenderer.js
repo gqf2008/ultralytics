@@ -1,9 +1,8 @@
 ﻿/**
  * WebGL 视频渲染器 - 使用 WebCodecs 解码和 Canvas2D 渲染
- * 音频处理已分离到独立模块: AudioDecoder, AudioPlayer, AudioDenoiser
+ * 音频处理已分离到独立模块: AudioDecoderModule, AudioPlayer, AudioDenoiser
  */
-import { invoke } from '@tauri-apps/api/core';
-import { AudioDecoder } from './audioDecoder.js';
+import { AudioDecoderModule } from './audioDecoder.js';
 import { AudioPlayer } from './audioPlayer.js';
 
 let streamInfoManager = null;
@@ -26,7 +25,7 @@ class WebGLVideoRenderer {
         
         // ========== 音频模块 (解耦) ==========
         this.audioPlayer = new AudioPlayer();
-        this.audioDecoderModule = new AudioDecoder((samples, sampleRate, channels, timestamp) => {
+        this.audioDecoderModule = new AudioDecoderModule((samples, sampleRate, channels, timestamp) => {
             // 解码完成后播放
             this.audioPlayer.play(samples, sampleRate, channels);
         });
@@ -36,7 +35,7 @@ class WebGLVideoRenderer {
         this.audioSampleRate = 8000;
         this.audioChannels = 1;
         this.audioGain = 1.0;
-        
+
         // 实时性优化：帧队列管理
         this.pendingFrames = [];
         this.maxPendingFrames = 2;
@@ -56,237 +55,102 @@ class WebGLVideoRenderer {
         
         this.resizeCanvas();
         window.addEventListener('resize', () => this.resizeCanvas());
-        this.initAudioContext();
     }
     
-    initAudioContext() {
-        this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
-        console.log('🔊 Audio Context initialized:', this.audioContext.sampleRate, 'Hz');
-        
-        // ========== 顶级降噪参数 ==========
-        this.noiseGateThreshold = -35;  // 噪声门限阈值 (dB)
-        this.noiseGateEnabled = true;
-        this.wienerFilterEnabled = false;  // 默认关闭，容易产生回声
-        this.noiseProfile = null;  // 噪声频谱特征
-        this.denoiseStrength = 1.0;  // 降噪强度 0-2
-        this.spectralFloor = 0.01;  // 频谱底噪
-        
-        // ========== RNNoise AI 降噪 ==========
-        this.rnnoiseEnabled = false;  // RNNoise 开关
-        this.rnnoiseReady = false;    // RNNoise 是否加载完成
-        this.rnnoiseInstance = null;  // Rnnoise 实例
-        this.rnnoiseState = null;     // DenoiseState
-        this.rnnoiseFrameSize = 480;  // 默认帧大小，加载后更新
-        this.rnnoiseBuffer = null;    // 处理缓冲，initRnnoise 后创建
-        this.rnnoiseBufferPos = 0;    // 缓冲区位置
-        this.rnnoiseOutputBuffer = [];  // 输出缓冲
-        this.initRnnoise();  // 预加载
-        
-        // 初始化频谱降噪
-        this.initSpectralDenoising();
-        
-        // ========== 音频滤波器链 ==========
-        // 高通滤波器：去除低频（默认250Hz，人声下限）
-        this.highpassFilter = this.audioContext.createBiquadFilter();
-        this.highpassFilter.type = 'highpass';
-        this.highpassFilter.frequency.value = 250;
-        this.highpassFilter.Q.value = 1.0;
-        
-        // 第二个高通：级联 = 24dB/oct 更陡峭
-        this.highpassFilter2 = this.audioContext.createBiquadFilter();
-        this.highpassFilter2.type = 'highpass';
-        this.highpassFilter2.frequency.value = 250;
-        this.highpassFilter2.Q.value = 1.0;
-        
-        // 低通滤波器：去除高频（默认6kHz，人声上限）
-        this.lowpassFilter = this.audioContext.createBiquadFilter();
-        this.lowpassFilter.type = 'lowpass';
-        this.lowpassFilter.frequency.value = 6000;
-        this.lowpassFilter.Q.value = 0.7;
-        
-        // 第二个低通
-        this.lowpassFilter2 = this.audioContext.createBiquadFilter();
-        this.lowpassFilter2.type = 'lowpass';
-        this.lowpassFilter2.frequency.value = 6000;
-        this.lowpassFilter2.Q.value = 0.7;
-        
-        // 陷波滤波器：消除电源工频干扰 (50Hz)
-        this.notchFilter = this.audioContext.createBiquadFilter();
-        this.notchFilter.type = 'notch';
-        this.notchFilter.frequency.value = 50;
-        this.notchFilter.Q.value = 30;
-        
-        // 第二个陷波：消除谐波 (100Hz)
-        this.notchFilter2 = this.audioContext.createBiquadFilter();
-        this.notchFilter2.type = 'notch';
-        this.notchFilter2.frequency.value = 100;
-        this.notchFilter2.Q.value = 30;
-        
-        // 动态压缩器：更强的压缩防止爆音
-        this.compressor = this.audioContext.createDynamicsCompressor();
-        this.compressor.threshold.value = -30;  // 更低阈值
-        this.compressor.knee.value = 20;        // 柔和过渡
-        this.compressor.ratio.value = 16;       // 高压缩比
-        this.compressor.attack.value = 0.001;   // 快速响应
-        this.compressor.release.value = 0.1;    // 稍慢释放
-        
-        // 增益节点：音量控制
-        this.gainNode = this.audioContext.createGain();
-        this.gainNode.gain.value = 1.0;  // 降低增益防止爆音
-        
-        // 连接滤波器链：
-        // source -> hp1 -> hp2 -> notch1 -> notch2 -> lp1 -> lp2 -> compressor -> gain -> destination
-        this.highpassFilter.connect(this.highpassFilter2);
-        this.highpassFilter2.connect(this.notchFilter);
-        this.notchFilter.connect(this.notchFilter2);
-        this.notchFilter2.connect(this.lowpassFilter);
-        this.lowpassFilter.connect(this.lowpassFilter2);
-        this.lowpassFilter2.connect(this.compressor);
-        this.compressor.connect(this.gainNode);
-        this.gainNode.connect(this.audioContext.destination);
-        
-        // 保存滤波器链入口
-        this.audioFilterInput = this.highpassFilter;
-        this.audioDirectOutput = this.gainNode;
-        this.noiseReductionEnabled = true;
-        
-        console.log('🔇 音频降噪: HP=200Hz LP=8kHz (强力模式，去除低频轰隆)');
-        
-        // 音频上下文可能被浏览器挂起
-        document.addEventListener('click', () => {
-            if (this.audioContext && this.audioContext.state === 'suspended') {
-                this.audioContext.resume();
-                console.log('🔊 Audio Context resumed');
-            }
-        }, { once: true });
-    }
-    
-    // ========== 音频控制方法 ==========
+    // ========== 音频控制方法 (代理到 AudioPlayer) ==========
     
     /**
      * 设置音量
      */
     setVolume(gain) {
         this.audioGain = gain;
-        if (this.gainNode) {
-            this.gainNode.gain.value = gain;
-            console.log(`🔊 音量设置: ${gain.toFixed(1)}x`);
-        }
+        this.audioPlayer?.setVolume(gain);
     }
     
     /**
      * 启用/禁用降噪
      */
     setNoiseReduction(enabled) {
-        this.noiseReductionEnabled = enabled;
-        if (enabled) {
-            // 启用降噪：音频源连接到滤波器链
-            this.audioFilterInput = this.highpassFilter;
-        } else {
-            // 禁用降噪：音频源直接连接到增益节点
-            this.audioFilterInput = this.gainNode;
-        }
-        console.log(`🔇 降噪${enabled ? '启用' : '禁用'}`);
+        this.audioPlayer?.setFilterEnabled(enabled);
     }
     
     /**
      * 设置高通滤波器截止频率
      */
     setHighpassFrequency(freq) {
-        if (this.highpassFilter) {
-            this.highpassFilter.frequency.value = freq;
-            this.highpassFilter2.frequency.value = freq;
-            console.log(`🔇 高通截止: ${freq}Hz (双重滤波)`);
-        }
+        this.audioPlayer?.setHighpassFrequency(freq);
     }
     
     /**
      * 设置低通滤波器截止频率
      */
     setLowpassFrequency(freq) {
-        if (this.lowpassFilter) {
-            this.lowpassFilter.frequency.value = freq;
-            this.lowpassFilter2.frequency.value = freq;
-            console.log(`🔇 低通截止: ${freq}Hz (双重滤波)`);
-        }
+        this.audioPlayer?.setLowpassFrequency(freq);
     }
     
     /**
      * 设置陷波滤波器频率（电源噪声）
      */
     setNotchFrequency(freq) {
-        if (this.notchFilter) {
-            if (freq > 0) {
-                this.notchFilter.frequency.value = freq;
-                this.notchFilter.Q.value = 30;
-                // 同时设置二次谐波
-                this.notchFilter2.frequency.value = freq * 2;
-                this.notchFilter2.Q.value = 30;
-                console.log(`🔇 陷波滤波: ${freq}Hz + ${freq * 2}Hz (含谐波)`);
-            } else {
-                this.notchFilter.Q.value = 0.001;
-                this.notchFilter2.Q.value = 0.001;
-                console.log(`🔇 陷波滤波: 关闭`);
-            }
-        }
+        this.audioPlayer?.setNotchFrequency(freq);
     }
     
     /**
      * 应用降噪预设
      */
     applyNoisePreset(preset) {
-        if (!preset) return;
-        
-        // 设置是否启用滤波器链
-        this.setNoiseReduction(preset.enabled);
-        
-        if (preset.enabled) {
-            // 设置高通
-            this.setHighpassFrequency(preset.highpass);
-            // 设置低通
-            this.setLowpassFrequency(preset.lowpass);
-            
-            // 噪声门限设置
-            if (preset.gate !== undefined) {
-                this.setNoiseGateEnabled(preset.gate);
-            }
-            if (preset.gateThreshold !== undefined) {
-                this.setNoiseGateThreshold(preset.gateThreshold);
-            }
-            // 降噪强度
-            if (preset.strength !== undefined) {
-                this.setDenoiseStrength(preset.strength / 100);
-            }
-        }
-        
-        console.log(`🔇 预设: HP=${preset.highpass}Hz LP=${preset.lowpass}Hz 门限=${preset.gateThreshold}dB 强度=${preset.strength}%`);
+        this.audioPlayer?.applyNoisePreset(preset);
     }
     
     /**
      * 重置音频缓冲
      */
     resetAudioBuffer() {
-        this.nextAudioTime = this.audioContext ? this.audioContext.currentTime + this.audioBufferAhead : 0;
-        this.audioClockBase = 0;
-        this.audioClockStart = 0;
-        this.audioClockReady = false;
-        this._videoSyncBaseSet = false;  // 同时重置视频同步标志
-        console.log(`🔄 音频缓冲和时钟重置`);
+        this.audioPlayer?.reset();
     }
     
     /**
-     * 获取当前音频时钟时间（毫秒）
-     * 用于视频帧同步参考
+     * 设置 RNNoise 启用状态
      */
-    getAudioClockTime() {
-        if (!this.audioClockReady || !this.audioContext) {
-            return null;
-        }
-        // 音频时钟 = 基准PTS + (当前AudioContext时间 - 开始时间) * 1000
-        const elapsed = (this.audioContext.currentTime - this.audioClockStart) * 1000;
-        return this.audioClockBase + elapsed;
+    setRnnoiseEnabled(enabled) {
+        this.audioPlayer?.setRnnoiseEnabled(enabled);
     }
     
+    /**
+     * 设置降噪强度
+     */
+    setDenoiseStrength(value) {
+        this.audioPlayer?.setDenoiseStrength(value);
+    }
+    
+    /**
+     * 设置噪声门限阈值
+     */
+    setNoiseGateThreshold(dB) {
+        this.audioPlayer?.setNoiseGateThreshold(dB);
+    }
+    
+    /**
+     * 启用/禁用噪声门限
+     */
+    setNoiseGateEnabled(enabled) {
+        this.audioPlayer?.setNoiseGateEnabled(enabled);
+    }
+    
+    /**
+     * 启用/禁用 Wiener 滤波
+     */
+    setWienerFilterEnabled(enabled) {
+        this.audioPlayer?.setWienerFilterEnabled(enabled);
+    }
+    
+    /**
+     * 采样环境噪声
+     */
+    sampleNoiseFloor() {
+        this.audioPlayer?.sampleNoiseFloor();
+    }
+
     /**
      * 在画布上显示错误信息，并创建可点击的安装按钮
      */
@@ -506,6 +370,7 @@ class WebGLVideoRenderer {
         this.decoder = new VideoDecoder({
             output: (frame) => {
                 this.decodedFrameCount++;
+                this.videoDecodeErrorCount = 0;  // 重置错误计数
                 // 每30帧更新一次状态到面板
                 if (this.decodedFrameCount % 30 === 1) {
                     if (typeof streamInfoManager !== 'undefined' && streamInfoManager) {
@@ -528,12 +393,33 @@ class WebGLVideoRenderer {
             },
             error: (e) => {
                 this.decodeErrorCount++;
+                this.videoDecodeErrorCount = (this.videoDecodeErrorCount || 0) + 1;
                 this.lastDecodeError = e.message;
                 console.error("❌ Decoder error:", e.message);
                 console.error("   decoder state:", this.decoder?.state);
                 // 解码错误时等待下一个关键帧
                 this.waitingForKeyframe = true;
                 this.basePts = null;  // 重置时间戳基准
+                
+                // 错误过多时尝试重建解码器
+                if (this.videoDecodeErrorCount >= 5) {
+                    console.log('🔄 视频解码错误过多，尝试重建解码器...');
+                    this.videoDecodeErrorCount = 0;
+                    // 保存配置用于重建
+                    this._pendingReconfig = {
+                        codec: this.currentCodec,
+                        width: this.videoWidth || 1920,
+                        height: this.videoHeight || 1080,
+                        extradata: this.extradata
+                    };
+                    setTimeout(() => {
+                        if (this._pendingReconfig && this.isRunning) {
+                            const cfg = this._pendingReconfig;
+                            this._pendingReconfig = null;
+                            this.initDecoder(cfg.codec, cfg.width, cfg.height, cfg.extradata);
+                        }
+                    }, 100);
+                }
                 
                 // 更新面板显示错误
                 if (typeof streamInfoManager !== 'undefined' && streamInfoManager) {
@@ -876,505 +762,14 @@ class WebGLVideoRenderer {
         return avcc;
     }
     
+    /**
+     * 初始化音频解码器 (代理到 audioDecoderModule)
+     */
     initAudioDecoder(codec = 'aac', sampleRate = 48000, channels = 2, description = null) {
-        // 避免重复初始化相同配置
-        if (this.audioCodec === codec && 
-            this.audioSampleRate === sampleRate && 
-            this.audioChannels === channels &&
-            this.audioDecoder && 
-            this.audioDecoder.state === 'configured') {
-            return;
-        }
-        
         this.audioCodec = codec;
         this.audioSampleRate = sampleRate;
         this.audioChannels = channels;
-        
-        if (codec === 'pcm_alaw' || codec === 'pcm_mulaw') {
-            console.log(`🎵 PCM audio detected: ${codec.toUpperCase()} ${sampleRate}Hz ${channels}ch - 直接播放`);
-            return;
-        }
-        
-        if (!('AudioDecoder' in window)) {
-            console.error('WebCodecs AudioDecoder not supported');
-            return;
-        }
-        
-        if (this.audioDecoder && this.audioDecoder.state !== 'closed') {
-            this.audioDecoder.close();
-        }
-        
-        this.audioDecoder = new AudioDecoder({
-            output: (audioData) => {
-                // 直接使用 AudioData 的内置时间戳 (微秒) → 转换为毫秒
-                const pts = audioData.timestamp / 1000;
-                this.playAudioData(audioData, pts);
-                audioData.close();
-            },
-            error: (e) => console.error('Audio decoder error:', e),
-        });
-        
-        let codecString;
-        switch(codec) {
-            case 'aac':
-                codecString = 'mp4a.40.2';
-                break;
-            case 'opus':
-                codecString = 'opus';
-                break;
-            case 'mp3':
-                codecString = 'mp3';
-                break;
-            default:
-                codecString = 'mp4a.40.2';
-        }
-        
-        const config = {
-            codec: codecString,
-            sampleRate: sampleRate,
-            numberOfChannels: channels,
-        };
-        
-        // 如果有 AAC description (AudioSpecificConfig)，添加到配置
-        if (description && codec === 'aac') {
-            config.description = description;
-            console.log(`🎵 AAC AudioSpecificConfig: [${Array.from(description).map(b => b.toString(16).padStart(2, '0')).join(' ')}]`);
-        }
-        
-        console.log(`🎵 Configuring audio decoder: ${codec.toUpperCase()} ${sampleRate}Hz ${channels}ch`);
-        
-        // 同步配置解码器
-        try {
-            this.audioDecoder.configure(config);
-            this.nextAudioTime = this.audioContext.currentTime;
-            console.log(`✅ Audio decoder configured: ${codecString} ${sampleRate}Hz ${channels}ch`);
-        } catch (e) {
-            console.error(`❌ Audio decoder configure failed:`, e);
-        }
-    }
-    
-    playAudioData(audioData, pts = null) {
-        const buffer = this.audioContext.createBuffer(
-            audioData.numberOfChannels,
-            audioData.numberOfFrames,
-            audioData.sampleRate
-        );
-        
-        for (let channel = 0; channel < audioData.numberOfChannels; channel++) {
-            const channelData = new Float32Array(audioData.numberOfFrames);
-            audioData.copyTo(channelData, { planeIndex: channel });
-            
-            // ========== 顶级降噪处理 ==========
-            // 优先使用 RNNoise AI 降噪
-            if (this.rnnoiseEnabled && this.rnnoiseReady) {
-                this.applyRnnoise(channelData, audioData.sampleRate);
-            } else if (this.noiseReductionEnabled) {
-                // 回退到传统频谱降噪
-                this.applySpectralDenoising(channelData);
-            }
-            
-            // 采样噪声底噪（如果正在采样）
-            if (this._samplingNoise) {
-                this.collectNoiseProfile(channelData);
-            }
-            
-            // ========== 软限幅防止爆音 ==========
-            for (let i = 0; i < channelData.length; i++) {
-                const x = channelData[i];
-                // 使用 tanh 软限幅，超过 0.8 开始压缩
-                if (Math.abs(x) > 0.8) {
-                    channelData[i] = Math.tanh(x);
-                }
-            }
-            
-            buffer.copyToChannel(channelData, channel);
-        }
-        
-        this.scheduleAudioBuffer(buffer, pts);
-    }
-    
-    /**
-     * 初始化 RNNoise AI 降噪
-     */
-    async initRnnoise() {
-        try {
-            console.log('🤖 正在加载 RNNoise AI 降噪引擎...');
-            this.rnnoiseInstance = await Rnnoise.load();
-            this.rnnoiseState = this.rnnoiseInstance.createDenoiseState();
-            this.rnnoiseFrameSize = this.rnnoiseInstance.frameSize;  // 通常是 480
-            this.rnnoiseBuffer = new Float32Array(this.rnnoiseFrameSize);
-            this.rnnoiseReady = true;
-            console.log(`🤖 RNNoise AI 降噪引擎加载成功！帧大小: ${this.rnnoiseFrameSize}`);
-        } catch (error) {
-            console.error('❌ RNNoise 加载失败:', error);
-            this.rnnoiseReady = false;
-        }
-    }
-    
-    /**
-     * 启用/禁用 RNNoise
-     */
-    setRnnoiseEnabled(enabled) {
-        this.rnnoiseEnabled = enabled;
-        if (enabled && !this.rnnoiseReady) {
-            this.initRnnoise();
-        }
-        console.log(`🤖 RNNoise AI 降噪${enabled ? '启用' : '禁用'}`);
-    }
-    
-    /**
-     * 应用 RNNoise 降噪
-     * RNNoise 输入：Float32Array，值范围 -32768 到 32767 (16-bit PCM 范围)
-     */
-    applyRnnoise(samples, sampleRate) {
-        if (!this.rnnoiseReady || !this.rnnoiseState || !this.rnnoiseBuffer) {
-            return samples;
-        }
-        
-        const frameSize = this.rnnoiseFrameSize;
-        const scale = 32767;    // Float32 [-1,1] 转 Int16 范围
-        const length = samples.length;
-        
-        // 使用环形缓冲处理
-        for (let i = 0; i < length; i++) {
-            // 转换到 Int16 范围
-            this.rnnoiseBuffer[this.rnnoiseBufferPos++] = samples[i] * scale;
-            
-            // 当缓冲区满时处理
-            if (this.rnnoiseBufferPos >= frameSize) {
-                // RNNoise 处理（原地修改）
-                this.rnnoiseState.processFrame(this.rnnoiseBuffer);
-                
-                // 把处理后的数据放回输出缓冲
-                for (let j = 0; j < frameSize; j++) {
-                    this.rnnoiseOutputBuffer.push(this.rnnoiseBuffer[j] / scale);
-                }
-                
-                this.rnnoiseBufferPos = 0;
-            }
-        }
-        
-        // 从输出缓冲取数据写回 samples
-        const available = Math.min(this.rnnoiseOutputBuffer.length, length);
-        for (let i = 0; i < available; i++) {
-            samples[i] = this.rnnoiseOutputBuffer.shift();
-        }
-        
-        // 如果输出缓冲不够，保持原样（等待更多数据）
-        // 这会引入少量延迟但保证连续性
-        
-        return samples;
-    }
-    
-    /**
-     * 销毁 RNNoise 实例（释放内存）
-     */
-    destroyRnnoise() {
-        if (this.rnnoiseState) {
-            this.rnnoiseState.destroy();
-            this.rnnoiseState = null;
-        }
-        this.rnnoiseReady = false;
-        console.log('🤖 RNNoise 已销毁');
-    }
-
-    /**
-     * 初始化 FFT 降噪所需的数据结构
-     */
-    initSpectralDenoising() {
-        this.fftSize = 2048;
-        this.hopSize = this.fftSize / 4;  // 75% 重叠
-        this.noiseProfile = null;  // 噪声频谱特征
-        this.prevPhase = new Float32Array(this.fftSize);
-        this.inputBuffer = new Float32Array(this.fftSize);
-        this.outputBuffer = new Float32Array(this.fftSize * 2);
-        this.outputReadPos = 0;
-        this.outputWritePos = 0;
-        this.inputWritePos = 0;
-        
-        // 汉宁窗
-        this.window = new Float32Array(this.fftSize);
-        for (let i = 0; i < this.fftSize; i++) {
-            this.window[i] = 0.5 * (1 - Math.cos(2 * Math.PI * i / (this.fftSize - 1)));
-        }
-        
-        // 降噪参数
-        this.denoiseStrength = 1.0;  // 降噪强度 0-2
-        this.spectralFloor = 0.002;  // 频谱底噪
-        
-        console.log('🔊 FFT 频谱降噪初始化完成');
-    }
-    
-    /**
-     * 收集噪声特征（采样时调用）
-     */
-    collectNoiseProfile(samples) {
-        if (!this.noiseProfileFrames) {
-            this.noiseProfileFrames = [];
-        }
-        
-        // 计算当前帧的频谱
-        const spectrum = this.computeSpectrum(samples);
-        this.noiseProfileFrames.push(spectrum);
-        
-        this._noiseSampleCount++;
-    }
-    
-    /**
-     * 计算信号的幅度谱（简化 FFT）
-     */
-    computeSpectrum(samples) {
-        const n = Math.min(samples.length, this.fftSize);
-        const spectrum = new Float32Array(n / 2);
-        
-        // 简化 DFT（对于实时降噪够用）
-        for (let k = 0; k < n / 2; k++) {
-            let re = 0, im = 0;
-            const freq = 2 * Math.PI * k / n;
-            for (let i = 0; i < n; i++) {
-                const w = this.window[i] || 1;
-                re += samples[i] * w * Math.cos(freq * i);
-                im -= samples[i] * w * Math.sin(freq * i);
-            }
-            spectrum[k] = Math.sqrt(re * re + im * im) / n;
-        }
-        
-        return spectrum;
-    }
-    
-    /**
-     * 顶级频谱降噪算法
-     * 基于 MMSE-STSA（最小均方短时谱幅度估计）
-     */
-    applySpectralDenoising(samples) {
-        const length = samples.length;
-        
-        // 1. 噪声门限（快速初筛）
-        if (this.noiseGateEnabled) {
-            this.applyNoiseGate(samples);
-        }
-        
-        // 2. 频谱减法降噪（如果有噪声特征）
-        if (this.noiseProfile && this.denoiseStrength > 0) {
-            this.applySpectralSubtraction(samples);
-        }
-        
-        // 3. Wiener 滤波平滑
-        if (this.wienerFilterEnabled) {
-            this.applyWienerFilter(samples);
-        }
-        
-        // 4. 软限幅
-        this.applySoftLimiter(samples);
-    }
-    
-    /**
-     * 噪声门限
-     */
-    applyNoiseGate(samples) {
-        const threshold = Math.pow(10, this.noiseGateThreshold / 20);
-        const attack = 0.001 * this.audioContext.sampleRate;
-        const release = 0.03 * this.audioContext.sampleRate;
-        const hold = 0.015 * this.audioContext.sampleRate;
-        
-        let env = this._gateEnvelope || 0;
-        let holdCount = this._gateHoldCount || 0;
-        
-        for (let i = 0; i < samples.length; i++) {
-            const abs = Math.abs(samples[i]);
-            
-            // 包络跟随
-            const coef = abs > env ? attack : release;
-            env += (abs - env) / coef;
-            
-            // 门限
-            if (env > threshold) {
-                holdCount = hold;
-            } else if (holdCount > 0) {
-                holdCount--;
-            } else {
-                // 平滑衰减
-                const gain = Math.pow(env / threshold, 2);
-                samples[i] *= Math.max(0.01, gain);
-            }
-        }
-        
-        this._gateEnvelope = env;
-        this._gateHoldCount = holdCount;
-    }
-    
-    /**
-     * 频谱减法（核心降噪）
-     * 优化：更宽松的阈值保护人声，避免断断续续
-     */
-    applySpectralSubtraction(samples) {
-        const blockSize = 512;  // 更大的块减少处理频率
-        const numBlocks = Math.floor(samples.length / blockSize);
-        
-        for (let b = 0; b < numBlocks; b++) {
-            const start = b * blockSize;
-            const block = samples.slice(start, start + blockSize);
-            
-            // 计算 RMS
-            let rms = 0;
-            for (let i = 0; i < block.length; i++) {
-                rms += block[i] * block[i];
-            }
-            rms = Math.sqrt(rms / block.length);
-            
-            // 与噪声特征比较
-            const noiseRMS = this.noiseProfile.rms || 0.01;
-            const snr = rms / noiseRMS;
-            
-            // 计算增益 - 更宽松的阈值保护人声
-            let gain;
-            if (snr > 1.5) {
-                gain = 1;  // 信号明显大于噪声，完全保留
-            } else if (snr > 0.8) {
-                // 平滑过渡区间更大，避免突变
-                gain = (snr - 0.8) / 0.7;
-                // 使用更平缓的曲线
-                gain = Math.sqrt(gain);
-            } else {
-                // 底噪保留更多，避免完全静音导致不自然
-                gain = Math.max(this.spectralFloor, 0.15);
-            }
-            
-            // 应用降噪强度（限制最大衰减）
-            const attenuation = (1 - gain) * this.denoiseStrength * 0.7;  // 最多衰减70%
-            gain = 1 - attenuation;
-            
-            // 平滑应用增益，避免块边界突变
-            for (let i = 0; i < blockSize && start + i < samples.length; i++) {
-                // 块内使用渐变过渡
-                const pos = i / blockSize;
-                const smoothGain = pos < 0.1 ? gain * (0.9 + pos) : 
-                                   pos > 0.9 ? gain * (1.9 - pos) : gain;
-                samples[start + i] *= smoothGain;
-            }
-        }
-    }
-    
-    /**
-     * Wiener 滤波器（帧间平滑，减少突变）
-     * 注意：alpha 太低会产生回声，设为 0.85-0.95 比较合适
-     */
-    applyWienerFilter(samples) {
-        // 只做帧间的轻微平滑，不做帧内平滑
-        // 这样可以减少块状噪声，同时避免回声
-        if (!this._wienerLastSample) {
-            this._wienerLastSample = 0;
-        }
-        
-        const alpha = 0.92;  // 高 alpha = 当前帧权重大，回声小
-        
-        // 只平滑帧的第一个样本与上一帧最后一个样本的过渡
-        if (samples.length > 0) {
-            samples[0] = alpha * samples[0] + (1 - alpha) * this._wienerLastSample;
-            this._wienerLastSample = samples[samples.length - 1];
-        }
-    }
-    
-    /**
-     * 软限幅（防爆音）
-     */
-    applySoftLimiter(samples) {
-        for (let i = 0; i < samples.length; i++) {
-            const x = samples[i];
-            if (Math.abs(x) > 0.7) {
-                samples[i] = Math.tanh(x * 2) * 0.85;
-            }
-        }
-    }
-    
-    /**
-     * 采样环境噪声
-     */
-    sampleNoiseFloor() {
-        this.noiseProfileFrames = [];
-        this._samplingNoise = true;
-        this._noiseSampleCount = 0;
-        console.log('🎤 开始采样环境噪声... 请保持安静3秒');
-        
-        setTimeout(() => {
-            if (this.noiseProfileFrames && this.noiseProfileFrames.length > 0) {
-                // 计算平均噪声特征
-                const numFrames = this.noiseProfileFrames.length;
-                let totalRMS = 0;
-                
-                for (const frame of this.noiseProfileFrames) {
-                    let rms = 0;
-                    for (let i = 0; i < frame.length; i++) {
-                        rms += frame[i] * frame[i];
-                    }
-                    totalRMS += Math.sqrt(rms / frame.length);
-                }
-                
-                this.noiseProfile = {
-                    rms: totalRMS / numFrames,
-                    frames: this.noiseProfileFrames
-                };
-                
-                const dB = 20 * Math.log10(this.noiseProfile.rms + 0.0001);
-                console.log(`✅ 噪声采样完成: ${dB.toFixed(1)} dB, ${numFrames} 帧`);
-            }
-            this._samplingNoise = false;
-        }, 3000);
-    }
-    
-    /**
-     * 设置降噪强度
-     */
-    setDenoiseStrength(value) {
-        this.denoiseStrength = Math.max(0, Math.min(2, value));
-        console.log(`🔇 降噪强度: ${(this.denoiseStrength * 100).toFixed(0)}%`);
-    }
-    
-    /**
-     * 设置噪声门限阈值
-     */
-    setNoiseGateThreshold(dB) {
-        this.noiseGateThreshold = dB;
-        console.log(`🔇 噪声门限: ${dB} dB`);
-    }
-    
-    /**
-     * 启用/禁用噪声门限
-     */
-    setNoiseGateEnabled(enabled) {
-        this.noiseGateEnabled = enabled;
-        console.log(`🔇 噪声门限: ${enabled ? '启用' : '禁用'}`);
-    }
-    
-    /**
-     * 启用/禁用 Wiener 滤波
-     */
-    setWienerFilterEnabled(enabled) {
-        this.wienerFilterEnabled = enabled;
-        console.log(`🔇 Wiener滤波: ${enabled ? '启用' : '禁用'}`);
-    }
-    
-    /**
-     * 调度音频缓冲区播放（简单顺序播放）
-     */
-    scheduleAudioBuffer(buffer, pts = null) {
-        const source = this.audioContext.createBufferSource();
-        source.buffer = buffer;
-        source.connect(this.audioFilterInput);
-        
-        const currentTime = this.audioContext.currentTime;
-        
-        // 简单缓冲管理
-        if (this.nextAudioTime < currentTime) {
-            // 缓冲耗尽，重新开始
-            this.nextAudioTime = currentTime + this.audioBufferAhead;
-        } else if (this.nextAudioTime - currentTime > this.audioMaxBuffer) {
-            // 缓冲过大，重置
-            this.nextAudioTime = currentTime + this.audioBufferAhead;
-        }
-        
-        source.start(this.nextAudioTime);
-        this.nextAudioTime += buffer.duration;
+        this.audioDecoderModule?.init(codec, sampleRate, channels, description);
     }
 
     handleVideoChunk(data, isKeyframe = true, pts = 0) {
@@ -1382,14 +777,54 @@ class WebGLVideoRenderer {
             return;
         }
         
+        // 解码器已关闭，尝试重建
         if (!this.decoder || this.decoder.state === 'closed') {
+            if (this.currentCodec && !this._rebuildingDecoder) {
+                console.log('🔄 视频解码器已关闭，尝试重建...');
+                this._rebuildingDecoder = true;
+                setTimeout(() => {
+                    this._rebuildingDecoder = false;
+                    if (this.isRunning) {
+                        this.initDecoder(
+                            this.currentCodec, 
+                            this.videoWidth || 1920, 
+                            this.videoHeight || 1080, 
+                            this.extradata
+                        );
+                    }
+                }, 100);
+            }
             return;
         }
         
+        // 解码器状态检查
         if (this.decoder.state !== 'configured') {
-            if (!this.decoderConfigured) {
-                return;
+            // 打印状态用于调试
+            console.warn(`⚠️ 解码器状态异常: ${this.decoder.state}, decoderConfigured=${this.decoderConfigured}`);
+            
+            // 如果是 unconfigured 状态且之前配置过，尝试重新配置
+            if (this.decoder.state === 'unconfigured' && this.decoderConfigured) {
+                console.log('🔄 解码器变为 unconfigured，尝试重新配置...');
+                this.decoderConfigured = false;
+                this.waitingForKeyframe = true;
+                
+                // 尝试用之前的配置重新配置
+                if (this.currentCodec && !this._rebuildingDecoder) {
+                    this._rebuildingDecoder = true;
+                    setTimeout(() => {
+                        this._rebuildingDecoder = false;
+                        if (this.isRunning) {
+                            this.initDecoder(
+                                this.currentCodec,
+                                this.videoWidth || 1920,
+                                this.videoHeight || 1080,
+                                this.extradata
+                            );
+                        }
+                    }, 100);
+                }
             }
+            return;
         }
         
         // 如果正在等待关键帧，只处理关键帧
@@ -1456,17 +891,9 @@ class WebGLVideoRenderer {
             // 转换为微秒
             var timestamp = relativePts * 1000;
             
-            // 每100帧打印状态（包含同步信息）
+            // 每100帧打印状态
             if (this.videoChunkCount % 100 === 0) {
-                const audioTime = this.getAudioClockTime();
-                let syncInfo = '';
-                if (audioTime !== null && this.audioClockReady) {
-                    const videoRelative = relativePts;
-                    const audioRelative = audioTime - this.audioClockBase;
-                    const drift = videoRelative - audioRelative;
-                    syncInfo = `, 音频相对=${audioRelative.toFixed(0)}ms, 视频相对=${videoRelative.toFixed(0)}ms, 偏差=${drift.toFixed(0)}ms`;
-                }
-                console.log(`📊 解码状态 #${this.videoChunkCount}: queueSize=${this.decoder.decodeQueueSize}, state=${this.decoder.state}${syncInfo}`);
+                console.log(`📊 解码状态 #${this.videoChunkCount}: queueSize=${this.decoder.decodeQueueSize}, state=${this.decoder.state}`);
             }
         } else {
             var timestamp = performance.now() * 1000;
@@ -1803,125 +1230,15 @@ class WebGLVideoRenderer {
         return avcc;
     }
     
+    /**
+     * 处理音频数据块 (代理到 audioDecoderModule)
+     */
     handleAudioChunk(data, pts = null) {
-        if (this.audioCodec === 'pcm_alaw') {
-            // A-Law 解码为 16-bit PCM
-            const pcm16 = this.decodeAlaw(data);
-            this.playPCMData(pcm16, pts);
-            return;
-        }
-        
-        if (this.audioCodec === 'pcm_mulaw') {
-            // μ-Law 解码为 16-bit PCM
-            const pcm16 = this.decodeMulaw(data);
-            this.playPCMData(pcm16, pts);
-            return;
-        }
-        
-        if (!this.audioDecoder || this.audioDecoder.state !== 'configured') {
-            console.warn('⚠️ Audio decoder not ready:', this.audioDecoder?.state);
-            return;
-        }
-        
-        const chunk = new EncodedAudioChunk({
-            type: 'key',
-            timestamp: pts !== null ? pts * 1000 : performance.now() * 1000,  // 微秒
-            data: data
-        });
-        
-        try {
-            this.audioDecoder.decode(chunk);
-        } catch(e) {
-            console.error('Audio decode error:', e);
-        }
+        // 转换 pts 为微秒
+        const timestamp = pts !== null ? pts * 1000 : performance.now() * 1000;
+        this.audioDecoderModule?.decode(data, timestamp);
     }
-    
-    /**
-     * A-Law 解码 (ITU-T G.711 A)
-     * 8-bit A-Law → 16-bit Linear PCM
-     */
-    decodeAlaw(alawData) {
-        const pcm16 = new Int16Array(alawData.length);
-        
-        for (let i = 0; i < alawData.length; i++) {
-            let alaw = alawData[i] ^ 0x55;  // A-Law 反转
-            
-            const sign = alaw & 0x80;
-            const exponent = (alaw >> 4) & 0x07;
-            const mantissa = alaw & 0x0F;
-            
-            let sample;
-            if (exponent === 0) {
-                sample = (mantissa << 4) + 8;
-            } else {
-                sample = ((mantissa << 4) + 0x108) << (exponent - 1);
-            }
-            
-            pcm16[i] = sign ? -sample : sample;
-        }
-        
-        return pcm16;
-    }
-    
-    /**
-     * μ-Law 解码 (ITU-T G.711 μ)
-     * 8-bit μ-Law → 16-bit Linear PCM
-     */
-    decodeMulaw(mulawData) {
-        const pcm16 = new Int16Array(mulawData.length);
-        
-        for (let i = 0; i < mulawData.length; i++) {
-            let mulaw = ~mulawData[i];  // μ-Law 反转
-            
-            const sign = mulaw & 0x80;
-            const exponent = (mulaw >> 4) & 0x07;
-            const mantissa = mulaw & 0x0F;
-            
-            let sample = ((mantissa << 3) + 0x84) << exponent;
-            sample -= 0x84;
-            
-            pcm16[i] = sign ? -sample : sample;
-        }
-        
-        return pcm16;
-    }
-    
-    playPCM16(data, pts = null) {
-        const pcmData = new Int16Array(data.buffer, data.byteOffset, data.byteLength / 2);
-        this.playPCMData(pcmData, pts);
-    }
-    
-    playPCMData(pcmData, pts = null) {
-        const sampleRate = this.audioSampleRate;
-        const channels = this.audioChannels;
-        const frameCount = pcmData.length / channels;
-        
-        if (this.audioContext.state === 'suspended') {
-            console.warn('⚠️ AudioContext suspended, resuming...');
-            this.audioContext.resume();
-        }
-        
-        const buffer = this.audioContext.createBuffer(channels, frameCount, sampleRate);
-        
-        for (let ch = 0; ch < channels; ch++) {
-            const channelData = buffer.getChannelData(ch);
-            for (let i = 0; i < frameCount; i++) {
-                const sampleIndex = channels === 1 ? i : i * channels + ch;
-                let sample = pcmData[sampleIndex] / 32768.0;
-                sample *= this.audioGain;
-                
-                if (Math.abs(sample) > 0.95) {
-                    sample = Math.tanh(sample * 0.8);
-                }
-                
-                channelData[i] = sample;
-            }
-        }
-        
-        // 使用统一的调度逻辑，传递 PTS 建立音频时钟
-        this.scheduleAudioBuffer(buffer, pts);
-    }
-    
+
     processLatestFrame() {
         if (!this.isRunning || this.pendingFrames.length === 0) return;
         
@@ -2023,106 +1340,22 @@ class WebGLVideoRenderer {
     start() {
         this.isRunning = true;
     }
-    
+
     stop() {
         this.isRunning = false;
-        this.hwDecodeRunning = false;
         // 清理保存的最后一帧
         if (this.lastImageBitmap) {
             this.lastImageBitmap.close();
             this.lastImageBitmap = null;
         }
-        // 重置音频配置
-        this.audioConfigured = false;
+        // 重置音频
         this.audioCodec = null;
+        this.resetAudioBuffer();
         // 重置时间戳基准
         this.basePts = null;
         this.baseTime = null;
-        this.resetAudioBuffer();
     }
     
-    // 硬件解码模式 - 事件驱动，收到帧就绪信号后读取数据
-    startHardwareDecodeMode(frameChannel) {
-        this.isRunning = true;
-        this.hwDecodeRunning = true;
-        this.lastFrameId = 0;
-        console.log('🎬 启动后端硬解渲染模式 (事件驱动)');
-        
-        // 监听帧就绪信号
-        frameChannel.onmessage = async (signal) => {
-            if (!this.hwDecodeRunning) return;
-            
-            try {
-                // 收到帧就绪信号，读取完整数据
-                const response = await invoke('get_shared_memory_frame');
-                
-                // 确保是 Uint8Array
-                let data;
-                if (response instanceof ArrayBuffer) {
-                    data = new Uint8Array(response);
-                } else if (response instanceof Uint8Array) {
-                    data = response;
-                } else if (Array.isArray(response)) {
-                    data = new Uint8Array(response);
-                } else {
-                    console.warn('未知的响应类型:', typeof response);
-                    return;
-                }
-                
-                if (data && data.length > 24) {
-                    // 解析 header: frame_id(8) + width(4) + height(4) + timestamp(8) = 24 bytes
-                    const headerView = new DataView(data.buffer, data.byteOffset, data.byteLength);
-                    const frameId = Number(headerView.getBigUint64(0, true));
-                    const width = headerView.getUint32(8, true);
-                    const height = headerView.getUint32(12, true);
-                    
-                    // 首帧日志
-                    if (this.lastFrameId === 0) {
-                        console.log(`🎬 首帧: id=${frameId}, ${width}x${height}, 数据大小=${data.length}`);
-                    }
-                    
-                    this.lastFrameId = frameId;
-                    
-                    // 提取 RGBA 数据 (跳过 24 字节 header)
-                    const frameData = new Uint8ClampedArray(data.buffer, data.byteOffset + 24, width * height * 4);
-                    
-                    // 更新 canvas 尺寸
-                    if (this.canvas.width !== width || this.canvas.height !== height) {
-                        this.canvas.width = width;
-                        this.canvas.height = height;
-                        this.videoWidth = width;
-                        this.videoHeight = height;
-                        console.log(`📐 Canvas 尺寸更新: ${width}x${height}`);
-                        
-                        if (typeof syncOverlayToCanvas === 'function') {
-                            syncOverlayToCanvas(width, height);
-                        }
-                    }
-                    
-                    // 创建 ImageData 并绘制
-                    const imageData = new ImageData(frameData, width, height);
-                    this.ctx.putImageData(imageData, 0, 0);
-                    
-                    // 更新 FPS
-                    this.frameCount++;
-                    const now = performance.now();
-                    if (now - this.lastTime >= 1000) {
-                        this.fps = this.frameCount;
-                        this.frameCount = 0;
-                        this.lastTime = now;
-                        // 更新流信息面板
-                        if (streamInfoManager) {
-                            streamInfoManager.updatePerformance(this.fps, 0);
-                        }
-                    }
-                }
-            } catch (e) {
-                if (!e.toString().includes('没有可用')) {
-                    console.warn('获取帧失败:', e);
-                }
-            }
-        };
-    }
 }
 
 export { WebGLVideoRenderer };
