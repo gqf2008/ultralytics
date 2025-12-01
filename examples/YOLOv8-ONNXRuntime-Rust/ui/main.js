@@ -580,6 +580,18 @@ function setupEventListeners() {
     document.getElementById('stream-info-toggle')?.addEventListener('change', (e) => {
         streamInfoManager?.setEnabled(e.target.checked);
     });
+    
+    // 防截屏保护
+    document.getElementById('capture-protection-toggle')?.addEventListener('change', async (e) => {
+        try {
+            await invoke('set_capture_protection', { enabled: e.target.checked });
+            showStatus(e.target.checked ? '🛡️ 防截屏已启用' : '🛡️ 防截屏已禁用');
+        } catch (err) {
+            console.error('设置防截屏失败:', err);
+            showStatus('❌ 设置防截屏失败: ' + err, true);
+            e.target.checked = !e.target.checked;
+        }
+    });
 }
 
 // ==================== DOMContentLoaded ====================

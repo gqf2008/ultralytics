@@ -164,6 +164,49 @@ async fn show_window(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+/// 设置窗口防截屏保护
+///
+/// enabled=true: 窗口在截图/录屏时显示黑色 (WDA_EXCLUDEFROMCAPTURE)
+/// enabled=false: 正常显示，可被捕获
+#[tauri::command]
+async fn set_capture_protection(app: AppHandle, enabled: bool) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE, WDA_NONE, WINDOW_DISPLAY_AFFINITY,
+        };
+
+        if let Some(window) = app.get_webview_window("main") {
+            let hwnd = window.hwnd().map_err(|e| e.to_string())?;
+            let affinity: WINDOW_DISPLAY_AFFINITY = if enabled {
+                WDA_EXCLUDEFROMCAPTURE
+            } else {
+                WDA_NONE
+            };
+
+            unsafe {
+                SetWindowDisplayAffinity(HWND(hwnd.0 as *mut _), affinity)
+                    .map_err(|e| format!("设置防截屏失败: {}", e))?;
+            }
+
+            println!(
+                "🛡️ 防截屏保护: {}",
+                if enabled { "已启用" } else { "已禁用" }
+            );
+            Ok(())
+        } else {
+            Err("找不到主窗口".to_string())
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        println!("⚠️ 防截屏保护仅支持 Windows");
+        Ok(())
+    }
+}
+
 /// 读取文本文件
 #[tauri::command]
 async fn read_text_file(path: String) -> Result<String, String> {
@@ -295,6 +338,7 @@ fn main() {
             log_frontend,
             show_window,
             read_text_file,
+            set_capture_protection,
             // LLM 推理命令
             start_llm_inference,
             stop_llm_inference,
