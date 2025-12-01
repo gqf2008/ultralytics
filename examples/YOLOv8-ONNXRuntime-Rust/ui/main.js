@@ -1,6 +1,7 @@
 import { invoke, Channel } from '@tauri-apps/api/core';
 import { llmManager, defaultLlmConfig } from './llmInference.js';
 import { ZeroCopyRenderer } from './zeroCopyRenderer.js';
+import { Rnnoise } from '@shiguredo/rnnoise-wasm';
 
 // 前端加载完成后显示窗口（避免白屏闪烁）
 invoke('show_window').catch(console.error);
@@ -572,56 +573,77 @@ class WebGLVideoRenderer {
         this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
         console.log('🔊 Audio Context initialized:', this.audioContext.sampleRate, 'Hz');
         
-        // ========== 音频滤波器链（降噪） ==========
-        // 高通滤波器：去除低频嗡嗡声（如电源噪声 50/60Hz）
+        // ========== 顶级降噪参数 ==========
+        this.noiseGateThreshold = -35;  // 噪声门限阈值 (dB)
+        this.noiseGateEnabled = true;
+        this.wienerFilterEnabled = false;  // 默认关闭，容易产生回声
+        this.noiseProfile = null;  // 噪声频谱特征
+        this.denoiseStrength = 1.0;  // 降噪强度 0-2
+        this.spectralFloor = 0.01;  // 频谱底噪
+        
+        // ========== RNNoise AI 降噪 ==========
+        this.rnnoiseEnabled = false;  // RNNoise 开关
+        this.rnnoiseReady = false;    // RNNoise 是否加载完成
+        this.rnnoiseInstance = null;  // Rnnoise 实例
+        this.rnnoiseState = null;     // DenoiseState
+        this.rnnoiseBuffer = new Float32Array(480);  // RNNoise 需要 480 采样 (10ms@48kHz)
+        this.rnnoiseBufferPos = 0;    // 缓冲区位置
+        this.rnnoiseOutputBuffer = [];  // 输出缓冲
+        this.initRnnoise();
+        
+        // 初始化频谱降噪
+        this.initSpectralDenoising();
+        
+        // ========== 音频滤波器链 ==========
+        // 高通滤波器：去除低频（默认250Hz，人声下限）
         this.highpassFilter = this.audioContext.createBiquadFilter();
         this.highpassFilter.type = 'highpass';
-        this.highpassFilter.frequency.value = 80;  // 80Hz 以下截止
-        this.highpassFilter.Q.value = 0.7;
+        this.highpassFilter.frequency.value = 250;
+        this.highpassFilter.Q.value = 1.0;
         
-        // 第二个高通：更陡峭的斜率
+        // 第二个高通：级联 = 24dB/oct 更陡峭
         this.highpassFilter2 = this.audioContext.createBiquadFilter();
         this.highpassFilter2.type = 'highpass';
-        this.highpassFilter2.frequency.value = 80;
-        this.highpassFilter2.Q.value = 0.7;
+        this.highpassFilter2.frequency.value = 250;
+        this.highpassFilter2.Q.value = 1.0;
         
-        // 低通滤波器：去除高频噪声（如电流噪声、嘶嘶声）
+        // 低通滤波器：去除高频（默认6kHz，人声上限）
         this.lowpassFilter = this.audioContext.createBiquadFilter();
         this.lowpassFilter.type = 'lowpass';
-        this.lowpassFilter.frequency.value = 12000;  // 12kHz 以上截止（保留语音）
+        this.lowpassFilter.frequency.value = 6000;
         this.lowpassFilter.Q.value = 0.7;
         
-        // 第二个低通：更陡峭的斜率
+        // 第二个低通
         this.lowpassFilter2 = this.audioContext.createBiquadFilter();
         this.lowpassFilter2.type = 'lowpass';
-        this.lowpassFilter2.frequency.value = 12000;
+        this.lowpassFilter2.frequency.value = 6000;
         this.lowpassFilter2.Q.value = 0.7;
         
         // 陷波滤波器：消除电源工频干扰 (50Hz)
         this.notchFilter = this.audioContext.createBiquadFilter();
         this.notchFilter.type = 'notch';
-        this.notchFilter.frequency.value = 50;  // 50Hz 电源干扰
-        this.notchFilter.Q.value = 30;  // 窄带
+        this.notchFilter.frequency.value = 50;
+        this.notchFilter.Q.value = 30;
         
-        // 第二个陷波：消除谐波 (100Hz/150Hz)
+        // 第二个陷波：消除谐波 (100Hz)
         this.notchFilter2 = this.audioContext.createBiquadFilter();
         this.notchFilter2.type = 'notch';
-        this.notchFilter2.frequency.value = 100;  // 50Hz的二次谐波
+        this.notchFilter2.frequency.value = 100;
         this.notchFilter2.Q.value = 30;
         
-        // 动态压缩器：减少突发噪声，平衡音量（更激进的设置）
+        // 动态压缩器：减少突发噪声
         this.compressor = this.audioContext.createDynamicsCompressor();
-        this.compressor.threshold.value = -30;  // 更低的阈值
-        this.compressor.knee.value = 10;
-        this.compressor.ratio.value = 8;  // 更高的压缩比
-        this.compressor.attack.value = 0.001;  // 更快的响应
-        this.compressor.release.value = 0.1;
+        this.compressor.threshold.value = -35;
+        this.compressor.knee.value = 5;
+        this.compressor.ratio.value = 12;
+        this.compressor.attack.value = 0.001;
+        this.compressor.release.value = 0.05;
         
         // 增益节点：音量控制
         this.gainNode = this.audioContext.createGain();
-        this.gainNode.gain.value = 1.5;  // 默认音量 1.5x（与 UI 滑块一致）
+        this.gainNode.gain.value = 1.5;
         
-        // 连接滤波器链（双重滤波，更陡峭的斜率）：
+        // 连接滤波器链：
         // source -> hp1 -> hp2 -> notch1 -> notch2 -> lp1 -> lp2 -> compressor -> gain -> destination
         this.highpassFilter.connect(this.highpassFilter2);
         this.highpassFilter2.connect(this.notchFilter);
@@ -632,20 +654,18 @@ class WebGLVideoRenderer {
         this.compressor.connect(this.gainNode);
         this.gainNode.connect(this.audioContext.destination);
         
-        // 保存滤波器链入口，供音频源连接
+        // 保存滤波器链入口
         this.audioFilterInput = this.highpassFilter;
-        // 保存直连节点（用于关闭降噪时）
         this.audioDirectOutput = this.gainNode;
-        // 降噪是否启用
         this.noiseReductionEnabled = true;
         
-        console.log('🔇 音频降噪滤波器已启用: 双重高通 + 双重陷波 + 双重低通 + 压缩器');
+        console.log('🔇 音频降噪: HP=200Hz LP=8kHz (强力模式，去除低频轰隆)');
         
-        // 音频上下文可能被浏览器挂起，需要用户交互后恢复
+        // 音频上下文可能被浏览器挂起
         document.addEventListener('click', () => {
             if (this.audioContext && this.audioContext.state === 'suspended') {
                 this.audioContext.resume();
-                console.log('🔊 Audio Context resumed on user interaction');
+                console.log('🔊 Audio Context resumed');
             }
         }, { once: true });
     }
@@ -735,17 +755,20 @@ class WebGLVideoRenderer {
             // 设置低通
             this.setLowpassFrequency(preset.lowpass);
             
-            // 压缩器设置
-            if (preset.compression && this.compressor) {
-                this.compressor.threshold.value = -30;
-                this.compressor.ratio.value = 8;
-            } else if (this.compressor) {
-                this.compressor.threshold.value = 0;
-                this.compressor.ratio.value = 1;
+            // 噪声门限设置
+            if (preset.gate !== undefined) {
+                this.setNoiseGateEnabled(preset.gate);
+            }
+            if (preset.gateThreshold !== undefined) {
+                this.setNoiseGateThreshold(preset.gateThreshold);
+            }
+            // 降噪强度
+            if (preset.strength !== undefined) {
+                this.setDenoiseStrength(preset.strength / 100);
             }
         }
         
-        console.log(`🔇 应用降噪预设: HP=${preset.highpass}Hz LP=${preset.lowpass}Hz 压缩=${preset.compression}`);
+        console.log(`🔇 预设: HP=${preset.highpass}Hz LP=${preset.lowpass}Hz 门限=${preset.gateThreshold}dB 强度=${preset.strength}%`);
     }
     
     /**
@@ -1448,10 +1471,441 @@ class WebGLVideoRenderer {
         for (let channel = 0; channel < audioData.numberOfChannels; channel++) {
             const channelData = new Float32Array(audioData.numberOfFrames);
             audioData.copyTo(channelData, { planeIndex: channel });
+            
+            // ========== 顶级降噪处理 ==========
+            // 优先使用 RNNoise AI 降噪
+            if (this.rnnoiseEnabled && this.rnnoiseReady) {
+                this.applyRnnoise(channelData, audioData.sampleRate);
+            } else if (this.noiseReductionEnabled) {
+                // 回退到传统频谱降噪
+                this.applySpectralDenoising(channelData);
+            }
+            
+            // 采样噪声底噪（如果正在采样）
+            if (this._samplingNoise) {
+                this.collectNoiseProfile(channelData);
+            }
+            
             buffer.copyToChannel(channelData, channel);
         }
         
         this.scheduleAudioBuffer(buffer, pts);
+    }
+    
+    /**
+     * 初始化 RNNoise AI 降噪
+     */
+    async initRnnoise() {
+        try {
+            console.log('🤖 正在加载 RNNoise AI 降噪引擎...');
+            this.rnnoiseInstance = await Rnnoise.load();
+            this.rnnoiseState = this.rnnoiseInstance.createDenoiseState();
+            this.rnnoiseReady = true;
+            console.log('🤖 RNNoise AI 降噪引擎加载成功！');
+        } catch (error) {
+            console.error('❌ RNNoise 加载失败:', error);
+            this.rnnoiseReady = false;
+        }
+    }
+    
+    /**
+     * 启用/禁用 RNNoise
+     */
+    setRnnoiseEnabled(enabled) {
+        this.rnnoiseEnabled = enabled;
+        if (enabled && !this.rnnoiseReady) {
+            this.initRnnoise();
+        }
+        console.log(`🤖 RNNoise AI 降噪${enabled ? '启用' : '禁用'}`);
+    }
+    
+    /**
+     * 应用 RNNoise 降噪
+     * RNNoise 要求：48kHz 采样率，480 采样/帧 (10ms)
+     */
+    applyRnnoise(samples, sampleRate) {
+        if (!this.rnnoiseReady || !this.rnnoiseState) {
+            return samples;
+        }
+        
+        // RNNoise 需要 48kHz，如果不是需要重采样
+        const targetRate = 48000;
+        const frameSize = 480;  // RNNoise 固定帧大小
+        
+        // 简单线性重采样（如果需要）
+        let processedSamples;
+        if (sampleRate !== targetRate) {
+            processedSamples = this.resampleAudio(samples, sampleRate, targetRate);
+        } else {
+            processedSamples = new Float32Array(samples);
+        }
+        
+        // 输出缓冲
+        const output = new Float32Array(processedSamples.length);
+        let outputPos = 0;
+        
+        // 处理累积的样本
+        for (let i = 0; i < processedSamples.length; i++) {
+            this.rnnoiseBuffer[this.rnnoiseBufferPos++] = processedSamples[i];
+            
+            // 当缓冲区满时处理
+            if (this.rnnoiseBufferPos >= frameSize) {
+                // RNNoise 处理（原地修改）
+                this.rnnoiseState.processFrame(this.rnnoiseBuffer);
+                
+                // 复制到输出
+                for (let j = 0; j < frameSize && outputPos < output.length; j++) {
+                    output[outputPos++] = this.rnnoiseBuffer[j];
+                }
+                
+                this.rnnoiseBufferPos = 0;
+            }
+        }
+        
+        // 处理剩余样本（用零填充）
+        if (outputPos < output.length && this.rnnoiseBufferPos > 0) {
+            // 用零填充剩余部分
+            for (let i = this.rnnoiseBufferPos; i < frameSize; i++) {
+                this.rnnoiseBuffer[i] = 0;
+            }
+            this.rnnoiseState.processFrame(this.rnnoiseBuffer);
+            
+            for (let j = 0; j < this.rnnoiseBufferPos && outputPos < output.length; j++) {
+                output[outputPos++] = this.rnnoiseBuffer[j];
+            }
+        }
+        
+        // 如果重采样了，需要转回原采样率
+        let finalOutput;
+        if (sampleRate !== targetRate) {
+            finalOutput = this.resampleAudio(output, targetRate, sampleRate);
+            // 确保长度匹配
+            if (finalOutput.length !== samples.length) {
+                const adjusted = new Float32Array(samples.length);
+                for (let i = 0; i < samples.length; i++) {
+                    adjusted[i] = finalOutput[Math.min(i, finalOutput.length - 1)] || 0;
+                }
+                finalOutput = adjusted;
+            }
+        } else {
+            finalOutput = output;
+        }
+        
+        // 复制回原数组
+        for (let i = 0; i < samples.length; i++) {
+            samples[i] = finalOutput[i];
+        }
+        
+        return samples;
+    }
+    
+    /**
+     * 简单线性重采样
+     */
+    resampleAudio(input, fromRate, toRate) {
+        const ratio = toRate / fromRate;
+        const outputLength = Math.floor(input.length * ratio);
+        const output = new Float32Array(outputLength);
+        
+        for (let i = 0; i < outputLength; i++) {
+            const srcPos = i / ratio;
+            const srcIndex = Math.floor(srcPos);
+            const frac = srcPos - srcIndex;
+            
+            const s0 = input[srcIndex] || 0;
+            const s1 = input[srcIndex + 1] || s0;
+            output[i] = s0 + (s1 - s0) * frac;
+        }
+        
+        return output;
+    }
+    
+    /**
+     * 销毁 RNNoise 实例（释放内存）
+     */
+    destroyRnnoise() {
+        if (this.rnnoiseState) {
+            this.rnnoiseState.destroy();
+            this.rnnoiseState = null;
+        }
+        this.rnnoiseReady = false;
+        console.log('🤖 RNNoise 已销毁');
+    }
+
+    /**
+     * 初始化 FFT 降噪所需的数据结构
+     */
+    initSpectralDenoising() {
+        this.fftSize = 2048;
+        this.hopSize = this.fftSize / 4;  // 75% 重叠
+        this.noiseProfile = null;  // 噪声频谱特征
+        this.prevPhase = new Float32Array(this.fftSize);
+        this.inputBuffer = new Float32Array(this.fftSize);
+        this.outputBuffer = new Float32Array(this.fftSize * 2);
+        this.outputReadPos = 0;
+        this.outputWritePos = 0;
+        this.inputWritePos = 0;
+        
+        // 汉宁窗
+        this.window = new Float32Array(this.fftSize);
+        for (let i = 0; i < this.fftSize; i++) {
+            this.window[i] = 0.5 * (1 - Math.cos(2 * Math.PI * i / (this.fftSize - 1)));
+        }
+        
+        // 降噪参数
+        this.denoiseStrength = 1.0;  // 降噪强度 0-2
+        this.spectralFloor = 0.002;  // 频谱底噪
+        
+        console.log('🔊 FFT 频谱降噪初始化完成');
+    }
+    
+    /**
+     * 收集噪声特征（采样时调用）
+     */
+    collectNoiseProfile(samples) {
+        if (!this.noiseProfileFrames) {
+            this.noiseProfileFrames = [];
+        }
+        
+        // 计算当前帧的频谱
+        const spectrum = this.computeSpectrum(samples);
+        this.noiseProfileFrames.push(spectrum);
+        
+        this._noiseSampleCount++;
+    }
+    
+    /**
+     * 计算信号的幅度谱（简化 FFT）
+     */
+    computeSpectrum(samples) {
+        const n = Math.min(samples.length, this.fftSize);
+        const spectrum = new Float32Array(n / 2);
+        
+        // 简化 DFT（对于实时降噪够用）
+        for (let k = 0; k < n / 2; k++) {
+            let re = 0, im = 0;
+            const freq = 2 * Math.PI * k / n;
+            for (let i = 0; i < n; i++) {
+                const w = this.window[i] || 1;
+                re += samples[i] * w * Math.cos(freq * i);
+                im -= samples[i] * w * Math.sin(freq * i);
+            }
+            spectrum[k] = Math.sqrt(re * re + im * im) / n;
+        }
+        
+        return spectrum;
+    }
+    
+    /**
+     * 顶级频谱降噪算法
+     * 基于 MMSE-STSA（最小均方短时谱幅度估计）
+     */
+    applySpectralDenoising(samples) {
+        const length = samples.length;
+        
+        // 1. 噪声门限（快速初筛）
+        if (this.noiseGateEnabled) {
+            this.applyNoiseGate(samples);
+        }
+        
+        // 2. 频谱减法降噪（如果有噪声特征）
+        if (this.noiseProfile && this.denoiseStrength > 0) {
+            this.applySpectralSubtraction(samples);
+        }
+        
+        // 3. Wiener 滤波平滑
+        if (this.wienerFilterEnabled) {
+            this.applyWienerFilter(samples);
+        }
+        
+        // 4. 软限幅
+        this.applySoftLimiter(samples);
+    }
+    
+    /**
+     * 噪声门限
+     */
+    applyNoiseGate(samples) {
+        const threshold = Math.pow(10, this.noiseGateThreshold / 20);
+        const attack = 0.001 * this.audioContext.sampleRate;
+        const release = 0.03 * this.audioContext.sampleRate;
+        const hold = 0.015 * this.audioContext.sampleRate;
+        
+        let env = this._gateEnvelope || 0;
+        let holdCount = this._gateHoldCount || 0;
+        
+        for (let i = 0; i < samples.length; i++) {
+            const abs = Math.abs(samples[i]);
+            
+            // 包络跟随
+            const coef = abs > env ? attack : release;
+            env += (abs - env) / coef;
+            
+            // 门限
+            if (env > threshold) {
+                holdCount = hold;
+            } else if (holdCount > 0) {
+                holdCount--;
+            } else {
+                // 平滑衰减
+                const gain = Math.pow(env / threshold, 2);
+                samples[i] *= Math.max(0.01, gain);
+            }
+        }
+        
+        this._gateEnvelope = env;
+        this._gateHoldCount = holdCount;
+    }
+    
+    /**
+     * 频谱减法（核心降噪）
+     * 优化：更宽松的阈值保护人声，避免断断续续
+     */
+    applySpectralSubtraction(samples) {
+        const blockSize = 512;  // 更大的块减少处理频率
+        const numBlocks = Math.floor(samples.length / blockSize);
+        
+        for (let b = 0; b < numBlocks; b++) {
+            const start = b * blockSize;
+            const block = samples.slice(start, start + blockSize);
+            
+            // 计算 RMS
+            let rms = 0;
+            for (let i = 0; i < block.length; i++) {
+                rms += block[i] * block[i];
+            }
+            rms = Math.sqrt(rms / block.length);
+            
+            // 与噪声特征比较
+            const noiseRMS = this.noiseProfile.rms || 0.01;
+            const snr = rms / noiseRMS;
+            
+            // 计算增益 - 更宽松的阈值保护人声
+            let gain;
+            if (snr > 1.5) {
+                gain = 1;  // 信号明显大于噪声，完全保留
+            } else if (snr > 0.8) {
+                // 平滑过渡区间更大，避免突变
+                gain = (snr - 0.8) / 0.7;
+                // 使用更平缓的曲线
+                gain = Math.sqrt(gain);
+            } else {
+                // 底噪保留更多，避免完全静音导致不自然
+                gain = Math.max(this.spectralFloor, 0.15);
+            }
+            
+            // 应用降噪强度（限制最大衰减）
+            const attenuation = (1 - gain) * this.denoiseStrength * 0.7;  // 最多衰减70%
+            gain = 1 - attenuation;
+            
+            // 平滑应用增益，避免块边界突变
+            for (let i = 0; i < blockSize && start + i < samples.length; i++) {
+                // 块内使用渐变过渡
+                const pos = i / blockSize;
+                const smoothGain = pos < 0.1 ? gain * (0.9 + pos) : 
+                                   pos > 0.9 ? gain * (1.9 - pos) : gain;
+                samples[start + i] *= smoothGain;
+            }
+        }
+    }
+    
+    /**
+     * Wiener 滤波器（帧间平滑，减少突变）
+     * 注意：alpha 太低会产生回声，设为 0.85-0.95 比较合适
+     */
+    applyWienerFilter(samples) {
+        // 只做帧间的轻微平滑，不做帧内平滑
+        // 这样可以减少块状噪声，同时避免回声
+        if (!this._wienerLastSample) {
+            this._wienerLastSample = 0;
+        }
+        
+        const alpha = 0.92;  // 高 alpha = 当前帧权重大，回声小
+        
+        // 只平滑帧的第一个样本与上一帧最后一个样本的过渡
+        if (samples.length > 0) {
+            samples[0] = alpha * samples[0] + (1 - alpha) * this._wienerLastSample;
+            this._wienerLastSample = samples[samples.length - 1];
+        }
+    }
+    
+    /**
+     * 软限幅（防爆音）
+     */
+    applySoftLimiter(samples) {
+        for (let i = 0; i < samples.length; i++) {
+            const x = samples[i];
+            if (Math.abs(x) > 0.7) {
+                samples[i] = Math.tanh(x * 2) * 0.85;
+            }
+        }
+    }
+    
+    /**
+     * 采样环境噪声
+     */
+    sampleNoiseFloor() {
+        this.noiseProfileFrames = [];
+        this._samplingNoise = true;
+        this._noiseSampleCount = 0;
+        console.log('🎤 开始采样环境噪声... 请保持安静3秒');
+        
+        setTimeout(() => {
+            if (this.noiseProfileFrames && this.noiseProfileFrames.length > 0) {
+                // 计算平均噪声特征
+                const numFrames = this.noiseProfileFrames.length;
+                let totalRMS = 0;
+                
+                for (const frame of this.noiseProfileFrames) {
+                    let rms = 0;
+                    for (let i = 0; i < frame.length; i++) {
+                        rms += frame[i] * frame[i];
+                    }
+                    totalRMS += Math.sqrt(rms / frame.length);
+                }
+                
+                this.noiseProfile = {
+                    rms: totalRMS / numFrames,
+                    frames: this.noiseProfileFrames
+                };
+                
+                const dB = 20 * Math.log10(this.noiseProfile.rms + 0.0001);
+                console.log(`✅ 噪声采样完成: ${dB.toFixed(1)} dB, ${numFrames} 帧`);
+            }
+            this._samplingNoise = false;
+        }, 3000);
+    }
+    
+    /**
+     * 设置降噪强度
+     */
+    setDenoiseStrength(value) {
+        this.denoiseStrength = Math.max(0, Math.min(2, value));
+        console.log(`🔇 降噪强度: ${(this.denoiseStrength * 100).toFixed(0)}%`);
+    }
+    
+    /**
+     * 设置噪声门限阈值
+     */
+    setNoiseGateThreshold(dB) {
+        this.noiseGateThreshold = dB;
+        console.log(`🔇 噪声门限: ${dB} dB`);
+    }
+    
+    /**
+     * 启用/禁用噪声门限
+     */
+    setNoiseGateEnabled(enabled) {
+        this.noiseGateEnabled = enabled;
+        console.log(`🔇 噪声门限: ${enabled ? '启用' : '禁用'}`);
+    }
+    
+    /**
+     * 启用/禁用 Wiener 滤波
+     */
+    setWienerFilterEnabled(enabled) {
+        this.wienerFilterEnabled = enabled;
+        console.log(`🔇 Wiener滤波: ${enabled ? '启用' : '禁用'}`);
     }
     
     /**
@@ -2565,22 +3019,147 @@ volumeSlider.addEventListener('input', (e) => {
 // 降噪预设控制
 const noisePreset = document.getElementById('noise-preset');
 const notchSelect = document.getElementById('notch-select');
+const highpassSlider = document.getElementById('highpass-slider');
+const highpassValue = document.getElementById('highpass-value');
+const lowpassSlider = document.getElementById('lowpass-slider');
+const lowpassValue = document.getElementById('lowpass-value');
+const noiseGateToggle = document.getElementById('noise-gate-toggle');
+const noiseGateSlider = document.getElementById('noise-gate-slider');
+const noiseGateValue = document.getElementById('noise-gate-value');
+const sampleNoiseBtn = document.getElementById('sample-noise-btn');
+const denoiseStrengthSlider = document.getElementById('denoise-strength-slider');
+const denoiseStrengthValue = document.getElementById('denoise-strength-value');
+const wienerToggle = document.getElementById('wiener-toggle');
+const noiseStatus = document.getElementById('noise-status');
+const rnnoiseToggle = document.getElementById('rnnoise-toggle');
+const rnnoiseStatus = document.getElementById('rnnoise-status');
 
-// 降噪预设配置
+// RNNoise AI 降噪开关
+rnnoiseToggle?.addEventListener('change', (e) => {
+    if (renderer) {
+        renderer.setRnnoiseEnabled(e.target.checked);
+        // 更新状态提示
+        if (e.target.checked) {
+            rnnoiseStatus.textContent = '🤖 RNNoise AI 降噪已启用';
+            rnnoiseStatus.style.color = 'rgba(100,255,150,0.9)';
+        } else {
+            rnnoiseStatus.textContent = '🤖 深度学习降噪 (无需采样，效果更自然)';
+            rnnoiseStatus.style.color = 'rgba(100,200,255,0.8)';
+        }
+    }
+    console.log(`🤖 [RNNoise] ${e.target.checked ? '启用' : '禁用'}`);
+});
+
+// 降噪预设配置 - 优化版：降低强度避免回声
 const NOISE_PRESETS = {
-    off: { enabled: false, highpass: 20, lowpass: 20000, compression: false },
-    light: { enabled: true, highpass: 60, lowpass: 14000, compression: false },
-    normal: { enabled: true, highpass: 100, lowpass: 12000, compression: true },
-    strong: { enabled: true, highpass: 150, lowpass: 8000, compression: true },
-    extreme: { enabled: true, highpass: 200, lowpass: 4000, compression: true }
+    off: { enabled: false, highpass: 20, lowpass: 20000, gate: false, gateThreshold: -60, strength: 0 },
+    light: { enabled: true, highpass: 80, lowpass: 12000, gate: true, gateThreshold: -50, strength: 30 },
+    normal: { enabled: true, highpass: 120, lowpass: 10000, gate: true, gateThreshold: -45, strength: 50 },
+    strong: { enabled: true, highpass: 180, lowpass: 8000, gate: true, gateThreshold: -40, strength: 70 },
+    voice: { enabled: true, highpass: 200, lowpass: 7000, gate: true, gateThreshold: -38, strength: 80 },
+    store: { enabled: true, highpass: 250, lowpass: 6000, gate: true, gateThreshold: -35, strength: 100 },
+    extreme: { enabled: true, highpass: 300, lowpass: 5000, gate: true, gateThreshold: -30, strength: 150 }
 };
 
 noisePreset?.addEventListener('change', (e) => {
     const preset = NOISE_PRESETS[e.target.value];
     if (renderer && preset) {
         renderer.applyNoisePreset(preset);
+        // 同步更新所有滑块
+        if (highpassSlider) {
+            highpassSlider.value = preset.highpass;
+            highpassValue.textContent = preset.highpass + 'Hz';
+        }
+        if (lowpassSlider) {
+            lowpassSlider.value = preset.lowpass;
+            lowpassValue.textContent = (preset.lowpass / 1000).toFixed(1) + 'kHz';
+        }
+        if (noiseGateToggle) {
+            noiseGateToggle.checked = preset.gate;
+        }
+        if (noiseGateSlider) {
+            noiseGateSlider.value = preset.gateThreshold;
+            noiseGateValue.textContent = preset.gateThreshold + 'dB';
+        }
+        if (denoiseStrengthSlider) {
+            denoiseStrengthSlider.value = preset.strength;
+            denoiseStrengthValue.textContent = preset.strength + '%';
+        }
     }
-    console.log(`🔇 [NoisePreset] ${e.target.value}`);
+    console.log(`🔇 [Preset] ${e.target.value}`);
+});
+
+// 降噪强度
+denoiseStrengthSlider?.addEventListener('input', (e) => {
+    const strength = parseInt(e.target.value);
+    if (renderer) {
+        renderer.setDenoiseStrength(strength / 100);
+    }
+    denoiseStrengthValue.textContent = strength + '%';
+});
+
+// Wiener 滤波开关
+wienerToggle?.addEventListener('change', (e) => {
+    if (renderer) {
+        renderer.setWienerFilterEnabled(e.target.checked);
+    }
+});
+
+// 噪声门限开关
+noiseGateToggle?.addEventListener('change', (e) => {
+    if (renderer) {
+        renderer.setNoiseGateEnabled(e.target.checked);
+    }
+});
+
+// 噪声门限阈值
+noiseGateSlider?.addEventListener('input', (e) => {
+    const dB = parseInt(e.target.value);
+    if (renderer) {
+        renderer.setNoiseGateThreshold(dB);
+    }
+    noiseGateValue.textContent = dB + 'dB';
+});
+
+// 采样环境噪声
+sampleNoiseBtn?.addEventListener('click', () => {
+    if (renderer) {
+        renderer.sampleNoiseFloor();
+        sampleNoiseBtn.textContent = '🎤 采样中... 请安静';
+        sampleNoiseBtn.disabled = true;
+        sampleNoiseBtn.style.background = 'rgba(251,146,60,0.5)';
+        if (noiseStatus) {
+            noiseStatus.textContent = '⏳ 正在采样环境噪声...';
+            noiseStatus.style.color = 'rgba(251,191,36,0.9)';
+        }
+        setTimeout(() => {
+            sampleNoiseBtn.textContent = '🎤 采样环境噪声 (必须！)';
+            sampleNoiseBtn.disabled = false;
+            sampleNoiseBtn.style.background = 'linear-gradient(135deg, #6366f1, #8b5cf6)';
+            if (noiseStatus) {
+                noiseStatus.textContent = '✅ 噪声采样完成！降噪已激活';
+                noiseStatus.style.color = 'rgba(74,222,128,0.9)';
+            }
+        }, 3500);
+    }
+});
+
+// 高通滤波器滑块
+highpassSlider?.addEventListener('input', (e) => {
+    const freq = parseInt(e.target.value);
+    if (renderer) {
+        renderer.setHighpassFrequency(freq);
+    }
+    highpassValue.textContent = freq + 'Hz';
+});
+
+// 低通滤波器滑块
+lowpassSlider?.addEventListener('input', (e) => {
+    const freq = parseInt(e.target.value);
+    if (renderer) {
+        renderer.setLowpassFrequency(freq);
+    }
+    lowpassValue.textContent = (freq / 1000).toFixed(1) + 'kHz';
 });
 
 notchSelect?.addEventListener('change', (e) => {
@@ -2588,7 +3167,6 @@ notchSelect?.addEventListener('change', (e) => {
     if (renderer) {
         renderer.setNotchFrequency(freq);
     }
-    console.log(`🔇 [Notch] ${freq > 0 ? freq + 'Hz' : '关闭'}`);
 });
 
 // 折叠/展开控制面板

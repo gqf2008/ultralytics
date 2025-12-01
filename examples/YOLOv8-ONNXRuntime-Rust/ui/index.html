@@ -1086,33 +1086,123 @@
                             <span class="slider-value" id="volume-value">1.5×</span>
                         </div>
                     </div>
+                    
+                    <!-- 顶级降噪标题 -->
+                    <div style="margin-top: 12px; padding: 6px 10px; background: linear-gradient(90deg, rgba(99,102,241,0.2), transparent); border-radius: 6px; font-size: 11px; font-weight: 600; color: #a5b4fc;">
+                        🎯 AI 频谱降噪
+                    </div>
+                    
                     <!-- 降噪强度 -->
                     <div class="settings-row" style="margin-top: 8px;">
                         <div class="settings-label">
-                            <span class="icon">🔇</span> 降噪强度
+                            <span class="icon">💪</span> 降噪强度
+                        </div>
+                        <div class="slider-control">
+                            <input type="range" id="denoise-strength-slider" min="0" max="200" step="10" value="100">
+                            <span class="slider-value" id="denoise-strength-value">100%</span>
+                        </div>
+                    </div>
+                    
+                    <!-- RNNoise AI 降噪 -->
+                    <div class="settings-row" style="margin-top: 10px; padding-top: 10px; border-top: 1px solid rgba(255,255,255,0.1);">
+                        <div class="settings-label">
+                            <span class="icon">🤖</span> RNNoise AI
+                        </div>
+                        <label class="toggle-switch">
+                            <input type="checkbox" id="rnnoise-toggle">
+                            <span class="toggle-slider"></span>
+                        </label>
+                    </div>
+                    <div id="rnnoise-status" style="margin-top: 4px; font-size: 10px; color: rgba(100,200,255,0.8); text-align: center;">
+                        🤖 深度学习降噪 (无需采样，效果更自然)
+                    </div>
+                    
+                    <!-- 采样噪声按钮 (传统降噪) -->
+                    <div class="settings-row" style="margin-top: 10px; padding-top: 10px; border-top: 1px solid rgba(255,255,255,0.1);">
+                        <button id="sample-noise-btn" class="btn" style="width: 100%; padding: 10px; font-size: 12px; background: linear-gradient(135deg, #6366f1, #8b5cf6); border: none; font-weight: 600;">
+                            🎤 采样环境噪声 (传统降噪)
+                        </button>
+                    </div>
+                    <div id="noise-status" style="margin-top: 4px; font-size: 10px; color: rgba(255,200,100,0.8); text-align: center;">
+                        ⚠️ 传统降噪需要先采样，RNNoise 无需采样
+                    </div>
+                    
+                    <!-- 噪声门限 -->
+                    <div class="settings-row" style="margin-top: 10px; padding-top: 10px; border-top: 1px solid rgba(255,255,255,0.1);">
+                        <div class="settings-label">
+                            <span class="icon">🚪</span> 噪声门限
+                        </div>
+                        <label class="toggle-switch">
+                            <input type="checkbox" id="noise-gate-toggle" checked>
+                            <span class="toggle-slider"></span>
+                        </label>
+                    </div>
+                    <div class="settings-row" style="margin-top: 6px;">
+                        <div class="settings-label" style="font-size: 11px;">
+                            门限阈值
+                        </div>
+                        <div class="slider-control">
+                            <input type="range" id="noise-gate-slider" min="-60" max="-15" step="1" value="-35">
+                            <span class="slider-value" id="noise-gate-value">-35dB</span>
+                        </div>
+                    </div>
+                    
+                    <!-- Wiener 滤波 -->
+                    <div class="settings-row" style="margin-top: 8px;">
+                        <div class="settings-label" style="font-size: 11px;">
+                            🌊 平滑滤波
+                        </div>
+                        <label class="toggle-switch">
+                            <input type="checkbox" id="wiener-toggle" checked>
+                            <span class="toggle-slider"></span>
+                        </label>
+                    </div>
+                    
+                    <!-- 频率滤波 -->
+                    <div class="settings-row" style="margin-top: 10px; padding-top: 10px; border-top: 1px solid rgba(255,255,255,0.1);">
+                        <div class="settings-label" style="font-size: 11px;">
+                            🔻 低频截止
+                        </div>
+                        <div class="slider-control">
+                            <input type="range" id="highpass-slider" min="20" max="500" step="10" value="300">
+                            <span class="slider-value" id="highpass-value">300Hz</span>
+                        </div>
+                    </div>
+                    <div class="settings-row" style="margin-top: 6px;">
+                        <div class="settings-label" style="font-size: 11px;">
+                            🔺 高频截止
+                        </div>
+                        <div class="slider-control">
+                            <input type="range" id="lowpass-slider" min="2000" max="16000" step="500" value="5000">
+                            <span class="slider-value" id="lowpass-value">5kHz</span>
+                        </div>
+                    </div>
+                    
+                    <!-- 快速预设 -->
+                    <div class="settings-row" style="margin-top: 8px;">
+                        <div class="settings-label" style="font-size: 11px;">
+                            ⚡ 预设
                         </div>
                         <div class="slider-control">
                             <select id="noise-preset" style="flex: 1; padding: 4px 8px; border-radius: 6px; border: 1px solid rgba(255,255,255,0.1); background: rgba(0,0,0,0.3); color: white; font-size: 11px;">
                                 <option value="off">关闭</option>
-                                <option value="light">轻度 (保留更多细节)</option>
-                                <option value="normal" selected>标准</option>
-                                <option value="strong">强力 (人声优化)</option>
-                                <option value="extreme">极限 (仅保留人声)</option>
+                                <option value="light">轻度</option>
+                                <option value="normal">标准</option>
+                                <option value="strong">强力</option>
+                                <option value="voice">人声</option>
+                                <option value="store" selected>门店环境</option>
+                                <option value="extreme">极限</option>
                             </select>
                         </div>
                     </div>
-                    <!-- 电源噪声 -->
-                    <div class="settings-row" style="margin-top: 6px;">
-                        <div class="settings-label" style="font-size: 11px;">
-                            电源频率
-                        </div>
-                        <div class="slider-control">
-                            <select id="notch-select" style="flex: 1; padding: 4px 8px; border-radius: 6px; border: 1px solid rgba(255,255,255,0.1); background: rgba(0,0,0,0.3); color: white; font-size: 11px;">
-                                <option value="0">关闭</option>
-                                <option value="50" selected>50Hz (中国)</option>
-                                <option value="60">60Hz (美国)</option>
-                            </select>
-                        </div>
+                    
+                    <!-- 使用说明 -->
+                    <div style="margin-top: 10px; padding: 10px; background: rgba(34,197,94,0.15); border-radius: 8px; font-size: 10px; color: rgba(255,255,255,0.7); line-height: 1.5;">
+                        <div style="font-weight: 600; color: #4ade80; margin-bottom: 4px;">📖 使用步骤：</div>
+                        1️⃣ 点击 <b>"采样环境噪声"</b><br>
+                        2️⃣ 保持 <b>3秒安静</b>（让它学习背景噪声）<br>
+                        3️⃣ 调整 <b>降噪强度</b>（100-150%效果好）<br>
+                        4️⃣ 如果有人声断续，降低 <b>门限阈值</b>
                     </div>
                 </div>
                 
