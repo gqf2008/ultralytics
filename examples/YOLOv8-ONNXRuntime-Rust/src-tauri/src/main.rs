@@ -99,7 +99,7 @@ async fn get_stream_status(app: AppHandle) -> Result<(bool, u64), String> {
 /// 读取流地址历史记录
 #[tauri::command]
 async fn get_stream_history() -> Result<Vec<String>, String> {
-    let path = "stream_history.txt";
+    let path = "rtsp_history.txt";
     match std::fs::read_to_string(path) {
         Ok(content) => {
             let urls: Vec<String> = content
@@ -117,7 +117,7 @@ async fn get_stream_history() -> Result<Vec<String>, String> {
 /// 添加流地址历史记录
 #[tauri::command]
 async fn add_stream_history(url: String) -> Result<(), String> {
-    let path = "stream_history.txt";
+    let path = "rtsp_history.txt";
 
     let mut urls = match std::fs::read_to_string(path) {
         Ok(content) => content
@@ -143,7 +143,7 @@ async fn add_stream_history(url: String) -> Result<(), String> {
 /// 清空流地址历史记录
 #[tauri::command]
 async fn clear_stream_history() -> Result<(), String> {
-    let path = "stream_history.txt";
+    let path = "rtsp_history.txt";
     std::fs::write(path, "").map_err(|e| format!("Failed to clear history: {}", e))
 }
 
